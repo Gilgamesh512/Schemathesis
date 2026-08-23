@@ -1,0 +1,66 @@
+{
+  "payloads": [
+    {
+      "target_app": "dvga",
+      "query": "query { systemDebug(arg: \"1' OR '1'='1\") }",
+      "variables": {},
+      "operation_name": null,
+      "operation": "query",
+      "attack_type": "SQL_INJECTION",
+      "payload_value": "1' OR '1'='1",
+      "owasp_category": "API8:2023 Security Misconfiguration",
+      "context": "DVGA systemDebug String argument",
+      "expected_signal": [
+        "sql syntax",
+        "database error",
+        "sqlite error",
+        "syntax error"
+      ]
+    },
+    {
+      "target_app": "dvga",
+      "query": "query { systemDebug(arg: \"DVGA_CMDI_TEST; printf DVGA_CMDI_MARKER; #\") }",
+      "variables": {},
+      "operation_name": null,
+      "operation": "query",
+      "attack_type": "COMMAND_INJECTION",
+      "payload_value": "DVGA_CMDI_TEST; printf DVGA_CMDI_MARKER; #",
+      "owasp_category": "API8:2023 Security Misconfiguration",
+      "context": "DVGA systemDebug String argument",
+      "expected_signal": [
+        "DVGA_CMDI_MARKER"
+      ]
+    },
+    {
+      "target_app": "dvga",
+      "query": "query { systemDiagnostics(username: \"test\", password: \"test\", cmd: \"printf DVGA_DIAG_MARKER\") }",
+      "variables": {},
+      "operation_name": null,
+      "operation": "query",
+      "attack_type": "COMMAND_INJECTION",
+      "payload_value": "printf DVGA_DIAG_MARKER",
+      "owasp_category": "API8:2023 Security Misconfiguration",
+      "context": "DVGA systemDiagnostics cmd argument",
+      "expected_signal": [
+        "DVGA_DIAG_MARKER"
+      ]
+    },
+    {
+      "target_app": "dvga",
+      "query": "query { systemDiagnostics(username: \"test\", password: \"test\", cmd: \"1' OR '1'='1\") }",
+      "variables": {},
+      "operation_name": null,
+      "operation": "query",
+      "attack_type": "SQL_INJECTION",
+      "payload_value": "1' OR '1'='1",
+      "owasp_category": "API8:2023 Security Misconfiguration",
+      "context": "DVGA systemDiagnostics cmd argument",
+      "expected_signal": [
+        "sql syntax",
+        "database error",
+        "sqlite error",
+        "syntax error"
+      ]
+    }
+  ]
+}

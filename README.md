@@ -1,8 +1,6 @@
-# Main API Fuzzing Pipeline
+# Main Security Testing Pipeline
 
 Main security-testing pipeline for the API fuzzing lab. This pipeline prepares the target applications, obtains authentication tokens, discovers the DVGA GraphQL schema, and then runs the main REST + GraphQL fuzzing stages.
-
-The current Main pipeline is intentionally separated from the legacy DVGA pipeline. The Main controller does **not** execute the legacy DVGA fuzzer or its analyze/triage chain.
 
 ## Pipeline
 
@@ -542,9 +540,3 @@ python3 main_pipeline/rules_engine.py \
 cat main_pipeline/results/vulnerabilities.csv
 cat main_pipeline/results/vulnerabilities.ndjson
 ```
-
-## Legacy pipeline
-
-The legacy DVGA pipeline is maintained separately and should not be mixed with this Main pipeline.
-
-Its role and excluded components are documented in the legacy README. The Main pipeline is the active controller for the VAmPI + crAPI REST and DVGA GraphQL security-testing flow.

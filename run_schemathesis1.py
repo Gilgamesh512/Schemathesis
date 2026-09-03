@@ -121,7 +121,7 @@ class RunState:
         self.path = path
         self.data: dict[str, dict] = {}
         if path.exists():
-            self.data = json.loads(path.read_text())
+            self.data = json.loads(path.read_text(encoding="utf-8"))
 
     def status(self, fp: str) -> Optional[str]:
         return self.data.get(fp, {}).get("status")
@@ -136,7 +136,7 @@ class RunState:
         entry["last_seen"] = datetime.now(timezone.utc).isoformat()
 
     def save(self) -> None:
-        self.path.write_text(json.dumps(self.data, indent=2, ensure_ascii=False))
+        self.path.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 MAX_ATTEMPTS_PER_FINGERPRINT = 3  # dung Nhiem vu 3.3: dung sau 3 lan thu that bai
@@ -149,7 +149,7 @@ MAX_ATTEMPTS_PER_FINGERPRINT = 3  # dung Nhiem vu 3.3: dung sau 3 lan thu that b
 def _read_spec_dict(spec_path: str) -> dict:
     """Doc spec ra dict, ho tro ca JSON va YAML - OpenAPI thuong duoc viet
     bang YAML tren thuc te, khong chi JSON."""
-    text = Path(spec_path).read_text()
+    text = Path(spec_path).read_text(encoding="utf-8")
     suffix = Path(spec_path).suffix.lower()
     if suffix in (".yaml", ".yml"):
         return yaml.safe_load(text)
@@ -244,7 +244,7 @@ def load_targets(targets_arg: str, base_urls_arg: Optional[str]) -> dict[str, tu
 
 
 def load_payloads(payload_path: str) -> list[Payload]:
-    raw = json.loads(Path(payload_path).read_text())
+    raw = json.loads(Path(payload_path).read_text(encoding="utf-8"))
     if isinstance(raw, dict):
         raw = raw.get("payloads", [raw])
 

@@ -11,6 +11,20 @@ from pathlib import Path
 MAIN_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = MAIN_DIR.parent
 
+sys.path.insert(0, str(PROJECT_ROOT))
+_CFG_BASE_URLS: dict[str, str] = {}
+_CFG_SPECS: dict[str, Path] = {}
+try:
+    from core import target_config as _tc
+
+    for _n, _t in _tc.load_targets().targets.items():
+        _CFG_BASE_URLS[_n] = _t.base_url
+        if _t.spec:
+            _p = Path(_t.spec)
+            _CFG_SPECS[_n] = _p if _p.is_absolute() else PROJECT_ROOT / _p
+except Exception:
+    pass
+
 RESULTS_DIR = MAIN_DIR / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -39,19 +53,17 @@ GRAPHQL_PAYLOADS_CANDIDATES = [
 ]
 
 VAMPI_SPEC_CANDIDATES = [
-    PROJECT_ROOT / "vampi_spec.yaml",
-    MAIN_DIR / "vampi_spec.yaml",
+    p for p in [_CFG_SPECS.get("vampi"), PROJECT_ROOT / "vampi_spec.yaml", MAIN_DIR / "vampi_spec.yaml"] if p
 ]
 
 CRAPI_SPEC_CANDIDATES = [
-    PROJECT_ROOT / "crapi_openapi_spec.json",
-    MAIN_DIR / "crapi_openapi_spec.json",
+    p for p in [_CFG_SPECS.get("crapi"), PROJECT_ROOT / "crapi_openapi_spec.json", MAIN_DIR / "crapi_openapi_spec.json"] if p
 ]
 
 TARGET_BASE_URLS = {
-    "vampi": "http://localhost:5002",
-    "crapi": "http://localhost:8888",
-    "dvga": "http://localhost:5013",
+    "vampi": _CFG_BASE_URLS.get("vampi", "http://localhost:5002"),
+    "crapi": _CFG_BASE_URLS.get("crapi", "http://localhost:8888"),
+    "dvga": _CFG_BASE_URLS.get("dvga", "http://localhost:5013"),
 }
 
 

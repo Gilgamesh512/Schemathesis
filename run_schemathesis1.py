@@ -41,6 +41,7 @@ import yaml
 from pydantic import BaseModel, Field, ValidationError
 
 import rules_engine
+from core import Evidence, Finding, content_hash, redact_headers, stable_finding_id
 
 # --------------------------------------------------------------------------
 # 1. Schema du lieu (payload tu B phai khop dung format nay)
@@ -59,25 +60,6 @@ class Payload(BaseModel):
     target_app: Optional[str] = None  # "vampi" | "crapi" | ... - B NEN dien khi
                                        # chay multi-target, tranh truong hop 1
                                        # endpoint trung ten giua 2 app khac nhau
-
-
-class Finding(BaseModel):
-    run_id: str
-    timestamp: str
-    target_app: str
-    endpoint: str
-    method: str
-    tool: str = "schemathesis"
-    attack_type: str
-    owasp_category: Optional[str]
-    payload: Any
-    status_code: Optional[int]
-    response_time_ms: Optional[float]
-    evidence: str
-    severity: str
-    confirmed: bool
-    fingerprint: str
-    matched_cve: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -321,8 +303,9 @@ def find_operation_multi(targets: dict[str, tuple], payload: "Payload"):
         names = [c[0] for c in candidates]
         print(f"[CANH BAO] Endpoint '{payload.method} {payload.endpoint}' trung "
               f"trong NHIEU target: {names}. B nen dien field 'target_app' trong "
-              f"payload de tranh nham lan. Tam thoi dung target dau tien: '{names[0]}'.",
+              "payload de tranh nham lan. Bo qua payload mo ho.",
               file=sys.stderr)
+        return None
     return candidates[0]
 
 
@@ -393,8 +376,7 @@ def evaluate_response(resp, payload: Payload, rules: Optional[dict] = None
         signals = [s.lower() for s in payload.expected_signal] + DEFAULT_ERROR_SIGNALS
     hit_signals = [s for s in signals if s in body_lower]
 
-    # Tim CVE co lien quan de boost severity + gan bang chung CVE cu the
-    # (dung owasp_category + attack_type lam tu khoa tra cuu trong cache).
+    # CVE la enrichment/context, khong phai bang chung de tu dong nang risk.
     matched_cves: list[dict] = []
     if rules is not None:
         matched_cves = rules_engine.match_cves_by_keyword(
@@ -403,11 +385,6 @@ def evaluate_response(resp, payload: Payload, rules: Optional[dict] = None
 
     if status >= 500:
         severity = SEVERITY_BY_STATUS.get(status, "high")
-        if matched_cves:  # trung voi 1 CVE cong khai -> nang severity + neu ro CVE
-            top = max(matched_cves, key=lambda c: c["cvss_score"] or 0)
-            if top["severity"] in ("critical",):
-                severity = "critical"
-            return severity, True, f"HTTP {status}; matched: {hit_signals[:3]}; lien quan {top['cve_id']} (CVSS {top['cvss_score']})", cve_ids
         return severity, True, f"HTTP {status}; matched: {hit_signals[:3]}", cve_ids
     if hit_signals:
         return "medium", True, f"HTTP {status}; leaked signal: {hit_signals[:3]}", cve_ids
@@ -476,7 +453,29 @@ async def process_fingerprint_group(
             severity, confirmed, evidence, cve_ids = evaluate_response(resp, pc.payload, rules)
             status_code = resp.status_code
 
+        payload_value = pc.payload.payload_value
+        evidence_model = Evidence(
+            status_code=status_code,
+            response_headers=redact_headers(dict(resp.headers)) if resp is not None else {},
+            response_signal=[evidence],
+            response_time_ms=round(elapsed_ms, 1),
+            payload_hash=content_hash(payload_value),
+            request_hash=content_hash({
+                "target": pc.target_app,
+                "method": pc.payload.method,
+                "endpoint": pc.payload.endpoint,
+                "parameter": pc.payload.target_param,
+                "value": payload_value,
+            }),
+            endpoint=pc.payload.endpoint,
+            payload=payload_value,
+            auth_context=redact_headers(headers),
+        )
         finding = Finding(
+            finding_id=stable_finding_id(
+                pc.target_app, pc.payload.method, pc.payload.endpoint,
+                pc.payload.attack_type, pc.payload.target_param,
+            ),
             run_id=STATE_RUN_ID.get(),
             timestamp=datetime.now(timezone.utc).isoformat(),
             target_app=pc.target_app,
@@ -487,11 +486,13 @@ async def process_fingerprint_group(
             payload=pc.payload.payload_value,
             status_code=status_code,
             response_time_ms=round(elapsed_ms, 1),
-            evidence=evidence,
+            evidence=evidence_model,
             severity=severity,
+            confidence=0.95 if confirmed and status_code is not None and status_code >= 500 else (0.65 if confirmed else 0.25),
             confirmed=confirmed,
+            lifecycle="confirmed" if confirmed else "possible",
             fingerprint=fp,
-            matched_cve=",".join(cve_ids),
+            cve_matches=cve_ids,
         )
         results.append(finding)
         state.record(fp, "confirmed" if confirmed else "tested")

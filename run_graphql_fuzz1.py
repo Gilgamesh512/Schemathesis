@@ -42,6 +42,7 @@ import httpx
 from pydantic import BaseModel, Field, ValidationError
 
 import rules_engine
+from core import Evidence, Finding, content_hash, redact_headers, stable_finding_id
 
 
 DEFAULT_ERROR_SIGNALS = [
@@ -75,25 +76,6 @@ class GraphQLPayload(BaseModel):
 
     target_app: Optional[str] = "dvga"
     operation: Optional[str] = None
-
-
-class Finding(BaseModel):
-    run_id: str
-    timestamp: str
-    target_app: str
-    endpoint: str
-    method: str
-    tool: str = "graphql"
-    attack_type: str
-    owasp_category: Optional[str]
-    payload: Any
-    status_code: Optional[int]
-    response_time_ms: Optional[float]
-    evidence: str
-    severity: str
-    confirmed: bool
-    fingerprint: str
-    matched_cve: str = ""
 
 
 def fingerprint_of(
@@ -462,7 +444,28 @@ async def process_payload(
         )
         status_code = resp.status_code
 
+    request_payload = {
+        "query": payload.query,
+        "variables": payload.variables,
+        "operation_name": payload.operation_name,
+        "payload_value": payload.payload_value,
+    }
+    evidence_model = Evidence(
+        status_code=status_code,
+        response_headers=redact_headers(dict(resp.headers)) if resp is not None else {},
+        response_signal=[evidence],
+        response_time_ms=round(elapsed_ms, 1),
+        payload_hash=content_hash(payload.payload_value),
+        request_hash=content_hash(request_payload),
+        endpoint=endpoint,
+        payload=request_payload,
+        auth_context=redact_headers(headers),
+    )
     finding = Finding(
+        finding_id=stable_finding_id(
+            target_app, "POST", endpoint, payload.attack_type,
+            payload.operation or payload.operation_name or "graphql",
+        ),
         run_id=RUN_ID,
         timestamp=datetime.now(timezone.utc).isoformat(),
         target_app=target_app,
@@ -478,11 +481,13 @@ async def process_payload(
         },
         status_code=status_code,
         response_time_ms=round(elapsed_ms, 1),
-        evidence=evidence,
+        evidence=evidence_model,
         severity=severity,
+        confidence=0.95 if confirmed and status_code is not None and status_code >= 500 else (0.65 if confirmed else 0.25),
         confirmed=confirmed,
+        lifecycle="confirmed" if confirmed else "possible",
         fingerprint=fp,
-        matched_cve=",".join(cve_ids),
+        cve_matches=cve_ids,
     )
 
     state.record(fp, "confirmed" if confirmed else "tested")

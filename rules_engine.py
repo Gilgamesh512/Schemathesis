@@ -50,6 +50,7 @@ DEFAULT_KEYWORDS = [
 ]
 
 RATE_LIMIT_SLEEP_S = 6  # khong co API key -> ~5 req/30s, de an toan choi 6s/req
+NVD_PAGE_SIZE = 50
 
 
 def _severity_from_cvss(score: Optional[float]) -> str:
@@ -72,41 +73,51 @@ def fetch_cves_for_keyword(keyword: str, days_back: int, api_key: Optional[str])
         "keywordSearch": keyword,
         "pubStartDate": start.strftime("%Y-%m-%dT%H:%M:%S.000"),
         "pubEndDate": end.strftime("%Y-%m-%dT%H:%M:%S.000"),
-        "resultsPerPage": 50,
+        "resultsPerPage": NVD_PAGE_SIZE,
     }
     headers = {"apiKey": api_key} if api_key else {}
 
-    try:
-        resp = requests.get(NVD_API_URL, params=params, headers=headers, timeout=20)
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        print(f"[CANH BAO] Khong goi duoc NVD API cho keyword '{keyword}': {exc}",
-              file=sys.stderr)
-        return []
-
-    data = resp.json()
     out = []
-    for item in data.get("vulnerabilities", []):
-        cve = item.get("cve", {})
-        cve_id = cve.get("id")
-        descs = cve.get("descriptions", [])
-        desc_en = next((d["value"] for d in descs if d.get("lang") == "en"), "")
+    start_index = 0
+    total_results = None
+    while total_results is None or start_index < total_results:
+        params["startIndex"] = start_index
+        try:
+            resp = requests.get(NVD_API_URL, params=params, headers=headers, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            print(f"[CANH BAO] Khong goi duoc NVD API cho keyword '{keyword}' "
+                  f"(startIndex={start_index}): {exc}", file=sys.stderr)
+            break
 
-        metrics = cve.get("metrics", {})
-        score = None
-        for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
-            if key in metrics and metrics[key]:
-                score = metrics[key][0]["cvssData"].get("baseScore")
-                break
+        total_results = int(data.get("totalResults", 0))
+        page = data.get("vulnerabilities", [])
+        print(f"[INFO] NVD '{keyword}': {start_index + len(page)}/{total_results}")
+        for item in page:
+            cve = item.get("cve", {})
+            cve_id = cve.get("id")
+            descs = cve.get("descriptions", [])
+            desc_en = next((d["value"] for d in descs if d.get("lang") == "en"), "")
 
-        out.append({
-            "cve_id": cve_id,
-            "keyword": keyword,
-            "description": desc_en[:300],
-            "cvss_score": score,
-            "severity": _severity_from_cvss(score),
-            "published": cve.get("published"),
-        })
+            metrics = cve.get("metrics", {})
+            score = None
+            for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+                if key in metrics and metrics[key]:
+                    score = metrics[key][0]["cvssData"].get("baseScore")
+                    break
+
+            out.append({
+                "cve_id": cve_id,
+                "keyword": keyword,
+                "description": desc_en[:300],
+                "cvss_score": score,
+                "severity": _severity_from_cvss(score),
+                "published": cve.get("published"),
+            })
+        if not page:
+            break
+        start_index += len(page)
     return out
 
 

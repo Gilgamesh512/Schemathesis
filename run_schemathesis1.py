@@ -41,8 +41,8 @@ import yaml
 from pydantic import BaseModel, Field, ValidationError
 
 import rules_engine
-from core import (Evidence, Finding, RequestScheduler, ResponseObservation,
-                  confirmation_result, content_hash, redact_headers,
+from core import (ConfirmationEngine, Evidence, Finding, RequestScheduler,
+                  content_hash, redact_headers, snapshot_response,
                   stable_finding_id)
 
 # --------------------------------------------------------------------------
@@ -456,62 +456,52 @@ async def process_fingerprint_group(
         if state.attempts(fp) >= MAX_ATTEMPTS_PER_FINGERPRINT:
             break
 
-        baseline_resp = None
-        baseline_observation = None
-        baseline_elapsed_ms = None
-        if pc.baseline_case is not None:
-            baseline_t0 = time.perf_counter()
-            try:
-                baseline_resp = await scheduler.request(
+        attack_response = None
+        try:
+            async def execute_baseline():
+                return await scheduler.request(
                     pc.target_app,
                     lambda: fire_case(client, pc.baseline_case, pc.base_url, headers),
                 )
-                baseline_elapsed_ms = (time.perf_counter() - baseline_t0) * 1000
-                baseline_observation = ResponseObservation(
-                    status_code=baseline_resp.status_code,
-                    body_hash=content_hash(baseline_resp.text or ""),
-                    headers_hash=content_hash(dict(baseline_resp.headers)),
-                    response_time_ms=round(baseline_elapsed_ms, 1),
-                )
-            except Exception as exc:
-                print(f"[CANH BAO] Baseline loi cho {pc.target_app} "
-                      f"{pc.payload.method} {pc.payload.endpoint}: {exc}", file=sys.stderr)
 
-        t0 = time.perf_counter()
-        try:
-            resp = await scheduler.request(
-                pc.target_app,
-                lambda: fire_case(client, pc.case, pc.base_url, headers),
+            async def execute_attack():
+                nonlocal attack_response
+                attack_response = await scheduler.request(
+                    pc.target_app,
+                    lambda: fire_case(client, pc.case, pc.base_url, headers),
+                )
+                return attack_response
+
+            def candidate_detector(response):
+                return evaluate_response(response, pc.payload, rules)[1]
+
+            result = await ConfirmationEngine().confirm(
+                candidate_detector,
+                execute_baseline if pc.baseline_case is not None else None,
+                execute_attack,
+                snapshot_response,
             )
             error_text = None
         except Exception as exc:
-            resp = None
+            attack_response = None
+            result = None
             error_text = str(exc)
-        elapsed_ms = (time.perf_counter() - t0) * 1000
         if rate_limit_s:
             await asyncio.sleep(rate_limit_s)
 
-        if resp is None:
+        resp = attack_response
+        if resp is None or result is None:
             severity, confirmed, evidence, cve_ids = "unknown", False, f"request loi: {error_text}", []
             status_code = None
+            confidence = 0.1
+            confirmation_differences = {}
         else:
             severity, confirmed, evidence, cve_ids = evaluate_response(resp, pc.payload, rules)
             status_code = resp.status_code
-
-        attack_observation = None
-        confirmation_differences = {}
-        if resp is not None:
-            attack_observation = ResponseObservation(
-                status_code=resp.status_code,
-                body_hash=content_hash(resp.text or ""),
-                headers_hash=content_hash(dict(resp.headers)),
-                response_time_ms=round(elapsed_ms, 1),
-            )
-            confirmed, confidence, confirmation_differences = confirmation_result(
-                baseline_observation, attack_observation, confirmed,
-            )
-        else:
-            confidence = 0.1
+            confirmed = result.confirmed
+            confidence = result.confidence
+            confirmation_differences = result.evidence
+        elapsed_ms = result.attack.response_time_ms if result and result.attack else 0
 
         payload_value = pc.payload.payload_value
         evidence_model = Evidence(
@@ -532,10 +522,10 @@ async def process_fingerprint_group(
             auth_context=redact_headers(headers),
             previous_observations=([{
                 "role": "baseline",
-                "status_code": baseline_observation.status_code,
-                "response_time_ms": baseline_observation.response_time_ms,
+                "status_code": result.baseline.status_code,
+                "response_time_ms": result.baseline.response_time_ms,
                 "differences": confirmation_differences,
-            }] if baseline_observation else []),
+            }] if result and result.baseline else []),
         )
         finding = Finding(
             finding_id=stable_finding_id(
@@ -556,14 +546,15 @@ async def process_fingerprint_group(
             severity=severity,
             confidence=confidence,
             confirmed=confirmed,
-            lifecycle="confirmed" if confirmed else "possible",
+            lifecycle=("confirmed" if confirmed else
+                       ("candidate" if result and result.candidate else "rejected")),
             fingerprint=fp,
             cve_matches=cve_ids,
             cve_match_type=("cpe" if pc.payload.technology else "keyword") if cve_ids else "",
             cve_confidence=0.94 if pc.payload.technology and cve_ids else (0.2 if cve_ids else 0.0),
         )
         results.append(finding)
-        state.record(fp, "confirmed" if confirmed else "tested")
+        state.record(fp, "confirmed" if confirmed else ("candidate" if result and result.candidate else "rejected"))
 
     return results
 

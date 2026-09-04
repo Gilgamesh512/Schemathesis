@@ -448,7 +448,7 @@ These keep fingerprint/deduplication state between runs.
 
 The fuzzers do not treat every error response as a confirmed vulnerability.
 
-REST candidates now use a baseline generated from the same OpenAPI operation:
+REST and GraphQL candidates now use the shared confirmation engine:
 
 ```text
 baseline case -> baseline response
@@ -457,12 +457,16 @@ attack case   -> attack response
               -> confirmation result
 ```
 
+For GraphQL, the baseline keeps the same query operation and shape while
+replacing the attack value in the inline query or variables. The comparator
+also checks GraphQL error messages and top-level data shape.
+
 If a valid baseline cannot be generated, the attack can still run, but it is not
 automatically confirmed.
 
 In particular:
 
-- expected payload-specific signals are used as primary confirmation evidence;
+- expected payload-specific signals are used to create candidates;
 - server-side `5xx` responses are treated as strong candidate signals;
 - generic strings such as `debug`, `exception`, or `error` alone are not sufficient to confirm a vulnerability;
 - GraphQL errors alone are not automatically vulnerabilities;

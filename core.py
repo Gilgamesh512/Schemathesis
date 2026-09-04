@@ -109,6 +109,11 @@ def compare_responses(baseline: Any, attack: Any) -> dict[str, Any]:
         attack_value = getattr(attack, field, None)
         if baseline_value != attack_value:
             differences[field] = {"baseline": baseline_value, "attack": attack_value}
+    for field in ("graphql_errors", "data_shape"):
+        baseline_value = getattr(baseline, field, ())
+        attack_value = getattr(attack, field, ())
+        if baseline_value != attack_value:
+            differences[field] = {"baseline": baseline_value, "attack": attack_value}
     baseline_time = getattr(baseline, "response_time_ms", None)
     attack_time = getattr(attack, "response_time_ms", None)
     if baseline_time is not None and attack_time is not None:
@@ -118,25 +123,91 @@ def compare_responses(baseline: Any, attack: Any) -> dict[str, Any]:
     return differences
 
 
+def snapshot_response(response: Any, elapsed_ms: float,
+                      graphql: bool = False) -> ResponseSnapshot:
+    errors: tuple[str, ...] = ()
+    data_shape: tuple[str, ...] = ()
+    if graphql:
+        try:
+            document = response.json() if hasattr(response, "json") else json.loads(response.text)
+            raw_errors = document.get("errors", []) if isinstance(document, dict) else []
+            errors = tuple(
+                str(item.get("message", item)) if isinstance(item, dict) else str(item)
+                for item in raw_errors
+            )
+            data = document.get("data") if isinstance(document, dict) else None
+            data_shape = tuple(sorted(data.keys())) if isinstance(data, dict) else ()
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return ResponseSnapshot(
+        status_code=response.status_code,
+        body_hash=content_hash(response.text or ""),
+        headers_hash=content_hash(dict(response.headers)),
+        response_time_ms=round(elapsed_ms, 1),
+        graphql_errors=errors,
+        data_shape=data_shape,
+    )
+
+
+class ConfirmationEngine:
+    """Execute baseline and attack through protocol-specific async adapters."""
+
+    async def confirm(self, candidate, execute_baseline, execute_attack,
+                      snapshot=snapshot_response) -> ConfirmationResult:
+        baseline_snapshot = None
+        if execute_baseline is not None:
+            started = time.perf_counter()
+            try:
+                response = await execute_baseline()
+                baseline_snapshot = snapshot(
+                    response, (time.perf_counter() - started) * 1000,
+                )
+            except Exception:
+                baseline_snapshot = None
+
+        started = time.perf_counter()
+        attack_response = await execute_attack()
+        attack_snapshot = snapshot(
+            attack_response, (time.perf_counter() - started) * 1000,
+        )
+        is_candidate = candidate(attack_response) if callable(candidate) else candidate
+        return confirmation_result(baseline_snapshot, attack_snapshot, is_candidate)
+
+
 @dataclass
-class ResponseObservation:
+class ResponseSnapshot:
     status_code: int
     body_hash: str
     headers_hash: str
     response_time_ms: float
+    graphql_errors: tuple[str, ...] = ()
+    data_shape: tuple[str, ...] = ()
 
 
-def confirmation_result(baseline: Optional[ResponseObservation],
-                        attack: ResponseObservation,
-                        candidate: bool) -> tuple[bool, float, dict[str, Any]]:
+ResponseObservation = ResponseSnapshot
+
+
+@dataclass
+class ConfirmationResult:
+    candidate: bool
+    confirmed: bool
+    confidence: float
+    evidence: dict[str, Any]
+    baseline: Optional[ResponseSnapshot]
+    attack: Optional[ResponseSnapshot]
+
+
+def confirmation_result(baseline: Optional[ResponseSnapshot],
+                        attack: ResponseSnapshot,
+                        candidate: bool) -> ConfirmationResult:
     """Confirm a candidate only when attack behavior differs from baseline."""
     if baseline is None:
-        return False, 0.35 if candidate else 0.1, {}
+        return ConfirmationResult(candidate, False, 0.35 if candidate else 0.1, {}, None, attack)
     differences = compare_responses(baseline, attack)
     if not candidate:
-        return False, 0.2 if differences else 0.1, differences
-    strong_difference = any(name in differences for name in ("status_code", "body_hash"))
-    return strong_difference, 0.9 if strong_difference else 0.55, differences
+        return ConfirmationResult(False, False, 0.2 if differences else 0.1, differences, baseline, attack)
+    strong_difference = any(name in differences for name in ("status_code", "body_hash", "graphql_errors", "data_shape"))
+    return ConfirmationResult(candidate, strong_difference, 0.9 if strong_difference else 0.55, differences, baseline, attack)
 
 
 class Finding(BaseModel):

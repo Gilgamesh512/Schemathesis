@@ -42,7 +42,9 @@ import httpx
 from pydantic import BaseModel, Field, ValidationError
 
 import rules_engine
-from core import Evidence, Finding, RequestScheduler, content_hash, redact_headers, stable_finding_id
+from core import (ConfirmationEngine, Evidence, Finding, RequestScheduler,
+                  content_hash, redact_headers, snapshot_response,
+                  stable_finding_id)
 
 
 DEFAULT_ERROR_SIGNALS = [
@@ -176,6 +178,40 @@ def build_graphql_request(payload: GraphQLPayload) -> dict[str, Any]:
     return body
 
 
+def _replace_value(value: Any, attack_value: Any, baseline_value: Any) -> Any:
+    if value == attack_value:
+        return baseline_value
+    if isinstance(value, dict):
+        return {key: _replace_value(item, attack_value, baseline_value)
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [_replace_value(item, attack_value, baseline_value) for item in value]
+    return value
+
+
+def build_baseline_payload(payload: GraphQLPayload) -> Optional[GraphQLPayload]:
+    """Keep GraphQL operation shape while replacing only the attack value."""
+    attack_value = payload.payload_value
+    if attack_value is None:
+        return None
+    baseline_value = "1" if isinstance(attack_value, str) else 1
+    baseline_query = payload.query
+    if isinstance(attack_value, str):
+        baseline_query = baseline_query.replace(
+            json.dumps(attack_value), json.dumps(baseline_value), 1,
+        )
+    baseline_variables = _replace_value(
+        payload.variables, attack_value, baseline_value,
+    )
+    if baseline_query == payload.query and baseline_variables == payload.variables:
+        return None
+    return payload.model_copy(update={
+        "query": baseline_query,
+        "variables": baseline_variables,
+        "payload_value": baseline_value,
+    })
+
+
 def extract_graphql_errors(response_json: Any) -> list[str]:
     if not isinstance(response_json, dict):
         return []
@@ -286,14 +322,14 @@ def evaluate_response(
     cve_ids = [c["cve_id"] for c in matched_cves]
 
     # ------------------------------------------------------------
-    # 4. Determine severity + confirmation
+    # 4. Determine severity + candidate status. Confirmation is done by the
+    # shared baseline-vs-attack engine after this detector returns.
     # ------------------------------------------------------------
 
-    # Server-side 5xx is a strong signal, but keep the finding
-    # distinguishable from payload-specific exploit confirmation.
+    # Server-side 5xx is a strong candidate signal, not confirmation.
     if status >= 500:
         severity = SEVERITY_BY_STATUS.get(status, "high")
-        confirmed = True
+        candidate = True
 
         evidence_parts = [
             f"HTTP {status}",
@@ -316,12 +352,10 @@ def evaluate_response(
 
         evidence = "; ".join(evidence_parts)
 
-    # Payload-specific expected signal is the primary confirmation
-    # mechanism. This is what prevents generic "debug" from confirming
-    # the old false-positive SQLi finding.
+    # Payload-specific expected signal is the primary candidate mechanism.
     elif expected_hits:
         severity = "medium"
-        confirmed = True
+        candidate = True
 
         evidence_parts = [
             f"HTTP {status}",
@@ -341,10 +375,10 @@ def evaluate_response(
 
         evidence = "; ".join(evidence_parts)
 
-    # Generic signal only: evidence, NOT confirmation.
+    # Generic signal only: evidence, NOT a candidate.
     elif generic_hits:
         severity = "info"
-        confirmed = False
+        candidate = False
 
         evidence_parts = [
             f"HTTP {status}",
@@ -362,7 +396,7 @@ def evaluate_response(
     # GraphQL errors are not vulnerabilities by themselves.
     elif gql_errors:
         severity = "info"
-        confirmed = False
+        candidate = False
         evidence = (
             f"HTTP {status}; "
             f"GraphQL errors={gql_errors[:3]}"
@@ -370,13 +404,13 @@ def evaluate_response(
 
     else:
         severity = "info"
-        confirmed = False
+        candidate = False
         evidence = (
             f"HTTP {status}; "
             "khong phat hien dau hieu bat thuong"
         )
 
-    return severity, confirmed, evidence, cve_ids
+    return severity, candidate, evidence, cve_ids
 
 
 async def fire_case(
@@ -419,34 +453,60 @@ async def process_payload(
         return None
 
     url = base_url.rstrip("/") + "/" + endpoint.lstrip("/")
-
-    t0 = time.perf_counter()
+    baseline_payload = build_baseline_payload(payload)
+    attack_response = None
     try:
-        resp = await scheduler.request(
-            target_app,
-            lambda: fire_case(client, url, payload, headers),
+        async def execute_baseline():
+            return await scheduler.request(
+                target_app,
+                lambda: fire_case(client, url, baseline_payload, headers),
+            )
+
+        async def execute_attack():
+            nonlocal attack_response
+            attack_response = await scheduler.request(
+                target_app,
+                lambda: fire_case(client, url, payload, headers),
+            )
+            return attack_response
+
+        def candidate_detector(response):
+            return evaluate_response(response, payload, rules)[1]
+
+        result = await ConfirmationEngine().confirm(
+            candidate_detector,
+            execute_baseline if baseline_payload is not None else None,
+            execute_attack,
+            lambda response, elapsed: snapshot_response(response, elapsed, graphql=True),
         )
         error_text = None
     except Exception as exc:
-        resp = None
+        attack_response = None
+        result = None
         error_text = str(exc)
-
-    elapsed_ms = (time.perf_counter() - t0) * 1000
+    resp = attack_response
 
     if rate_limit_s:
         await asyncio.sleep(rate_limit_s)
 
-    if resp is None:
+    if resp is None or result is None:
         severity = "unknown"
         confirmed = False
         evidence = f"request loi: {error_text}"
         status_code = None
         cve_ids: list[str] = []
+        confidence = 0.1
+        confirmation_differences = {}
     else:
         severity, confirmed, evidence, cve_ids = evaluate_response(
             resp, payload, rules
         )
         status_code = resp.status_code
+        confirmed = result.confirmed
+        confidence = result.confidence
+        confirmation_differences = result.evidence
+
+    elapsed_ms = result.attack.response_time_ms if result and result.attack else 0
 
     request_payload = {
         "query": payload.query,
@@ -464,6 +524,14 @@ async def process_payload(
         endpoint=endpoint,
         payload=request_payload,
         auth_context=redact_headers(headers),
+        previous_observations=([{
+            "role": "baseline",
+            "status_code": result.baseline.status_code,
+            "response_time_ms": result.baseline.response_time_ms,
+            "graphql_errors": result.baseline.graphql_errors,
+            "data_shape": result.baseline.data_shape,
+            "differences": confirmation_differences,
+        }] if result and result.baseline else []),
     )
     finding = Finding(
         finding_id=stable_finding_id(
@@ -487,16 +555,17 @@ async def process_payload(
         response_time_ms=round(elapsed_ms, 1),
         evidence=evidence_model,
         severity=severity,
-        confidence=0.95 if confirmed and status_code is not None and status_code >= 500 else (0.65 if confirmed else 0.25),
+        confidence=confidence,
         confirmed=confirmed,
-        lifecycle="confirmed" if confirmed else "possible",
+        lifecycle=("confirmed" if confirmed else
+               ("candidate" if result and result.candidate else "rejected")),
         fingerprint=fp,
         cve_matches=cve_ids,
         cve_match_type=("cpe" if payload.technology else "keyword") if cve_ids else "",
         cve_confidence=0.94 if payload.technology and cve_ids else (0.2 if cve_ids else 0.0),
     )
 
-    state.record(fp, "confirmed" if confirmed else "tested")
+    state.record(fp, "confirmed" if confirmed else ("candidate" if result and result.candidate else "rejected"))
     return finding
 
 

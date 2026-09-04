@@ -2,8 +2,9 @@ from unittest.mock import Mock, patch
 
 import asyncio
 
-from core import (RequestScheduler, ResponseObservation, compare_responses,
-                  confirmation_result, redact_headers, stable_finding_id)
+from core import (ConfirmationEngine, RequestScheduler, ResponseObservation,
+                  compare_responses, confirmation_result, redact_headers,
+                  snapshot_response, stable_finding_id)
 from rules_engine import fetch_cves_for_keyword, match_cves_by_keyword
 
 
@@ -83,10 +84,39 @@ def test_confirmation_comparator_exposes_behavioral_difference():
 def test_confirmation_requires_attack_difference():
     baseline = ResponseObservation(200, "same", "headers", 20)
     attack = ResponseObservation(500, "different", "headers", 25)
-    confirmed, confidence, differences = confirmation_result(baseline, attack, True)
-    assert confirmed is True
-    assert confidence == 0.9
-    assert "status_code" in differences
+    result = confirmation_result(baseline, attack, True)
+    assert result.confirmed is True
+    assert result.confidence == 0.9
+    assert "status_code" in result.evidence
+
+
+def test_confirmation_engine_executes_baseline_then_attack():
+    class Response:
+        def __init__(self, status, body):
+            self.status_code = status
+            self.text = body
+            self.headers = {}
+
+    async def run():
+        calls = []
+
+        async def baseline():
+            calls.append("baseline")
+            return Response(200, '{"data":{"user":{}}}')
+
+        async def attack():
+            calls.append("attack")
+            return Response(500, '{"errors":[{"message":"database error"}]}')
+
+        return calls, await ConfirmationEngine().confirm(
+            True, baseline, attack,
+            lambda response, elapsed: snapshot_response(response, elapsed, graphql=True),
+        )
+
+    calls, result = asyncio.run(run())
+    assert calls == ["baseline", "attack"]
+    assert result.confirmed is True
+    assert result.attack.graphql_errors == ("database error",)
 
 
 def test_cve_technology_filter_requires_applicable_cpe():

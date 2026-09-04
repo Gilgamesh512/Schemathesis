@@ -41,7 +41,7 @@ import yaml
 from pydantic import BaseModel, Field, ValidationError
 
 import rules_engine
-from core import Evidence, Finding, content_hash, redact_headers, stable_finding_id
+from core import Evidence, Finding, RequestScheduler, content_hash, redact_headers, stable_finding_id
 
 # --------------------------------------------------------------------------
 # 1. Schema du lieu (payload tu B phai khop dung format nay)
@@ -57,6 +57,7 @@ class Payload(BaseModel):
     owasp_category: Optional[str] = None
     context: Optional[str] = None
     expected_signal: list[str] = Field(default_factory=list)  # tu khoa nghi ngo trong response
+    technology: Optional[dict[str, str]] = None
     target_app: Optional[str] = None  # "vampi" | "crapi" | ... - B NEN dien khi
                                        # chay multi-target, tranh truong hop 1
                                        # endpoint trung ten giua 2 app khac nhau
@@ -380,7 +381,7 @@ def evaluate_response(resp, payload: Payload, rules: Optional[dict] = None
     matched_cves: list[dict] = []
     if rules is not None:
         matched_cves = rules_engine.match_cves_by_keyword(
-            rules, payload.attack_type, payload.owasp_category)
+            rules, payload.attack_type, payload.owasp_category, payload.technology)
     cve_ids = [c["cve_id"] for c in matched_cves]
 
     if status >= 500:
@@ -411,7 +412,7 @@ async def fire_case(client: "httpx.AsyncClient", case, base_url: str, headers: d
 
 
 async def process_fingerprint_group(
-    client: "httpx.AsyncClient", sem: "asyncio.Semaphore",
+    client: "httpx.AsyncClient", scheduler: RequestScheduler,
     fp: str, group: list[PreparedCase], headers: dict,
     rules: Optional[dict], state: RunState, rate_limit_s: float,
 ) -> list[Finding]:
@@ -434,17 +435,19 @@ async def process_fingerprint_group(
         if state.attempts(fp) >= MAX_ATTEMPTS_PER_FINGERPRINT:
             break
 
-        async with sem:
-            t0 = time.perf_counter()
-            try:
-                resp = await fire_case(client, pc.case, pc.base_url, headers)
-                error_text = None
-            except Exception as exc:
-                resp = None
-                error_text = str(exc)
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-            if rate_limit_s:
-                await asyncio.sleep(rate_limit_s)
+        t0 = time.perf_counter()
+        try:
+            resp = await scheduler.request(
+                pc.target_app,
+                lambda: fire_case(client, pc.case, pc.base_url, headers),
+            )
+            error_text = None
+        except Exception as exc:
+            resp = None
+            error_text = str(exc)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        if rate_limit_s:
+            await asyncio.sleep(rate_limit_s)
 
         if resp is None:
             severity, confirmed, evidence, cve_ids = "unknown", False, f"request loi: {error_text}", []
@@ -502,16 +505,16 @@ async def process_fingerprint_group(
 
 async def run_all(prepared: list[PreparedCase], headers: dict,
                    rules: Optional[dict], state: RunState, concurrency: int,
-                   rate_limit_ms: int) -> list[Finding]:
+                   rate_limit_ms: int, global_rps: float = 0) -> list[Finding]:
     groups: dict[str, list[PreparedCase]] = {}
     for pc in prepared:
         groups.setdefault(pc.fingerprint, []).append(pc)
 
-    sem = asyncio.Semaphore(concurrency)
+    scheduler = RequestScheduler(concurrency=concurrency, global_rps=global_rps)
     async with httpx.AsyncClient(timeout=20.0) as client:
         tasks = [
             process_fingerprint_group(
-                client, sem, fp, group, headers,
+                client, scheduler, fp, group, headers,
                 rules, state, rate_limit_ms / 1000,
             )
             for fp, group in groups.items()
@@ -553,6 +556,8 @@ def main():
                           "(an toan cho container lab)")
     ap.add_argument("--concurrency", type=int, default=10,
                      help="So request toi da chay song song (bat dong bo)")
+    ap.add_argument("--global-rps", type=float, default=0,
+                     help="Gioi han request/giay toan cuc (0 = tat)")
     ap.add_argument("--rules", default="rules.json", help="File rules OWASP+CVE (rules_engine.py)")
     args = ap.parse_args()
 
@@ -611,6 +616,7 @@ def main():
     findings = asyncio.run(run_all(
         prepared, headers, rules, state,
         args.concurrency, args.rate_limit_ms,
+        args.global_rps,
     ))
     total_fired = len(findings)
     total_skipped = total_prepared - total_fired

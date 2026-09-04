@@ -107,6 +107,13 @@ def fetch_cves_for_keyword(keyword: str, days_back: int, api_key: Optional[str])
                     score = metrics[key][0]["cvssData"].get("baseScore")
                     break
 
+            cpe_uris = []
+            for node in cve.get("configurations", []):
+                for cpe_match in node.get("nodes", []):
+                    for match in cpe_match.get("cpeMatch", []):
+                        if match.get("criteria"):
+                            cpe_uris.append(match["criteria"])
+
             out.append({
                 "cve_id": cve_id,
                 "keyword": keyword,
@@ -114,6 +121,7 @@ def fetch_cves_for_keyword(keyword: str, days_back: int, api_key: Optional[str])
                 "cvss_score": score,
                 "severity": _severity_from_cvss(score),
                 "published": cve.get("published"),
+                "cpe_uris": sorted(set(cpe_uris)),
             })
         if not page:
             break
@@ -188,7 +196,8 @@ ATTACK_TYPE_SYNONYMS = {
 }
 
 
-def match_cves_by_keyword(rules: dict, attack_type: str, owasp_category: Optional[str] = None
+def match_cves_by_keyword(rules: dict, attack_type: str, owasp_category: Optional[str] = None,
+                          technology: Optional[dict] = None
                            ) -> list[dict]:
     """Tim CVE trong cache lien quan toi loai tan cong dang test, dung bang
     dong nghia thay vi so khop chu-doi-chu (attack_type/owasp code thuong
@@ -201,10 +210,20 @@ def match_cves_by_keyword(rules: dict, attack_type: str, owasp_category: Optiona
         phrases.extend(w for w in name.replace("(", "").replace(")", "").split()
                         if len(w) >= 4 and w not in STOPWORDS)
 
+    technology_terms = []
+    if technology:
+        technology_terms = [str(value).lower() for value in technology.values() if value]
+
     matched = []
     for cve in rules.get("cve_signals", []):
         desc_l = cve["description"].lower()
-        if any(p in desc_l for p in phrases):
+        attack_match = any(p in desc_l for p in phrases)
+        cpe_match = not technology_terms or any(
+            term in " ".join(cve.get("cpe_uris", [])).lower()
+            or term in desc_l
+            for term in technology_terms
+        )
+        if attack_match and cpe_match:
             matched.append(cve)
     return matched[:3]
 

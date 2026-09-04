@@ -1,6 +1,8 @@
 from unittest.mock import Mock, patch
 
-from core import redact_headers, stable_finding_id
+import asyncio
+
+from core import RequestScheduler, compare_responses, redact_headers, stable_finding_id
 from rules_engine import fetch_cves_for_keyword
 
 
@@ -36,3 +38,42 @@ def test_nvd_fetch_paginates_until_total_results():
 
     assert [item["cve_id"] for item in result] == ["CVE-1", "CVE-2"]
     assert get.call_count == 2
+
+
+def test_scheduler_retries_429_then_returns_success():
+    class Response:
+        def __init__(self, status_code, retry_after=None):
+            self.status_code = status_code
+            self.headers = {"Retry-After": str(retry_after)} if retry_after else {}
+
+    async def run():
+        scheduler = RequestScheduler(concurrency=1, max_retries=1)
+        responses = iter((Response(429, 0), Response(200)))
+        calls = 0
+
+        async def operation():
+            nonlocal calls
+            calls += 1
+            return next(responses)
+
+        result = await scheduler.request("vampi", operation)
+        return result.status_code, calls
+
+    assert asyncio.run(run()) == (200, 2)
+
+
+def test_confirmation_comparator_exposes_behavioral_difference():
+    class Observation:
+        status_code = 400
+        body_hash = "same"
+        headers_hash = "h1"
+        response_time_ms = 20
+
+    baseline = Observation()
+    attack = Observation()
+    attack.status_code = 500
+    attack.body_hash = "different"
+    attack.response_time_ms = 30
+    assert set(compare_responses(baseline, attack)) == {
+        "status_code", "body_hash", "response_time_ms"
+    }

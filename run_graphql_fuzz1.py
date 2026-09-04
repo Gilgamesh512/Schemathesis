@@ -42,7 +42,7 @@ import httpx
 from pydantic import BaseModel, Field, ValidationError
 
 import rules_engine
-from core import Evidence, Finding, content_hash, redact_headers, stable_finding_id
+from core import Evidence, Finding, RequestScheduler, content_hash, redact_headers, stable_finding_id
 
 
 DEFAULT_ERROR_SIGNALS = [
@@ -73,6 +73,7 @@ class GraphQLPayload(BaseModel):
     owasp_category: Optional[str] = None
     context: Optional[str] = None
     expected_signal: list[str] = Field(default_factory=list)
+    technology: Optional[dict[str, str]] = None
 
     target_app: Optional[str] = "dvga"
     operation: Optional[str] = None
@@ -279,6 +280,7 @@ def evaluate_response(
             rules,
             payload.attack_type,
             payload.owasp_category,
+            payload.technology,
         )
 
     cve_ids = [c["cve_id"] for c in matched_cves]
@@ -392,7 +394,7 @@ async def fire_case(
 
 async def process_payload(
     client: httpx.AsyncClient,
-    sem: asyncio.Semaphore,
+    scheduler: RequestScheduler,
     payload: GraphQLPayload,
     base_url: str,
     endpoint: str,
@@ -418,19 +420,21 @@ async def process_payload(
 
     url = base_url.rstrip("/") + "/" + endpoint.lstrip("/")
 
-    async with sem:
-        t0 = time.perf_counter()
-        try:
-            resp = await fire_case(client, url, payload, headers)
-            error_text = None
-        except Exception as exc:
-            resp = None
-            error_text = str(exc)
+    t0 = time.perf_counter()
+    try:
+        resp = await scheduler.request(
+            target_app,
+            lambda: fire_case(client, url, payload, headers),
+        )
+        error_text = None
+    except Exception as exc:
+        resp = None
+        error_text = str(exc)
 
-        elapsed_ms = (time.perf_counter() - t0) * 1000
+    elapsed_ms = (time.perf_counter() - t0) * 1000
 
-        if rate_limit_s:
-            await asyncio.sleep(rate_limit_s)
+    if rate_limit_s:
+        await asyncio.sleep(rate_limit_s)
 
     if resp is None:
         severity = "unknown"
@@ -503,13 +507,14 @@ async def run_all(
     state: RunState,
     concurrency: int,
     rate_limit_ms: int,
+    global_rps: float = 0,
 ) -> list[Finding]:
-    sem = asyncio.Semaphore(concurrency)
+    scheduler = RequestScheduler(concurrency=concurrency, global_rps=global_rps)
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         tasks = [
             process_payload(
-                client, sem, payload, base_url, endpoint,
+                client, scheduler, payload, base_url, endpoint,
                 headers, rules, state, rate_limit_ms / 1000,
             )
             for payload in payloads
@@ -597,6 +602,8 @@ def main() -> None:
     ap.add_argument("--results-dir", default="main_pipeline/results")
     ap.add_argument("--rate-limit-ms", type=int, default=200)
     ap.add_argument("--concurrency", type=int, default=10)
+    ap.add_argument("--global-rps", type=float, default=0,
+                    help="Gioi han request/giay toan cuc (0 = tat)")
     ap.add_argument("--rules", default="rules.json")
     ap.add_argument("--auth-header", default=None)
 
@@ -691,6 +698,7 @@ def main() -> None:
             state,
             max(1, args.concurrency),
             max(0, args.rate_limit_ms),
+            args.global_rps,
         )
     )
 

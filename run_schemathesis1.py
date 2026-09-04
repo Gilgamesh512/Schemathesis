@@ -60,6 +60,7 @@ class Payload(BaseModel):
     context: Optional[str] = None
     expected_signal: list[str] = Field(default_factory=list)  # tu khoa nghi ngo trong response
     technology: Optional[dict[str, str]] = None
+    mutation_family: Optional[str] = None
     target_app: Optional[str] = None  # "vampi" | "crapi" | ... - B NEN dien khi
                                        # chay multi-target, tranh truong hop 1
                                        # endpoint trung ten giua 2 app khac nhau
@@ -88,12 +89,14 @@ SEVERITY_BY_STATUS = {
 STATE_RUN_ID: "contextvars.ContextVar[str]" = contextvars.ContextVar("run_id", default="")
 
 
-def fingerprint_of(target_app: str, endpoint: str, method: str, param: str, attack_type: str) -> str:
+def fingerprint_of(target_app: str, endpoint: str, method: str, param: str,
+                   attack_type: str, mutation_family: Optional[str] = None) -> str:
     """Fingerprint tren (target_app, endpoint, method, param, attack_type).
     PHAI co target_app: khi chay multi-target, VAmPI va crAPI co the cung
     co endpoint /users/{id} - thieu target_app se lam 2 app khac nhau bi
     coi la CUNG 1 fingerprint, dedup/state se sai lech giua 2 target."""
-    raw = f"{target_app.lower()}|{method.upper()}|{endpoint}|{param}|{attack_type.lower()}"
+    raw = (f"{target_app.lower()}|{method.upper()}|{endpoint}|{param}|"
+           f"{attack_type.lower()}|{mutation_family or ''}")
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
@@ -312,16 +315,33 @@ def find_operation_multi(targets: dict[str, tuple], payload: "Payload"):
     return candidates[0]
 
 
-def build_case(schema, op, payload: Payload):
+def _baseline_component(baseline_case, name: str):
+    if baseline_case is None:
+        return None
+    value = getattr(baseline_case, name, None)
+    if value is not None:
+        return value.copy() if isinstance(value, dict) else value
+    return None
+
+
+def build_case(schema, op, payload: Payload, baseline_case=None):
     kwargs: dict[str, Any] = {"operation": op, "method": op.method, "path": op.path}
     if payload.param_location == "query":
-        kwargs["query"] = {payload.target_param: payload.payload_value}
+        values = _baseline_component(baseline_case, "query") or {}
+        values[payload.target_param] = payload.payload_value
+        kwargs["query"] = values
     elif payload.param_location == "path":
-        kwargs["path_parameters"] = {payload.target_param: payload.payload_value}
+        values = _baseline_component(baseline_case, "path_parameters") or {}
+        values[payload.target_param] = payload.payload_value
+        kwargs["path_parameters"] = values
     elif payload.param_location == "header":
-        kwargs["headers"] = {payload.target_param: str(payload.payload_value)}
+        values = _baseline_component(baseline_case, "headers") or {}
+        values[payload.target_param] = str(payload.payload_value)
+        kwargs["headers"] = values
     elif payload.param_location == "body":
-        kwargs["body"] = {payload.target_param: payload.payload_value}
+        values = _baseline_component(baseline_case, "body") or {}
+        values[payload.target_param] = payload.payload_value
+        kwargs["body"] = values
     else:
         raise ValueError(f"param_location khong ho tro: {payload.param_location}")
     return schema.make_case(**kwargs)
@@ -365,21 +385,31 @@ def prepare_cases(payloads: list[Payload], targets: dict[str, tuple]) -> list[Pr
                   file=sys.stderr)
             continue
         name, schema, base_url, op = match
-        try:
-            case = build_case(schema, op, payload)
-        except Exception as exc:
-            print(f"[CANH BAO] Khong tao duoc case cho {payload.endpoint} "
-                  f"(target={name}): {exc}", file=sys.stderr)
-            continue
+        baseline_case = None
         try:
             baseline_case = build_baseline_case(schema, op)
         except Exception as exc:
-            baseline_case = None
             print(f"[CANH BAO] Khong tao duoc baseline cho {payload.endpoint} "
                   f"(target={name}); finding se khong duoc auto-confirm: {exc}",
                   file=sys.stderr)
+        try:
+            case = build_case(schema, op, payload, baseline_case)
+        except Exception as exc:
+            if baseline_case is not None:
+                try:
+                    case = build_case(schema, op, payload)
+                    baseline_case = None
+                except Exception:
+                    print(f"[CANH BAO] Khong tao duoc case cho {payload.endpoint} "
+                          f"(target={name}): {exc}", file=sys.stderr)
+                    continue
+            else:
+                print(f"[CANH BAO] Khong tao duoc case cho {payload.endpoint} "
+                      f"(target={name}): {exc}", file=sys.stderr)
+                continue
         fp = fingerprint_of(name, payload.endpoint, payload.method,
-                             payload.target_param, payload.attack_type)
+                             payload.target_param, payload.attack_type,
+                             payload.mutation_family)
         prepared.append(PreparedCase(fp, name, base_url, baseline_case, case, payload))
     return prepared
 
@@ -534,6 +564,7 @@ async def process_fingerprint_group(
             ),
             run_id=STATE_RUN_ID.get(),
             timestamp=datetime.now(timezone.utc).isoformat(),
+            tool="schemathesis",
             target_app=pc.target_app,
             endpoint=pc.payload.endpoint,
             method=pc.payload.method,

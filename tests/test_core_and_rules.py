@@ -1,10 +1,14 @@
 from unittest.mock import Mock, patch
 
 import asyncio
+import json
+from pathlib import Path
 
-from core import (ConfirmationEngine, RequestScheduler, ResponseObservation,
-                  compare_responses, confirmation_result, redact_headers,
-                  snapshot_response, stable_finding_id)
+import httpx
+
+from core import (ConfirmationEngine, Evidence, Finding, RequestScheduler,
+                  ResponseObservation, compare_responses, confirmation_result,
+                  redact_headers, snapshot_response, stable_finding_id)
 from rules_engine import fetch_cves_for_keyword, match_cves_by_keyword
 
 
@@ -90,6 +94,32 @@ def test_confirmation_requires_attack_difference():
     assert "status_code" in result.evidence
 
 
+def test_body_only_difference_is_not_confirmation():
+    baseline = ResponseObservation(200, "timestamp-a", "headers", 20)
+    attack = ResponseObservation(200, "timestamp-b", "headers", 21)
+    result = confirmation_result(baseline, attack, True)
+    assert result.confirmed is False
+    assert result.confidence == 0.55
+
+
+def test_finding_requires_and_accepts_tool_field():
+    finding = Finding(
+        finding_id="F-test",
+        run_id="run-test",
+        timestamp="2026-09-05T00:00:00+00:00",
+        target_app="vampi",
+        endpoint="/users",
+        method="POST",
+        tool="schemathesis",
+        attack_type="sqli",
+        evidence=Evidence(),
+        severity="high",
+        confidence=0.9,
+        fingerprint="fp-test",
+    )
+    assert finding.tool == "schemathesis"
+
+
 def test_confirmation_engine_executes_baseline_then_attack():
     class Response:
         def __init__(self, status, body):
@@ -135,3 +165,39 @@ def test_cve_technology_filter_requires_applicable_cpe():
         rules, "ssrf", technology={"framework": "flask"}
     )
     assert [item["cve_id"] for item in result] == ["CVE-FLASK"]
+
+
+def test_graphql_process_uses_baseline_and_sets_tool(tmp_path: Path):
+    from run_graphql_fuzz1 import GraphQLPayload, RunState, process_payload
+
+    calls = []
+
+    def handler(request):
+        body = request.read().decode()
+        calls.append(body)
+        query = json.loads(body)["query"]
+        if '"normal"' in query:
+            return httpx.Response(200, json={"data": {"user": {"id": "1"}}})
+        return httpx.Response(500, json={"errors": [{"message": "database error"}]})
+
+    async def run():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            payload = GraphQLPayload(
+                query='query { user(id: "\' OR 1=1") { id } }',
+                attack_type="sqli",
+                payload_value="' OR 1=1",
+            )
+            state = RunState(tmp_path / "state.json")
+            from core import RequestScheduler
+            return await process_payload(
+                client, RequestScheduler(max_retries=0), payload,
+                "http://dvga", "/graphql", {}, None, state, 0,
+            ), state, calls
+
+    finding, state, requests = asyncio.run(run())
+    assert len(requests) == 2
+    assert 'normal' in json.loads(requests[0])["query"]
+    assert finding.tool == "schemathesis"
+    assert finding.lifecycle == "confirmed"
+    assert state.status(finding.fingerprint) == "confirmed"

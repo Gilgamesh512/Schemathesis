@@ -206,7 +206,11 @@ def confirmation_result(baseline: Optional[ResponseSnapshot],
     differences = compare_responses(baseline, attack)
     if not candidate:
         return ConfirmationResult(False, False, 0.2 if differences else 0.1, differences, baseline, attack)
-    strong_difference = any(name in differences for name in ("status_code", "body_hash", "graphql_errors", "data_shape"))
+    # Raw body/header hashes are useful evidence, but dynamic values such as
+    # timestamps, request IDs, and JSON ordering must not confirm a finding.
+    strong_difference = any(name in differences for name in (
+        "status_code", "graphql_errors", "data_shape",
+    ))
     return ConfirmationResult(candidate, strong_difference, 0.9 if strong_difference else 0.55, differences, baseline, attack)
 
 

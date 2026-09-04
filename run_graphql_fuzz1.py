@@ -76,6 +76,7 @@ class GraphQLPayload(BaseModel):
     context: Optional[str] = None
     expected_signal: list[str] = Field(default_factory=list)
     technology: Optional[dict[str, str]] = None
+    mutation_family: Optional[str] = None
 
     target_app: Optional[str] = "dvga"
     operation: Optional[str] = None
@@ -87,11 +88,12 @@ def fingerprint_of(
     operation: Optional[str],
     attack_type: str,
     query: str,
+    mutation_family: Optional[str] = None,
 ) -> str:
     query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:12]
     raw = (
         f"{target_app.lower()}|POST|{endpoint}|"
-        f"{operation or ''}|{attack_type.lower()}|{query_hash}"
+        f"{operation or ''}|{attack_type.lower()}|{mutation_family or ''}|{query_hash}"
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
@@ -194,7 +196,22 @@ def build_baseline_payload(payload: GraphQLPayload) -> Optional[GraphQLPayload]:
     attack_value = payload.payload_value
     if attack_value is None:
         return None
-    baseline_value = "1" if isinstance(attack_value, str) else 1
+    if isinstance(attack_value, bool):
+        baseline_value = False
+    elif isinstance(attack_value, int):
+        baseline_value = 1
+    elif isinstance(attack_value, float):
+        baseline_value = 1.0
+    elif isinstance(attack_value, list):
+        baseline_value = attack_value[:1]
+    elif isinstance(attack_value, dict):
+        baseline_value = {}
+    elif isinstance(attack_value, str):
+        baseline_value = "normal"
+    else:
+        baseline_value = None
+    if baseline_value is None:
+        return None
     baseline_query = payload.query
     if isinstance(attack_value, str):
         baseline_query = baseline_query.replace(
@@ -445,6 +462,7 @@ async def process_payload(
         payload.operation or payload.operation_name,
         payload.attack_type,
         payload.query,
+        payload.mutation_family,
     )
 
     if state.status(fp) == "confirmed":
@@ -540,6 +558,7 @@ async def process_payload(
         ),
         run_id=RUN_ID,
         timestamp=datetime.now(timezone.utc).isoformat(),
+        tool="schemathesis",
         target_app=target_app,
         endpoint=endpoint,
         method="POST",
@@ -756,6 +775,7 @@ def main() -> None:
             payload.operation or payload.operation_name,
             payload.attack_type,
             payload.query,
+            payload.mutation_family,
         )
         before_attempts[fp] = state.attempts(fp)
 

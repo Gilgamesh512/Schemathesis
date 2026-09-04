@@ -41,7 +41,9 @@ import yaml
 from pydantic import BaseModel, Field, ValidationError
 
 import rules_engine
-from core import Evidence, Finding, RequestScheduler, content_hash, redact_headers, stable_finding_id
+from core import (Evidence, Finding, RequestScheduler, ResponseObservation,
+                  confirmation_result, content_hash, redact_headers,
+                  stable_finding_id)
 
 # --------------------------------------------------------------------------
 # 1. Schema du lieu (payload tu B phai khop dung format nay)
@@ -325,18 +327,30 @@ def build_case(schema, op, payload: Payload):
     return schema.make_case(**kwargs)
 
 
+def build_baseline_case(schema, op):
+    """Generate a valid ordinary case from the operation schema."""
+    strategy = getattr(op, "as_strategy", None)
+    if callable(strategy):
+        try:
+            return strategy().example()
+        except Exception:
+            pass
+    return schema.make_case(operation=op, method=op.method, path=op.path)
+
+
 class PreparedCase:
     """1 payload da duoc resolve xong: biet thuoc target nao, base_url nao,
     va Case cua Schemathesis da build san. Tach buoc nay ra khoi vong lap
     async de: (1) loi resolve/build (endpoint khong ton tai, param sai...)
     bi bat va bao cao HET 1 lan truoc khi ban request nao, thay vi loi
     ret ra giua chung fuzzing; (2) nhom fingerprint chinh xac tu dau."""
-    __slots__ = ("fingerprint", "target_app", "base_url", "case", "payload")
+    __slots__ = ("fingerprint", "target_app", "base_url", "baseline_case", "case", "payload")
 
-    def __init__(self, fingerprint, target_app, base_url, case, payload):
+    def __init__(self, fingerprint, target_app, base_url, baseline_case, case, payload):
         self.fingerprint = fingerprint
         self.target_app = target_app
         self.base_url = base_url
+        self.baseline_case = baseline_case
         self.case = case
         self.payload = payload
 
@@ -357,9 +371,16 @@ def prepare_cases(payloads: list[Payload], targets: dict[str, tuple]) -> list[Pr
             print(f"[CANH BAO] Khong tao duoc case cho {payload.endpoint} "
                   f"(target={name}): {exc}", file=sys.stderr)
             continue
+        try:
+            baseline_case = build_baseline_case(schema, op)
+        except Exception as exc:
+            baseline_case = None
+            print(f"[CANH BAO] Khong tao duoc baseline cho {payload.endpoint} "
+                  f"(target={name}); finding se khong duoc auto-confirm: {exc}",
+                  file=sys.stderr)
         fp = fingerprint_of(name, payload.endpoint, payload.method,
                              payload.target_param, payload.attack_type)
-        prepared.append(PreparedCase(fp, name, base_url, case, payload))
+        prepared.append(PreparedCase(fp, name, base_url, baseline_case, case, payload))
     return prepared
 
 
@@ -435,6 +456,27 @@ async def process_fingerprint_group(
         if state.attempts(fp) >= MAX_ATTEMPTS_PER_FINGERPRINT:
             break
 
+        baseline_resp = None
+        baseline_observation = None
+        baseline_elapsed_ms = None
+        if pc.baseline_case is not None:
+            baseline_t0 = time.perf_counter()
+            try:
+                baseline_resp = await scheduler.request(
+                    pc.target_app,
+                    lambda: fire_case(client, pc.baseline_case, pc.base_url, headers),
+                )
+                baseline_elapsed_ms = (time.perf_counter() - baseline_t0) * 1000
+                baseline_observation = ResponseObservation(
+                    status_code=baseline_resp.status_code,
+                    body_hash=content_hash(baseline_resp.text or ""),
+                    headers_hash=content_hash(dict(baseline_resp.headers)),
+                    response_time_ms=round(baseline_elapsed_ms, 1),
+                )
+            except Exception as exc:
+                print(f"[CANH BAO] Baseline loi cho {pc.target_app} "
+                      f"{pc.payload.method} {pc.payload.endpoint}: {exc}", file=sys.stderr)
+
         t0 = time.perf_counter()
         try:
             resp = await scheduler.request(
@@ -456,6 +498,21 @@ async def process_fingerprint_group(
             severity, confirmed, evidence, cve_ids = evaluate_response(resp, pc.payload, rules)
             status_code = resp.status_code
 
+        attack_observation = None
+        confirmation_differences = {}
+        if resp is not None:
+            attack_observation = ResponseObservation(
+                status_code=resp.status_code,
+                body_hash=content_hash(resp.text or ""),
+                headers_hash=content_hash(dict(resp.headers)),
+                response_time_ms=round(elapsed_ms, 1),
+            )
+            confirmed, confidence, confirmation_differences = confirmation_result(
+                baseline_observation, attack_observation, confirmed,
+            )
+        else:
+            confidence = 0.1
+
         payload_value = pc.payload.payload_value
         evidence_model = Evidence(
             status_code=status_code,
@@ -473,6 +530,12 @@ async def process_fingerprint_group(
             endpoint=pc.payload.endpoint,
             payload=payload_value,
             auth_context=redact_headers(headers),
+            previous_observations=([{
+                "role": "baseline",
+                "status_code": baseline_observation.status_code,
+                "response_time_ms": baseline_observation.response_time_ms,
+                "differences": confirmation_differences,
+            }] if baseline_observation else []),
         )
         finding = Finding(
             finding_id=stable_finding_id(
@@ -491,11 +554,13 @@ async def process_fingerprint_group(
             response_time_ms=round(elapsed_ms, 1),
             evidence=evidence_model,
             severity=severity,
-            confidence=0.95 if confirmed and status_code is not None and status_code >= 500 else (0.65 if confirmed else 0.25),
+            confidence=confidence,
             confirmed=confirmed,
             lifecycle="confirmed" if confirmed else "possible",
             fingerprint=fp,
             cve_matches=cve_ids,
+            cve_match_type=("cpe" if pc.payload.technology else "keyword") if cve_ids else "",
+            cve_confidence=0.94 if pc.payload.technology and cve_ids else (0.2 if cve_ids else 0.0),
         )
         results.append(finding)
         state.record(fp, "confirmed" if confirmed else "tested")

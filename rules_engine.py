@@ -218,10 +218,9 @@ def match_cves_by_keyword(rules: dict, attack_type: str, owasp_category: Optiona
     for cve in rules.get("cve_signals", []):
         desc_l = cve["description"].lower()
         attack_match = any(p in desc_l for p in phrases)
-        cpe_match = not technology_terms or any(
-            term in " ".join(cve.get("cpe_uris", [])).lower()
-            or term in desc_l
-            for term in technology_terms
+        cpe_text = " ".join(cve.get("cpe_uris", [])).lower()
+        cpe_match = not technology_terms or bool(cpe_text) and any(
+            term in cpe_text for term in technology_terms
         )
         if attack_match and cpe_match:
             matched.append(cve)

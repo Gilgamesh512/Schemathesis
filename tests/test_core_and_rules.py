@@ -2,8 +2,9 @@ from unittest.mock import Mock, patch
 
 import asyncio
 
-from core import RequestScheduler, compare_responses, redact_headers, stable_finding_id
-from rules_engine import fetch_cves_for_keyword
+from core import (RequestScheduler, ResponseObservation, compare_responses,
+                  confirmation_result, redact_headers, stable_finding_id)
+from rules_engine import fetch_cves_for_keyword, match_cves_by_keyword
 
 
 def test_finding_id_is_stable_and_payload_independent():
@@ -77,3 +78,30 @@ def test_confirmation_comparator_exposes_behavioral_difference():
     assert set(compare_responses(baseline, attack)) == {
         "status_code", "body_hash", "response_time_ms"
     }
+
+
+def test_confirmation_requires_attack_difference():
+    baseline = ResponseObservation(200, "same", "headers", 20)
+    attack = ResponseObservation(500, "different", "headers", 25)
+    confirmed, confidence, differences = confirmation_result(baseline, attack, True)
+    assert confirmed is True
+    assert confidence == 0.9
+    assert "status_code" in differences
+
+
+def test_cve_technology_filter_requires_applicable_cpe():
+    rules = {
+        "cve_signals": [{
+            "cve_id": "CVE-FLASK",
+            "description": "server-side request forgery in Flask application",
+            "cpe_uris": ["cpe:2.3:a:palletsproject:flask:2.0:*:*:*:*:*:*:*"],
+        }, {
+            "cve_id": "CVE-CISCO",
+            "description": "server-side request forgery in Cisco router",
+            "cpe_uris": ["cpe:2.3:h:cisco:router:1.0:*:*:*:*:*:*:*"],
+        }],
+    }
+    result = match_cves_by_keyword(
+        rules, "ssrf", technology={"framework": "flask"}
+    )
+    assert [item["cve_id"] for item in result] == ["CVE-FLASK"]

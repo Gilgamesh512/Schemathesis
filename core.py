@@ -8,6 +8,7 @@ import re
 import asyncio
 import random
 import time
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
@@ -117,6 +118,27 @@ def compare_responses(baseline: Any, attack: Any) -> dict[str, Any]:
     return differences
 
 
+@dataclass
+class ResponseObservation:
+    status_code: int
+    body_hash: str
+    headers_hash: str
+    response_time_ms: float
+
+
+def confirmation_result(baseline: Optional[ResponseObservation],
+                        attack: ResponseObservation,
+                        candidate: bool) -> tuple[bool, float, dict[str, Any]]:
+    """Confirm a candidate only when attack behavior differs from baseline."""
+    if baseline is None:
+        return False, 0.35 if candidate else 0.1, {}
+    differences = compare_responses(baseline, attack)
+    if not candidate:
+        return False, 0.2 if differences else 0.1, differences
+    strong_difference = any(name in differences for name in ("status_code", "body_hash"))
+    return strong_difference, 0.9 if strong_difference else 0.55, differences
+
+
 class Finding(BaseModel):
     finding_id: str
     run_id: str
@@ -137,3 +159,5 @@ class Finding(BaseModel):
     lifecycle: str = "new"
     fingerprint: str
     cve_matches: list[str] = Field(default_factory=list)
+    cve_match_type: str = ""
+    cve_confidence: float = 0.0

@@ -389,6 +389,7 @@ main_pipeline/results/
 Tabular finding output containing fields such as:
 
 ```text
+finding_id
 run_id
 timestamp
 target_app
@@ -399,11 +400,15 @@ owasp_category
 payload
 status_code
 response_time_ms
-evidence
+evidence (structured status/signals/timing/hashes)
 severity
+confidence
 confirmed
+lifecycle
 fingerprint
-matched_cve
+cve_matches
+cve_match_type
+cve_confidence
 ```
 
 ### `vulnerabilities.ndjson`
@@ -443,13 +448,27 @@ These keep fingerprint/deduplication state between runs.
 
 The fuzzers do not treat every error response as a confirmed vulnerability.
 
+REST candidates now use a baseline generated from the same OpenAPI operation:
+
+```text
+baseline case -> baseline response
+attack case   -> attack response
+              -> compare status/body/headers/timing
+              -> confirmation result
+```
+
+If a valid baseline cannot be generated, the attack can still run, but it is not
+automatically confirmed.
+
 In particular:
 
 - expected payload-specific signals are used as primary confirmation evidence;
-- server-side `5xx` responses are treated as strong signals;
+- server-side `5xx` responses are treated as strong candidate signals;
 - generic strings such as `debug`, `exception`, or `error` alone are not sufficient to confirm a vulnerability;
 - GraphQL errors alone are not automatically vulnerabilities;
-- matched CVEs provide contextual information and are not proof of exploitation.
+- keyword CVE matches provide contextual information only;
+- CPE/technology matches are recorded as stronger applicability evidence, but
+  behavior from the target remains the primary proof.
 
 This distinction is important for reducing false positives.
 

@@ -492,6 +492,8 @@ async def process_payload(
         lifecycle="confirmed" if confirmed else "possible",
         fingerprint=fp,
         cve_matches=cve_ids,
+        cve_match_type=("cpe" if payload.technology else "keyword") if cve_ids else "",
+        cve_confidence=0.94 if payload.technology and cve_ids else (0.2 if cve_ids else 0.0),
     )
 
     state.record(fp, "confirmed" if confirmed else "tested")

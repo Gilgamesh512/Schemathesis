@@ -459,7 +459,8 @@ def _ensure_container(
         configured_environment = set(config.get("Env") or ())
         if (
             labels.get(label) != revision
-            or config.get("Image") != image
+            or (config.get("Image") or "").removeprefix("localhost/")
+            != image.removeprefix("localhost/")
             or not any(port.get("HostPort") == str(host_port) for port in ports)
             or not set(environment).issubset(configured_environment)
         ):

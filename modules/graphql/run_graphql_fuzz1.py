@@ -127,12 +127,15 @@ class RunState:
         entry["attempts"] += 1
         entry["status"] = status
         entry["last_seen"] = datetime.now(timezone.utc).isoformat()
+        self.save()
 
     def save(self) -> None:
-        self.path.write_text(
+        temp_path = self.path.with_name(self.path.name + ".tmp")
+        temp_path.write_text(
             json.dumps(self.data, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+        temp_path.replace(self.path)
 
 
 def load_payloads(payload_path: str) -> list[GraphQLPayload]:
@@ -525,9 +528,33 @@ async def process_payload(
             resp, payload, rules
         )
         status_code = resp.status_code
-        confirmed = result.confirmed
-        confidence = result.confidence
-        confirmation_differences = result.evidence
+        # A baseline/attack difference alone is not proof of exploitation.
+        # Require a payload-specific expected signal in the attack response.
+        attack_body = response_text(resp).lower()
+        expected_signals = [
+            str(signal).strip().lower()
+            for signal in payload.expected_signal
+            if str(signal).strip()
+        ]
+        matched_expected_signals = [
+            signal for signal in expected_signals
+            if signal in attack_body
+        ]
+
+        # A response difference is not proof of exploitation.
+        # Keep findings as candidates until a vulnerability-specific
+        # confirmation strategy is implemented and tested.
+        confirmed = False
+        confidence = min(result.confidence, 0.55)
+        confirmation_differences = dict(result.evidence)
+        confirmation_differences["confirmation_policy"] = (
+            "candidate_only_pending_vulnerability_specific_validation"
+        )
+        if expected_signals and not matched_expected_signals:
+            confirmation_differences["expected_signal_match"] = {
+                "matched": False,
+                "required_signals": expected_signals,
+            }
 
     elapsed_ms = result.attack.response_time_ms if result and result.attack else 0
 
@@ -607,13 +634,38 @@ async def run_all(
 ) -> list[Finding]:
     scheduler = RequestScheduler(concurrency=concurrency, global_rps=global_rps)
 
+    # Deduplicate identical fingerprints within this batch while preserving order.
+    unique_payloads = []
+    seen_fingerprints = set()
+    for payload in payloads:
+        target_app = (payload.target_app or target_id).strip().lower()
+        fp = fingerprint_of(
+            target_app,
+            endpoint,
+            payload.operation or payload.operation_name,
+            payload.attack_type,
+            payload.query,
+            payload.mutation_family,
+        )
+        if fp in seen_fingerprints:
+            continue
+        seen_fingerprints.add(fp)
+
+        # Skip findings already confirmed or fingerprints at the retry limit.
+        if state.status(fp) == "confirmed":
+            continue
+        if state.attempts(fp) >= MAX_ATTEMPTS_PER_FINGERPRINT:
+            continue
+
+        unique_payloads.append(payload)
+
     async with httpx.AsyncClient(timeout=20.0) as client:
         tasks = [
             process_payload(
                 client, scheduler, payload, base_url, endpoint,
                 headers, rules, state, rate_limit_ms / 1000, target_id,
             )
-            for payload in payloads
+            for payload in unique_payloads
         ]
         raw_results = await asyncio.gather(*tasks)
 

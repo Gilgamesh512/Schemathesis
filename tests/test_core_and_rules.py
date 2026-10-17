@@ -102,6 +102,23 @@ def test_body_only_difference_is_not_confirmation():
     assert result.confidence == 0.55
 
 
+
+def test_graphql_error_text_difference_alone_is_not_confirmation():
+    baseline = ResponseObservation(
+        400, "baseline-body", "same-headers", 20,
+        graphql_errors=('Expected type "Int", found "normal".',),
+    )
+    attack = ResponseObservation(
+        400, "attack-body", "same-headers", 21,
+        graphql_errors=('Expected type "Int", found "1 OR 1=1".',),
+    )
+
+    result = confirmation_result(baseline, attack, True)
+
+    assert result.confirmed is False
+    assert result.confidence == 0.55
+    assert "graphql_errors" in result.evidence
+
 def test_finding_requires_and_accepts_tool_field():
     finding = Finding(
         finding_id="F-test",
@@ -199,5 +216,93 @@ def test_graphql_process_uses_baseline_and_sets_tool(tmp_path: Path):
     assert len(requests) == 2
     assert 'normal' in json.loads(requests[0])["query"]
     assert finding.tool == "schemathesis"
-    assert finding.lifecycle == "confirmed"
-    assert state.status(finding.fingerprint) == "confirmed"
+    # HTTP 500 with a generic database error is a candidate,
+    # not proof that SQL injection was successfully exploited.
+    assert finding.confirmed is False
+    assert finding.lifecycle == "candidate"
+    assert state.status(finding.fingerprint) == "candidate"
+
+
+def test_graphql_run_all_deduplicates_identical_fingerprints(tmp_path: Path):
+    from modules.graphql import run_graphql_fuzz1 as graphql
+
+    payload = graphql.GraphQLPayload(
+        query="query { user { id } }",
+        attack_type="sqli",
+        target_app="dvga",
+    )
+    processed = []
+
+    async def fake_process_payload(
+        client, scheduler, payload, base_url, endpoint,
+        headers, rules, state, rate_limit_s, target_id="dvga",
+    ):
+        processed.append(payload)
+        return None
+
+    async def run():
+        state = graphql.RunState(tmp_path / "state.json")
+        with patch.object(
+            graphql, "process_payload", new=fake_process_payload
+        ):
+            return await graphql.run_all(
+                [payload, payload],
+                "http://127.0.0.1:8000",
+                "/graphql",
+                {},
+                None,
+                state,
+                concurrency=2,
+                rate_limit_ms=0,
+            )
+
+    findings = asyncio.run(run())
+
+    assert len(processed) == 1
+    assert findings == []
+
+
+def test_graphql_run_all_skips_payload_at_attempt_limit(tmp_path: Path):
+    from modules.graphql import run_graphql_fuzz1 as graphql
+
+    payload = graphql.GraphQLPayload(
+        query="query { user { id } }",
+        attack_type="sqli",
+        target_app="dvga",
+    )
+    fp = graphql.fingerprint_of(
+        "dvga", "/graphql", None, payload.attack_type, payload.query,
+        payload.mutation_family,
+    )
+    state = graphql.RunState(tmp_path / "state.json")
+    state.data[fp] = {"attempts": 3, "status": "rejected"}
+    state.save()
+
+    processed = []
+
+    async def fake_process_payload(
+        client, scheduler, payload, base_url, endpoint,
+        headers, rules, state, rate_limit_s, target_id="dvga",
+    ):
+        processed.append(payload)
+        return None
+
+    async def run():
+        with patch.object(
+            graphql, "process_payload", new=fake_process_payload
+        ):
+            return await graphql.run_all(
+                [payload],
+                "http://127.0.0.1:8000",
+                "/graphql",
+                {},
+                None,
+                state,
+                concurrency=1,
+                rate_limit_ms=0,
+            )
+
+    findings = asyncio.run(run())
+
+    assert processed == []
+    assert findings == []

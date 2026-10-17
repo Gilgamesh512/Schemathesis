@@ -208,8 +208,10 @@ def confirmation_result(baseline: Optional[ResponseSnapshot],
         return ConfirmationResult(False, False, 0.2 if differences else 0.1, differences, baseline, attack)
     # Raw body/header hashes are useful evidence, but dynamic values such as
     # timestamps, request IDs, and JSON ordering must not confirm a finding.
+    # GraphQL validation errors often echo the supplied payload.
+    # A changed error message alone does not prove vulnerability execution.
     strong_difference = any(name in differences for name in (
-        "status_code", "graphql_errors", "data_shape",
+        "status_code", "data_shape",
     ))
     return ConfirmationResult(candidate, strong_difference, 0.9 if strong_difference else 0.55, differences, baseline, attack)
 

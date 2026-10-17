@@ -434,7 +434,7 @@ def _image_exists(runtime: Runtime, image: str) -> bool:
     if result.returncode == 0:
         return True
     detail = (result.stderr or result.stdout).lower()
-    if "no such" in detail or "not found" in detail or "no image" in detail:
+    if ("no such" in detail or "not found" in detail or "no image" in detail or "image not known" in detail):
         return False
     raise LabError(f"Cannot inspect image {image}: {(result.stderr or result.stdout).strip()}")
 

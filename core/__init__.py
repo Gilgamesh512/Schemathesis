@@ -18,7 +18,7 @@ from .evidence import (
 from .path_manager import ProjectPaths, resolve_project_root, safe_project_path
 from .result_manager import ResultManager, make_run_id
 from .schema_manager import SchemaManager, load_schema
-from .target_manager import TargetConfig, TargetManager, TargetRegistry
+from .target_manager import TargetConfig, TargetManager, TargetRegistry, target_config
 
 __all__ = [
     "ConfirmationEngine",
@@ -44,4 +44,5 @@ __all__ = [
     "safe_project_path",
     "snapshot_response",
     "stable_finding_id",
+    "target_config",
 ]

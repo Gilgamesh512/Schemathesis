@@ -49,7 +49,6 @@ from core import (ConfirmationEngine, Evidence, Finding, RequestScheduler,
                   redact_headers, snapshot_response, stable_finding_id)
 
 PROJECT_PATHS = ProjectPaths.from_root(PROJECT_ROOT)
-DVGA_TARGET = TargetManager(PROJECT_ROOT).get_target("dvga")
 
 
 DEFAULT_ERROR_SIGNALS = [
@@ -83,7 +82,7 @@ class GraphQLPayload(BaseModel):
     technology: Optional[dict[str, str]] = None
     mutation_family: Optional[str] = None
 
-    target_app: Optional[str] = "dvga"
+    target_app: Optional[str] = None
     operation: Optional[str] = None
 
 
@@ -458,8 +457,9 @@ async def process_payload(
     rules: Optional[dict],
     state: RunState,
     rate_limit_s: float,
+    target_id: str = "dvga",
 ) -> Optional[Finding]:
-    target_app = (payload.target_app or "dvga").strip().lower()
+    target_app = (payload.target_app or target_id).strip().lower()
 
     fp = fingerprint_of(
         target_app,
@@ -603,6 +603,7 @@ async def run_all(
     concurrency: int,
     rate_limit_ms: int,
     global_rps: float = 0,
+    target_id: str = "dvga",
 ) -> list[Finding]:
     scheduler = RequestScheduler(concurrency=concurrency, global_rps=global_rps)
 
@@ -610,7 +611,7 @@ async def run_all(
         tasks = [
             process_payload(
                 client, scheduler, payload, base_url, endpoint,
-                headers, rules, state, rate_limit_ms / 1000,
+                headers, rules, state, rate_limit_ms / 1000, target_id,
             )
             for payload in payloads
         ]
@@ -667,9 +668,10 @@ def main() -> None:
     global RUN_ID
 
     ap = argparse.ArgumentParser(
-        description="Nguoi 1: GraphQL fuzzer cho DVGA"
+        description="GraphQL API fuzzer"
     )
 
+    ap.add_argument("--target-id", default="dvga")
     ap.add_argument("--payloads", required=True)
     ap.add_argument(
         "--base-url",
@@ -678,7 +680,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--endpoint",
-        default=str(DVGA_TARGET.settings.get("endpoint", "/graphql")),
+        default=None,
     )
     ap.add_argument("--results-dir", default=str(PROJECT_PATHS.results))
     ap.add_argument("--rate-limit-ms", type=int, default=200)
@@ -690,9 +692,18 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    base_url = args.base_url or os.environ.get("DVGA_BASE_URL") or DVGA_TARGET.base_url
+    args.target_id = args.target_id.strip().lower()
+    target = TargetManager(PROJECT_ROOT).get_target(args.target_id)
+    if target.settings.get("protocol") != "graphql":
+        ap.error(f"Target '{args.target_id}' is not configured for GraphQL")
+    base_url = (
+        args.base_url
+        or (os.environ.get("DVGA_BASE_URL") if args.target_id == "dvga" else None)
+        or target.base_url
+    )
 
-    endpoint = "/" + args.endpoint.strip("/")
+    configured_endpoint = target.settings.get("endpoint", "/graphql")
+    endpoint = "/" + (args.endpoint or str(configured_endpoint)).strip("/")
     print(f"[INFO] GraphQL target: {base_url.rstrip('/')}{endpoint}")
 
     rules_path = PROJECT_PATHS.resolve(args.rules, allow_outside=True)
@@ -732,17 +743,18 @@ def main() -> None:
 
     selected = []
     for payload in payloads:
-        target = (payload.target_app or "dvga").strip().lower()
-        if target != "dvga":
+        payload_target = (payload.target_app or args.target_id).strip().lower()
+        if payload_target != args.target_id:
             print(
-                f"[CANH BAO] target_app='{target}' khac dvga -> bo qua.",
+                f"[CANH BAO] target_app='{payload_target}' khac "
+                f"{args.target_id} -> bo qua.",
                 file=sys.stderr,
             )
             continue
         selected.append(payload)
 
     if not selected:
-        print("[LOI] Khong co GraphQL payload target_app='dvga'.",
+        print(f"[LOI] Khong co GraphQL payload target_app='{args.target_id}'.",
               file=sys.stderr)
         sys.exit(1)
 
@@ -755,7 +767,7 @@ def main() -> None:
     before_attempts = {}
     for payload in selected:
         fp = fingerprint_of(
-            (payload.target_app or "dvga").lower(),
+            (payload.target_app or args.target_id).lower(),
             endpoint,
             payload.operation or payload.operation_name,
             payload.attack_type,
@@ -775,6 +787,7 @@ def main() -> None:
             max(1, args.concurrency),
             max(0, args.rate_limit_ms),
             args.global_rps,
+            args.target_id,
         )
     )
 

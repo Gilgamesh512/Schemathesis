@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 
 def resolve_project_root(start: str | Path | None = None) -> Path:

@@ -27,6 +27,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -159,12 +160,27 @@ def extract_base_url(spec_path: str) -> Optional[str]:
     return None
 
 
-def load_schema(spec_path: str, cli_base_url: Optional[str]):
-    resolved_spec = SchemaManager(PROJECT_ROOT).resolve_local_schema(spec_path)
+def load_schema(
+    spec_path: str,
+    cli_base_url: Optional[str],
+    *,
+    allow_remote: bool = False,
+):
+    schema_manager = SchemaManager(PROJECT_ROOT)
+    is_remote = urlparse(spec_path).scheme in {"http", "https"}
     try:
-        schema = schemathesis.openapi.from_path(str(resolved_spec))
+        if is_remote:
+            schema_document = schema_manager.load(
+                spec_path,
+                allow_remote=allow_remote,
+            )
+            schema = schemathesis.openapi.from_dict(schema_document)
+            resolved_spec = spec_path
+        else:
+            resolved_spec = schema_manager.resolve_local_schema(spec_path)
+            schema = schemathesis.openapi.from_path(str(resolved_spec))
     except Exception as exc:  # spec loi cu phap / version khong ho tro
-        print(f"[LOI] Khong doc duoc OpenAPI spec tu A: {resolved_spec}\n  -> {exc}",
+        print(f"[LOI] Khong doc duoc OpenAPI spec tu A: {spec_path}\n  -> {exc}",
               file=sys.stderr)
         print("  Kiem tra: (1) spec co dung OpenAPI 3.0/3.1 khong (Swagger 2.0 "
               "phai convert truoc), (2) $ref co bi loop khong, (3) co field "
@@ -172,7 +188,9 @@ def load_schema(spec_path: str, cli_base_url: Optional[str]):
               file=sys.stderr)
         sys.exit(1)
 
-    base_url = cli_base_url or extract_base_url(str(resolved_spec))
+    base_url = cli_base_url or (
+        None if is_remote else extract_base_url(str(resolved_spec))
+    )
     if not base_url:
         print(f"[LOI] Khong tim duoc base_url. Spec cua A khong co 'servers' "
               f"(hoac 'host'+'basePath') hop le - can chay lai voi --base-url.",
@@ -183,7 +201,12 @@ def load_schema(spec_path: str, cli_base_url: Optional[str]):
     return schema, base_url
 
 
-def load_targets(targets_arg: str, base_urls_arg: Optional[str]) -> dict[str, tuple]:
+def load_targets(
+    targets_arg: str,
+    base_urls_arg: Optional[str],
+    *,
+    allow_remote_schema: bool = False,
+) -> dict[str, tuple]:
     """Nap NHIEU spec cung luc cho che do multi-target.
     --targets 'vampi=vampi_spec.yaml,crapi=crapi_spec.json'
     --base-urls 'vampi=http://localhost:5000,crapi=http://localhost:8888' (tuy chon)
@@ -209,7 +232,11 @@ def load_targets(targets_arg: str, base_urls_arg: Optional[str]) -> dict[str, tu
         if name in targets:
             print(f"[LOI] Ten target '{name}' bi lap trong --targets.", file=sys.stderr)
             sys.exit(1)
-        schema, base_url = load_schema(spec_path, base_url_overrides.get(name))
+        schema, base_url = load_schema(
+            spec_path,
+            base_url_overrides.get(name),
+            allow_remote=allow_remote_schema,
+        )
         targets[name] = (schema, base_url)
         print(f"[INFO] Da nap target '{name}': {spec_path} -> base_url={base_url}")
 
@@ -662,6 +689,11 @@ def main():
     ap.add_argument("--base-urls", default=None,
                      help="[Chi dung voi --targets] Ghi de base_url tung app, vd "
                           "'vampi=http://localhost:5000,crapi=http://localhost:8888'")
+    ap.add_argument(
+        "--allow-remote-schema",
+        action="store_true",
+        help="Explicitly allow loading an OpenAPI document from an HTTP(S) URL",
+    )
     ap.add_argument("--auth-header", default=None,
                      help='[KHONG KHUYEN KHICH - lo trong bash history] '
                           'Vd: "Authorization: Bearer <jwt>". '
@@ -702,13 +734,21 @@ def main():
     state = RunState(results_dir / "state.json")
 
     if args.spec:
-        schema, base_url = load_schema(args.spec, args.base_url)
+        schema, base_url = load_schema(
+            args.spec,
+            args.base_url,
+            allow_remote=args.allow_remote_schema,
+        )
         target_name = Path(args.spec).stem.lower()
         targets = {target_name: (schema, base_url)}
         print(f"[INFO] Che do 1-target (tuong thich nguoc): '{target_name}'")
         targets_desc = args.spec
     else:
-        targets = load_targets(args.targets, args.base_urls)
+        targets = load_targets(
+            args.targets,
+            args.base_urls,
+            allow_remote_schema=args.allow_remote_schema,
+        )
         print(f"[INFO] Che do multi-target: {sorted(targets)}")
         targets_desc = args.targets
 

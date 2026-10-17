@@ -51,20 +51,31 @@ def parse_tokens_env(path: Path = TOKENS_FILE) -> dict[str, str]:
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
-        if key.endswith("_AUTH_HEADER"):
-            tokens[key] = value
+        tokens[key] = value
     return tokens
 
 
-def auth_env_for(target_id: str, tokens: dict[str, str]) -> dict[str, str] | None:
-    target = TARGETS.get_target(target_id)
+def auth_env_for(
+    target_id: str,
+    tokens: dict[str, str],
+    *,
+    targets: TargetManager = TARGETS,
+) -> dict[str, str] | None:
+    target = targets.get_target(target_id)
     token_env = target.auth.get("token_env")
-    value = tokens.get(token_env) if isinstance(token_env, str) else None
+    value = None
+    if isinstance(token_env, str):
+        value = tokens.get(token_env) or os.environ.get(token_env)
     return {"FUZZ_AUTH_HEADER": value} if value else None
 
 
-def build_target_command(target_id: str, *, include_payload: bool = True) -> tuple[str, list[str]]:
-    target = TARGETS.get_target(target_id)
+def build_target_command(
+    target_id: str,
+    *,
+    include_payload: bool = True,
+    targets: TargetManager = TARGETS,
+) -> tuple[str, list[str]]:
+    target = targets.get_target(target_id)
     protocol = target.settings.get("protocol")
     schema_source = target.schema_source
 
@@ -72,8 +83,9 @@ def build_target_command(target_id: str, *, include_payload: bool = True) -> tup
     if protocol == "rest":
         if not schema_source:
             raise ValueError(f"Target '{target_id}' has no schema_source configured")
-        schema_path = TARGETS.resolve_source(schema_source)
-        if not schema_path.is_file():
+        remote_schema = schema_source.startswith(("http://", "https://"))
+        schema_path = schema_source if remote_schema else targets.resolve_source(schema_source)
+        if not remote_schema and not schema_path.is_file():
             raise FileNotFoundError(
                 f"Schema for target '{target_id}' not found: {schema_path}"
             )
@@ -82,9 +94,12 @@ def build_target_command(target_id: str, *, include_payload: bool = True) -> tup
             "--targets", f"{target_id}={schema_path}",
             "--base-urls", f"{target_id}={target.base_url}",
         ])
+        if target.settings.get("allow_remote_schema", False):
+            command.append("--allow-remote-schema")
     elif protocol == "graphql":
         command.extend([
             str(GRAPHQL_FUZZER),
+            "--target-id", target_id,
             "--base-url", target.base_url,
             "--endpoint", str(target.settings.get("endpoint", "/graphql")),
         ])
@@ -99,7 +114,11 @@ def build_target_command(target_id: str, *, include_payload: bool = True) -> tup
         if isinstance(payload_source, str) and payload_source
         else None
     )
-    if include_payload and payload_path and payload_path.is_file():
+    if include_payload and payload_path is not None:
+        if not payload_path.is_file():
+            raise FileNotFoundError(
+                f"Payload file for target '{target_id}' not found: {payload_path}"
+            )
         command.extend(["--payloads", str(payload_path)])
     elif protocol == "graphql":
         raise FileNotFoundError(
@@ -140,15 +159,22 @@ def run_command(label: str, command: list[str],
     print(f"[+] {label}: OK")
 
 
-def run_target(target_id: str, *, include_payload: bool = True,
-               tokens: dict[str, str] | None = None) -> None:
+def run_target(
+    target_id: str,
+    *,
+    include_payload: bool = True,
+    tokens: dict[str, str] | None = None,
+    targets: TargetManager = TARGETS,
+) -> None:
     label, command = build_target_command(
-        target_id, include_payload=include_payload,
+        target_id,
+        include_payload=include_payload,
+        targets=targets,
     )
     run_command(
         f"FUZZING - {label}",
         command,
-        auth_env_for(target_id, tokens or {}),
+        auth_env_for(target_id, tokens or {}, targets=targets),
     )
 
 

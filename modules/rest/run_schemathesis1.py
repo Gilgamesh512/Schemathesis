@@ -10,8 +10,7 @@ Luong xu ly:
   3) Execute and confirm requests, preserving the existing fingerprint state.
   4) Write findings and run metadata through ResultManager.
 
-Yeu cau: schemathesis>=4.0, pydantic>=2.0
-    pip install schemathesis pydantic --break-system-packages
+Yeu cau: install the pinned project dependencies in its virtual environment.
 """
 
 from __future__ import annotations

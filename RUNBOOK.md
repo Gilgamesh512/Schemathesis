@@ -7,12 +7,20 @@ startup checks, troubleshooting, and clean-clone instructions, see
 
 ## Fresh clone
 
-1. Create a Python 3.10-3.13 virtual environment (3.12 recommended).
-2. Install `requirements-dev.txt`.
-3. Run `python run_all.py setup` to fetch the three pinned lab dependencies and
-   create `.env` from `.env.example`.
-4. Start the local container runtime.
-5. Run `python run_all.py start`, then `python run_all.py check`.
+On Kali Linux, install Git, Python 3.10-3.13 with `venv`, and a supported local
+container runtime with Compose. From a fresh clone, run:
+
+```bash
+set -euo pipefail
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip && \
+  python -m pip install -r requirements-dev.txt && \
+  python -m pip check && \
+  python lab/start_lab.py setup
+```
+
+Start the local container runtime before starting the lab.
 
 ## Normal lab lifecycle
 

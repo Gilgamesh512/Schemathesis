@@ -11,47 +11,52 @@ home directory, VM transfer folder, or old container is used.
 ## Requirements
 
 - Git, for fetching the pinned lab sources.
-- Python 3.10-3.13 for compatibility with the pinned dependencies (Python 3.12
-  recommended) and `venv`.
+- Python 3.10-3.13 for compatibility with the pinned dependencies, plus
+  `venv` and `pip`.
 - One supported local container runtime:
-  - Docker Engine / Docker Desktop with either the Compose v2 plugin or the
-    standalone `docker-compose` command; or
+  - Docker Engine with the Compose v2 plugin or standalone `docker-compose`; or
   - Podman with `podman compose` or `podman-compose`.
 - Internet access during setup and when building/pulling container images.
 - Enough disk space for the three source checkouts and images. crAPI is the
   largest service.
 
-On Windows, use Docker Desktop with Linux containers. The runtime must be
-started and available to the current user; the scripts do not invoke `sudo`.
+The container runtime must be started and available to the current user; the
+scripts do not invoke `sudo`.
 
-## Fresh clone setup
+## Fresh clone setup on Kali Linux
 
-### Windows PowerShell
-
-```powershell
-git clone https://github.com/Gilgamesh512/Schemathesis.git
-Set-Location Schemathesis
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-.\.venv\Scripts\python.exe run_all.py setup
-```
-
-If PowerShell uses a different Python launcher, create `.venv` with the
-installed Python 3.12 executable and use `.venv\Scripts\python.exe` for the
-remaining commands.
-
-### Linux or macOS
+Install the host tools and a supported Python version:
 
 ```bash
+set -euo pipefail
+sudo apt update
+sudo apt install -y git python3 python3-venv python3-pip docker.io docker-compose
+python3 --version
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"
+```
+
+Log out and back in after adding your user to the `docker` group.
+
+Use Python 3.10-3.13. If Kali's `python3` is outside that range, install a
+supported interpreter before creating the virtual environment.
+
+```bash
+set -euo pipefail
 git clone https://github.com/Gilgamesh512/Schemathesis.git
 cd Schemathesis
-python3.12 -m venv .venv
+python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements-dev.txt
-python run_all.py setup
+python -m pip install --upgrade pip &&
+  python -m pip install -r requirements-dev.txt &&
+  python -m pip check &&
+  python lab/start_lab.py setup
 ```
+
+The chained commands stop at the first failed installation or dependency
+check, so setup is not attempted in a partially installed environment.
+`requirements.txt` contains runtime dependencies; `requirements-dev.txt`
+includes those plus the test runner.
 
 The setup command fetches these source revisions:
 
@@ -78,19 +83,9 @@ localhost. No real user credentials or API keys are required for lab startup.
 
 ## Lab operations
 
-All commands below are run from the repository root using the virtual
-environment's Python.
-
-```powershell
-# Windows
-.\.venv\Scripts\python.exe run_all.py --help
-.\.venv\Scripts\python.exe run_all.py start
-.\.venv\Scripts\python.exe run_all.py check
-.\.venv\Scripts\python.exe run_all.py stop
-```
+All commands below are run from the repository root with `.venv` activated:
 
 ```bash
-# Linux/macOS, after activating .venv
 python run_all.py --help
 python run_all.py start
 python run_all.py check
@@ -130,11 +125,8 @@ Keep the lab bound to localhost and do not expose it to an untrusted network.
 
 No container startup or fuzzing is needed for the unit tests:
 
-```powershell
-.\.venv\Scripts\python.exe -m pytest
-```
-
 ```bash
+. .venv/bin/activate
 python -m pytest
 ```
 
@@ -149,10 +141,6 @@ python run_all.py --help
 Fuzzing is opt-in. The following command starts the lab, refreshes
 authentication and DVGA schema artifacts, then runs the REST and GraphQL
 fuzzers. It writes to `results/`:
-
-```powershell
-.\.venv\Scripts\python.exe run_all.py run
-```
 
 ```bash
 python run_all.py run
@@ -186,9 +174,9 @@ files; startup reports the missing path instead of silently skipping it.
 
 - **No supported runtime:** install Docker with Compose or Podman with a Compose
   provider, then open/start the engine and retry.
-- **Runtime installed but unavailable:** start Docker Desktop/the Docker
-  service or the Podman machine, then retry. No resources are deleted to work
-  around a daemon error.
+- **Runtime installed but unavailable:** start Docker with
+  `sudo systemctl start docker` or start the configured Podman service, then
+  retry. No resources are deleted to work around a daemon error.
 - **Pinned source, Compose file, or crAPI `jwks.json` missing:** run
   `python run_all.py setup`. If a local directory is at the wrong revision,
   move it aside yourself; setup will not overwrite it.

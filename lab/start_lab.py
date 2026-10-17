@@ -18,7 +18,15 @@ from typing import Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
-import yaml
+try:
+    import yaml
+except ModuleNotFoundError as exc:
+    if exc.name != "yaml":
+        raise
+    raise SystemExit(
+        "Missing runtime dependency PyYAML. Install project dependencies with "
+        "`python -m pip install -r requirements-dev.txt` and retry."
+    ) from exc
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

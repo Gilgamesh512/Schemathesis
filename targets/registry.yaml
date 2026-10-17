@@ -1,0 +1,31 @@
+profiles:
+  - target_id: vampi
+    name: VAmPI
+    base_url: http://localhost:5002
+    schema_source: targets/schemas/vampi/vampi_spec.yaml
+    auth:
+      token_env: VAMPI_AUTH_HEADER
+    settings:
+      protocol: rest
+      payload_source: payloads/rest/payload_rest.json
+
+  - target_id: crapi
+    name: crAPI
+    base_url: http://localhost:8888
+    schema_source: targets/schemas/crapi/crapi_openapi_spec.json
+    auth:
+      token_env: CRAPI_AUTH_HEADER
+    settings:
+      protocol: rest
+      payload_source: payloads/crapi/payload_crapi.json
+
+  - target_id: dvga
+    name: DVGA
+    base_url: http://localhost:5013
+    schema_source: targets/schemas/dvga/dvga_schema.json
+    auth:
+      token_env: DVGA_AUTH_HEADER
+    settings:
+      protocol: graphql
+      endpoint: /graphql
+      payload_source: payloads/graphql/payload_graphql.json

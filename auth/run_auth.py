@@ -16,18 +16,24 @@ import sys
 import time
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import requests
 
-BASE_DIR = Path(__file__).resolve().parent
-ENV_FILE = BASE_DIR / "tokens.env"
+from core import TargetManager
+
+TARGET_PROFILES = TargetManager(PROJECT_ROOT)
+ENV_FILE = PROJECT_ROOT / "tokens.env"
 MAX_RETRIES = 12
 RETRY_DELAY = 5
 
 TARGETS = {
     "vampi": {
-        "base_url": "http://localhost:5002",
-        "login_url": "http://localhost:5002/users/v1/login",
-        "register_url": "http://localhost:5002/users/v1/register",
+        "base_url": TARGET_PROFILES.get_target("vampi").base_url,
+        "login_url": f"{TARGET_PROFILES.get_target('vampi').base_url.rstrip('/')}/users/v1/login",
+        "register_url": f"{TARGET_PROFILES.get_target('vampi').base_url.rstrip('/')}/users/v1/register",
         "creds": {"username": "pentester_auto", "password": "password123"},
         "register_payload": {
             "username": "pentester_auto",
@@ -36,9 +42,9 @@ TARGETS = {
         },
     },
     "crapi": {
-        "base_url": "http://localhost:8888",
-        "login_url": "http://localhost:8888/identity/api/auth/login",
-        "register_url": "http://localhost:8888/identity/api/auth/signup",
+        "base_url": TARGET_PROFILES.get_target("crapi").base_url,
+        "login_url": f"{TARGET_PROFILES.get_target('crapi').base_url.rstrip('/')}/identity/api/auth/login",
+        "register_url": f"{TARGET_PROFILES.get_target('crapi').base_url.rstrip('/')}/identity/api/auth/signup",
         "creds": {
             "email": "pentester_auto_2026@example.com",
             "password": "Password123!",

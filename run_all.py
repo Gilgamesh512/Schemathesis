@@ -5,25 +5,25 @@ run_all.py
 MAIN LAB/BOOTSTRAP CONTROLLER
 =============================
 
-This controller deliberately stops BEFORE the user's security-testing
-fuzzers are executed.
+This controller prepares the local target lab, authentication material, and
+DVGA schema before handing off to the configured security-testing runner.
 
 Pipeline owned by this controller:
 
-    start_lab.py
+    lab/start_lab.py
         |
         +--> VAmPI
         +--> crAPI
         +--> DVGA
         |
         v
-    run_auth.py
+    auth/run_auth.py
         |
         +--> VAMPI_AUTH_HEADER
         +--> CRAPI_AUTH_HEADER
         |
         v
-    run_dvga.py
+    auth/run_dvga.py
         |
         +--> DVGA_AUTH_HEADER
         +--> dvga_schema.json
@@ -35,16 +35,11 @@ Pipeline owned by this controller:
         +--> dvga_schema.json: READY
         |
         v
-    HANDOFF / STOP
+    modules/security/run_security_tests.py
 
-IMPORTANT OWNERSHIP BOUNDARY
-----------------------------
-run_schemathesis1.py and run_graphql_fuzz1.py are NOT called here.
-They are the user's security-testing components and consume the handoff
-artifacts produced by this controller.
-
-run_dvga_fuzzer.py is a legacy/experimental DVGA baseline fuzzer and is
-NOT called here either. Its old analyze/triage chain is kept standalone.
+run_dvga_fuzzer.py is a legacy/experimental DVGA baseline fuzzer and remains
+standalone. The active REST and GraphQL runners are selected by the target
+profiles consumed by run_security_tests.py.
 """
 
 from __future__ import annotations
@@ -57,14 +52,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 PYTHON = sys.executable
 
-START_LAB = ROOT / "start_lab.py"
-RUN_AUTH = ROOT / "run_auth.py"
-RUN_DVGA = ROOT / "run_dvga.py"
-RUN_SECURITY_TESTS = ROOT / "run_security_tests.py"
+START_LAB = ROOT / "lab" / "start_lab.py"
+RUN_AUTH = ROOT / "auth" / "run_auth.py"
+RUN_DVGA = ROOT / "auth" / "run_dvga.py"
+RUN_SECURITY_TESTS = ROOT / "modules" / "security" / "run_security_tests.py"
 TOKENS_FILE = ROOT / "tokens.env"
-DVGA_SCHEMA = ROOT / "dvga_schema.json"
-
-# These are intentionally NOT executed by run_all.py.
+DVGA_SCHEMA = ROOT / "targets" / "schemas" / "dvga" / "dvga_schema.json"
 
 
 def banner(title: str) -> None:

@@ -8,12 +8,21 @@ import uuid
 from pathlib import Path
 import requests
 
-BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-DVGA_URL = "http://localhost:5013"
+from core import TargetManager
+
+TARGETS = TargetManager(PROJECT_ROOT)
+DVGA_TARGET = TARGETS.get_target("dvga")
+if not DVGA_TARGET.schema_source:
+    raise ValueError("DVGA target profile must configure schema_source")
+
+DVGA_URL = DVGA_TARGET.base_url
 GRAPHQL_URL = f"{DVGA_URL}/graphql"
-OUTPUT_FILE = str(BASE_DIR / "dvga_schema.json")
-ENV_FILE = BASE_DIR / "tokens.env"
+OUTPUT_FILE = str(TARGETS.resolve_source(DVGA_TARGET.schema_source))
+ENV_FILE = PROJECT_ROOT / "tokens.env"
 
 MAX_RETRIES = 12
 RETRY_DELAY = 3

@@ -9,7 +9,7 @@ import httpx
 from core import (ConfirmationEngine, Evidence, Finding, RequestScheduler,
                   ResponseObservation, compare_responses, confirmation_result,
                   redact_headers, snapshot_response, stable_finding_id)
-from rules_engine import fetch_cves_for_keyword, match_cves_by_keyword
+from modules.security.rules_engine import fetch_cves_for_keyword, match_cves_by_keyword
 
 
 def test_finding_id_is_stable_and_payload_independent():
@@ -39,7 +39,7 @@ def test_nvd_fetch_paginates_until_total_results():
         response([{"id": "CVE-1", "descriptions": []}], 2),
         response([{"id": "CVE-2", "descriptions": []}], 2),
     ]
-    with patch("rules_engine.requests.get", side_effect=pages) as get:
+    with patch("modules.security.rules_engine.requests.get", side_effect=pages) as get:
         result = fetch_cves_for_keyword("SQL injection API", 30, None)
 
     assert [item["cve_id"] for item in result] == ["CVE-1", "CVE-2"]
@@ -168,7 +168,7 @@ def test_cve_technology_filter_requires_applicable_cpe():
 
 
 def test_graphql_process_uses_baseline_and_sets_tool(tmp_path: Path):
-    from run_graphql_fuzz1 import GraphQLPayload, RunState, process_payload
+    from modules.graphql.run_graphql_fuzz1 import GraphQLPayload, RunState, process_payload
 
     calls = []
 

@@ -4,16 +4,11 @@ run_schemathesis.py
 Vai trò: Nguoi 1 - tich hop Schemathesis vao pipeline LLM-fuzzing API REST.
 
 Luong xu ly:
-  1) Nhan OpenAPI spec (tu Thanh vien A)          -> --spec
-  2) Nhan payload JSON do LLM sinh (tu Thanh vien B) -> --payloads
-  3) Gan payload vao dung tham so cua dung endpoint, ban request that
-     bang Schemathesis (Case.call), khong dung random cua Hypothesis
-     vi minh can test CHINH XAC payload ma B sinh ra.
-  4) Ghi log ra results/vulnerabilities.csv va results/experiment_runs.csv
-     (dung dinh dang voi baseline cua Thanh vien A de D doi chieu).
-  5) Dedup theo fingerprint (endpoint, method, param, loai loi) de
-     khong test lap lai cho da confirm; ho tro state.json de nho lich su
-     giua cac lan chay.
+  1) Load one or more OpenAPI schemas.
+  2) Optionally load mutation payloads; if omitted, generate valid cases
+     from the schema's operations.
+  3) Execute and confirm requests, preserving the existing fingerprint state.
+  4) Write findings and run metadata through ResultManager.
 
 Yeu cau: schemathesis>=4.0, pydantic>=2.0
     pip install schemathesis pydantic --break-system-packages
@@ -24,26 +19,29 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextvars
-import csv
 import hashlib
 import json
 import os
 import sys
 import time
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import httpx
 import schemathesis
-import yaml
 from pydantic import BaseModel, Field, ValidationError
 
-import rules_engine
+from modules.security import rules_engine
 from core import (ConfirmationEngine, Evidence, Finding, RequestScheduler,
-                  content_hash, redact_headers, snapshot_response,
-                  stable_finding_id)
+                  ProjectPaths, ResultManager, SchemaManager, content_hash,
+                  redact_headers, snapshot_response, stable_finding_id)
+
+PROJECT_PATHS = ProjectPaths.from_root(PROJECT_ROOT)
 
 # --------------------------------------------------------------------------
 # 1. Schema du lieu (payload tu B phai khop dung format nay)
@@ -52,7 +50,7 @@ from core import (ConfirmationEngine, Evidence, Finding, RequestScheduler,
 class Payload(BaseModel):
     endpoint: str                     # vd: "/api/v1/users/{id}"
     method: str                       # GET/POST/PUT/DELETE/PATCH
-    target_param: str                 # ten tham so bi nham (query/path/body field)
+    target_param: str = ""            # ten tham so bi nham (query/path/body field)
     param_location: str = "query"     # "query" | "path" | "body" | "header"
     attack_type: str                  # SQLi, XSS, BOLA, MassAssignment, ...
     payload_value: Any                # gia tri thuc su se nhoi vao param
@@ -137,18 +135,7 @@ MAX_ATTEMPTS_PER_FINGERPRINT = 3  # dung Nhiem vu 3.3: dung sau 3 lan thu that b
 def _read_spec_dict(spec_path: str) -> dict:
     """Doc spec ra dict, ho tro ca JSON va YAML - OpenAPI thuong duoc viet
     bang YAML tren thuc te, khong chi JSON."""
-    text = Path(spec_path).read_text(encoding="utf-8")
-    suffix = Path(spec_path).suffix.lower()
-    if suffix in (".yaml", ".yml"):
-        return yaml.safe_load(text)
-    if suffix == ".json":
-        return json.loads(text)
-    # khong biet duoi file - thu JSON truoc, fallback YAML (YAML la sieu
-    # tap cua JSON nen parser YAML doc duoc ca JSON, dung lam fallback an toan)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return yaml.safe_load(text)
+    return SchemaManager(PROJECT_ROOT).load_local(spec_path)
 
 
 def extract_base_url(spec_path: str) -> Optional[str]:
@@ -173,10 +160,11 @@ def extract_base_url(spec_path: str) -> Optional[str]:
 
 
 def load_schema(spec_path: str, cli_base_url: Optional[str]):
+    resolved_spec = SchemaManager(PROJECT_ROOT).resolve_local_schema(spec_path)
     try:
-        schema = schemathesis.openapi.from_path(spec_path)
+        schema = schemathesis.openapi.from_path(str(resolved_spec))
     except Exception as exc:  # spec loi cu phap / version khong ho tro
-        print(f"[LOI] Khong doc duoc OpenAPI spec tu A: {spec_path}\n  -> {exc}",
+        print(f"[LOI] Khong doc duoc OpenAPI spec tu A: {resolved_spec}\n  -> {exc}",
               file=sys.stderr)
         print("  Kiem tra: (1) spec co dung OpenAPI 3.0/3.1 khong (Swagger 2.0 "
               "phai convert truoc), (2) $ref co bi loop khong, (3) co field "
@@ -184,7 +172,7 @@ def load_schema(spec_path: str, cli_base_url: Optional[str]):
               file=sys.stderr)
         sys.exit(1)
 
-    base_url = cli_base_url or extract_base_url(spec_path)
+    base_url = cli_base_url or extract_base_url(str(resolved_spec))
     if not base_url:
         print(f"[LOI] Khong tim duoc base_url. Spec cua A khong co 'servers' "
               f"(hoac 'host'+'basePath') hop le - can chay lai voi --base-url.",
@@ -231,8 +219,31 @@ def load_targets(targets_arg: str, base_urls_arg: Optional[str]) -> dict[str, tu
     return targets
 
 
+def schema_payloads(targets: dict[str, tuple]) -> list[Payload]:
+    """Create one schema-valid request descriptor for every OpenAPI operation."""
+    generated: list[Payload] = []
+    for target_name, (schema, _) in sorted(targets.items()):
+        for result in schema.get_all_operations():
+            if not result.ok():
+                continue
+            operation = result.ok()
+            generated.append(Payload(
+                endpoint=operation.path,
+                method=operation.method,
+                target_param="",
+                param_location="schema",
+                attack_type="schema-generated",
+                payload_value=None,
+                target_app=target_name,
+            ))
+    if not generated:
+        raise ValueError("No usable operations were found in the selected OpenAPI schema(s)")
+    return generated
+
+
 def load_payloads(payload_path: str) -> list[Payload]:
-    raw = json.loads(Path(payload_path).read_text(encoding="utf-8"))
+    path = PROJECT_PATHS.resolve(payload_path, allow_outside=True)
+    raw = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(raw, dict):
         raw = raw.get("payloads", [raw])
 
@@ -385,6 +396,20 @@ def prepare_cases(payloads: list[Payload], targets: dict[str, tuple]) -> list[Pr
                   file=sys.stderr)
             continue
         name, schema, base_url, op = match
+        if payload.param_location == "schema":
+            try:
+                case = build_baseline_case(schema, op)
+            except Exception as exc:
+                print(f"[CANH BAO] Khong tao duoc schema case cho {payload.endpoint} "
+                      f"(target={name}): {exc}", file=sys.stderr)
+                continue
+            fp = fingerprint_of(
+                name, payload.endpoint, payload.method, "",
+                payload.attack_type, payload.mutation_family,
+            )
+            prepared.append(PreparedCase(fp, name, base_url, None, case, payload))
+            continue
+
         baseline_case = None
         try:
             baseline_case = build_baseline_case(schema, op)
@@ -627,7 +652,11 @@ def main():
                        help="[Che do multi-target - MOI] danh sach 'ten=duong_dan' cach nhau "
                             "boi dau phay. Vd: 'vampi=vampi_spec.yaml,crapi=crapi_spec.json'. "
                             "DVGA la GraphQL, dung run_graphql.py rieng, khong dua vao day.")
-    ap.add_argument("--payloads", required=True, help="File JSON payload tu B")
+    ap.add_argument(
+        "--payloads",
+        default=None,
+        help="Optional JSON payload file; without it, generate schema-valid cases from OpenAPI",
+    )
     ap.add_argument("--base-url", default=None,
                      help="[Chi dung voi --spec] Ghi de base_url")
     ap.add_argument("--base-urls", default=None,
@@ -637,7 +666,7 @@ def main():
                      help='[KHONG KHUYEN KHICH - lo trong bash history] '
                           'Vd: "Authorization: Bearer <jwt>". '
                           'Nen dung bien moi truong FUZZ_AUTH_HEADER thay vi co nay.')
-    ap.add_argument("--results-dir", default="main_pipeline/results")
+    ap.add_argument("--results-dir", default=str(PROJECT_PATHS.results))
     ap.add_argument("--rate-limit-ms", type=int, default=200,
                      help="Delay giua cac request TRONG CUNG 1 fingerprint group "
                           "(an toan cho container lab)")
@@ -645,24 +674,29 @@ def main():
                      help="So request toi da chay song song (bat dong bo)")
     ap.add_argument("--global-rps", type=float, default=0,
                      help="Gioi han request/giay toan cuc (0 = tat)")
-    ap.add_argument("--rules", default="rules.json", help="File rules OWASP+CVE (rules_engine.py)")
+    ap.add_argument(
+        "--rules",
+        default=str(PROJECT_PATHS.config / "rules.json"),
+        help="File rules OWASP+CVE (rules_engine.py)",
+    )
     args = ap.parse_args()
 
+    rules_path = PROJECT_PATHS.resolve(args.rules, allow_outside=True)
     rules = None
-    if Path(args.rules).exists():
-        rules = rules_engine.load_rules(args.rules)
+    if rules_path.exists():
+        rules = rules_engine.load_rules(str(rules_path))
         n_cve = len(rules.get("cve_signals", []))
         last_upd = rules["meta"].get("cve_last_updated")
-        print(f"[INFO] Rules nap tu {args.rules}: {n_cve} CVE cache "
+        print(f"[INFO] Rules nap tu {rules_path}: {n_cve} CVE cache "
               f"(cap nhat: {last_upd or 'chua tung'}). "
-              f"Neu qua cu, chay: python3 rules_engine.py --update --rules {args.rules}")
+              f"Neu qua cu, cap nhat rules qua CLI rules-engine.")
     else:
-        print(f"[CANH BAO] Khong thay {args.rules} - dung signal tinh mac dinh. "
-              f"Nen tao rules.json va chay rules_engine.py --update.", file=sys.stderr)
+        print(f"[CANH BAO] Khong thay {rules_path} - dung signal tinh mac dinh.",
+              file=sys.stderr)
 
-    results_dir = Path(args.results_dir)
-    results_dir.mkdir(parents=True, exist_ok=True)
-    run_id = str(uuid.uuid4())[:8]
+    result_manager = ResultManager(PROJECT_ROOT, results_dir=args.results_dir)
+    results_dir = result_manager.ensure_results_dir()
+    run_id = result_manager.make_run_id(prefix="rest")
     STATE_RUN_ID.set(run_id)
 
     state = RunState(results_dir / "state.json")
@@ -693,7 +727,13 @@ def main():
         k, _, v = auth_header.partition(":")
         headers[k.strip()] = v.strip()
 
-    payloads = load_payloads(args.payloads)
+    payloads = (
+        load_payloads(args.payloads)
+        if args.payloads
+        else schema_payloads(targets)
+    )
+    if not args.payloads:
+        print(f"[INFO] Schema-only mode: generated {len(payloads)} cases from OpenAPI.")
     total_payloads = len(payloads)
 
     prepared = prepare_cases(payloads, targets)
@@ -708,44 +748,16 @@ def main():
     total_fired = len(findings)
     total_skipped = total_prepared - total_fired
 
-    vuln_csv = results_dir / "vulnerabilities.csv"
-    is_new_file = not vuln_csv.exists()
-    with open(vuln_csv, "a", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=list(Finding.model_fields.keys()))
-        if is_new_file:
-            writer.writeheader()
-        for finding in findings:
-            row = finding.model_dump()
-            row["payload"] = json.dumps(row["payload"], ensure_ascii=False)
-            writer.writerow(row)
-
-    # --- NDJSON (1 JSON object/dong) - dinh dang chuan de Filebeat/Fluentd/
-    # Logstash tail truc tiep vao ELK/Splunk sau nay, khong can sua code
-    # fuzzing engine khi co ha tang SIEM that. Khong tu day len bat ky
-    # SIEM cu the nao vi de tai chua co ha tang do (xem ghi chu Huong
-    # phat trien). Moi dong da bao gom "source":"schemathesis" de phan
-    # biet voi log cua Nuclei (Nguoi 2) khi gop chung 1 pipeline sau nay.
-    ndjson_path = results_dir / "vulnerabilities.ndjson"
-    with open(ndjson_path, "a", encoding="utf-8") as f:
-        for finding in findings:
-            record = finding.model_dump()
-            record["source"] = "schemathesis"
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    result_manager.append_findings(
+        findings,
+        source="schemathesis",
+        fieldnames=list(Finding.model_fields.keys()),
+    )
 
     state.save()
 
     # --- experiment_runs.csv (tong hop 1 dong / lan chay, cho D doi chieu) ---
-    runs_csv = results_dir / "experiment_runs.csv"
-    is_new_runs = not runs_csv.exists()
-    with open(runs_csv, "a", newline="", encoding="utf-8") as f:
-        run_writer = csv.DictWriter(f, fieldnames=[
-            "run_id", "timestamp", "tool", "targets", "total_payloads",
-            "total_dropped_at_prepare", "total_fired", "total_skipped_dedup",
-            "total_confirmed", "llm_used"
-        ])
-        if is_new_runs:
-            run_writer.writeheader()
-        run_writer.writerow({
+    result_manager.append_run_summary({
             "run_id": run_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "tool": "schemathesis",
@@ -755,13 +767,28 @@ def main():
             "total_fired": total_fired,
             "total_skipped_dedup": total_skipped,
             "total_confirmed": sum(1 for f in findings if f.confirmed),
-            "llm_used": True,
-        })
+            "llm_used": bool(args.payloads),
+        }, [
+            "run_id", "timestamp", "tool", "targets", "total_payloads",
+            "total_dropped_at_prepare", "total_fired", "total_skipped_dedup",
+            "total_confirmed", "llm_used"
+        ])
+    result_manager.write_manifest(
+        targets_desc,
+        run_id=run_id,
+        metadata={
+            "tool": "schemathesis",
+            "total_payloads": total_payloads,
+            "total_fired": total_fired,
+            "total_confirmed": sum(1 for finding in findings if finding.confirmed),
+            "payload_mode": "custom" if args.payloads else "openapi",
+        },
+    )
 
     print(f"[XONG] run_id={run_id} | chuan_bi={total_prepared}/{total_payloads} "
           f"| ban={total_fired} | bo_qua(dedup)={total_skipped} "
           f"| phat_hien={sum(1 for f in findings if f.confirmed)} "
-          f"| log: {vuln_csv}")
+          f"| log: {results_dir / 'vulnerabilities.csv'}")
 
 
 if __name__ == "__main__":

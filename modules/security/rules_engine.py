@@ -17,9 +17,9 @@ Quan ly rules dung chung cho tool cua Nguoi 1 (Schemathesis).
   req/30s khong co API key, 50 req/30s co key).
 
 Cach dung:
-    python3 rules_engine.py --update                 # cap nhat CVE 30 ngay gan nhat
-    python3 rules_engine.py --update --days 90 --api-key <NVD_KEY>
-    (roi run_schemathesis.py --rules rules.json se tu doc file nay)
+    python3 -m modules.security.rules_engine --update
+    python3 -m modules.security.rules_engine --update --days 90 --api-key <NVD_KEY>
+    The REST and GraphQL runners load config/rules.json by default.
 """
 
 from __future__ import annotations
@@ -32,7 +32,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import requests
+
+from core import ProjectPaths
+
+PROJECT_PATHS = ProjectPaths.from_root(PROJECT_ROOT)
 
 NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
@@ -229,25 +237,25 @@ def match_cves_by_keyword(rules: dict, attack_type: str, owasp_category: Optiona
 
 def main():
     ap = argparse.ArgumentParser(description="Cap nhat rules (CVE tu NVD) cho tool cua Nguoi 1")
-    ap.add_argument("--rules", default="rules.json")
+    ap.add_argument("--rules", default=str(PROJECT_PATHS.config / "rules.json"))
     ap.add_argument("--update", action="store_true", help="Goi NVD API cap nhat CVE")
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--api-key", default=None, help="NVD API key (khuyen khich - tang rate limit)")
     ap.add_argument("--keywords", nargs="*", default=None, help="Ghi de tu khoa mac dinh")
     args = ap.parse_args()
 
-    rules_path = Path(args.rules)
+    rules_path = PROJECT_PATHS.resolve(args.rules, allow_outside=True)
     if not rules_path.exists():
-        print(f"[LOI] {args.rules} chua ton tai. Tao file rules.json mau truoc "
+        print(f"[LOI] {rules_path} chua ton tai. Tao file rules.json mau truoc "
               f"(xem file rules.json dinh kem).", file=sys.stderr)
         sys.exit(1)
 
-    rules = load_rules(args.rules)
+    rules = load_rules(str(rules_path))
 
     if args.update:
         keywords = args.keywords or DEFAULT_KEYWORDS
         rules = update_from_nvd(rules, keywords, args.days, args.api_key)
-        save_rules(rules, args.rules)
+        save_rules(rules, str(rules_path))
     else:
         print(f"[INFO] Rules hien tai: {len(get_all_signals(rules))} signal, "
               f"{len(rules.get('cve_signals', []))} CVE cache "

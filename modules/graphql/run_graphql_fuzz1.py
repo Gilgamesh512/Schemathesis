@@ -27,24 +27,29 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import csv
 import hashlib
 import json
 import os
 import sys
 import time
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import httpx
 from pydantic import BaseModel, Field, ValidationError
 
-import rules_engine
+from modules.security import rules_engine
 from core import (ConfirmationEngine, Evidence, Finding, RequestScheduler,
-                  content_hash, redact_headers, snapshot_response,
-                  stable_finding_id)
+                  ProjectPaths, ResultManager, TargetManager, content_hash,
+                  redact_headers, snapshot_response, stable_finding_id)
+
+PROJECT_PATHS = ProjectPaths.from_root(PROJECT_ROOT)
+DVGA_TARGET = TargetManager(PROJECT_ROOT).get_target("dvga")
 
 
 DEFAULT_ERROR_SIGNALS = [
@@ -132,7 +137,7 @@ class RunState:
 
 
 def load_payloads(payload_path: str) -> list[GraphQLPayload]:
-    path = Path(payload_path)
+    path = PROJECT_PATHS.resolve(payload_path, allow_outside=True)
 
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -622,46 +627,18 @@ def write_results(
     total_payloads: int,
     total_skipped_dedup: int,
 ) -> None:
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    vuln_csv = results_dir / "vulnerabilities.csv"
-    is_new = not vuln_csv.exists()
-
-    with vuln_csv.open("a", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(
-            csv_file,
-            fieldnames=list(Finding.model_fields.keys()),
-        )
-        if is_new:
-            writer.writeheader()
-
-        for finding in findings:
-            row = finding.model_dump()
-            row["payload"] = json.dumps(row["payload"], ensure_ascii=False)
-            writer.writerow(row)
-
-    ndjson_path = results_dir / "vulnerabilities.ndjson"
-    with ndjson_path.open("a", encoding="utf-8") as f:
-        for finding in findings:
-            record = finding.model_dump()
-            record["source"] = "graphql"
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    runs_csv = results_dir / "experiment_runs.csv"
-    is_new_runs = not runs_csv.exists()
-
+    result_manager = ResultManager(PROJECT_ROOT, results_dir=results_dir)
+    result_manager.append_findings(
+        findings,
+        source="graphql",
+        fieldnames=list(Finding.model_fields.keys()),
+    )
     fields = [
         "run_id", "timestamp", "tool", "targets", "total_payloads",
         "total_dropped_at_prepare", "total_fired", "total_skipped_dedup",
         "total_confirmed", "llm_used",
     ]
-
-    with runs_csv.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        if is_new_runs:
-            writer.writeheader()
-
-        writer.writerow({
+    result_manager.append_run_summary({
             "run_id": run_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "tool": "graphql",
@@ -672,7 +649,18 @@ def write_results(
             "total_skipped_dedup": total_skipped_dedup,
             "total_confirmed": sum(1 for x in findings if x.confirmed),
             "llm_used": True,
-        })
+        }, fields)
+    result_manager.write_manifest(
+        target_desc,
+        run_id=run_id,
+        metadata={
+            "tool": "graphql",
+            "total_payloads": total_payloads,
+            "total_fired": len(findings),
+            "total_confirmed": sum(1 for finding in findings if finding.confirmed),
+            "payload_mode": "custom",
+        },
+    )
 
 
 def main() -> None:
@@ -688,36 +676,33 @@ def main() -> None:
         default=None,
         help="http://<DVGA_HOST>:<DVGA_PORT> hoặc DVGA_BASE_URL",
     )
-    ap.add_argument("--endpoint", default="/graphql")
-    ap.add_argument("--results-dir", default="main_pipeline/results")
+    ap.add_argument(
+        "--endpoint",
+        default=str(DVGA_TARGET.settings.get("endpoint", "/graphql")),
+    )
+    ap.add_argument("--results-dir", default=str(PROJECT_PATHS.results))
     ap.add_argument("--rate-limit-ms", type=int, default=200)
     ap.add_argument("--concurrency", type=int, default=10)
     ap.add_argument("--global-rps", type=float, default=0,
                     help="Gioi han request/giay toan cuc (0 = tat)")
-    ap.add_argument("--rules", default="rules.json")
+    ap.add_argument("--rules", default=str(PROJECT_PATHS.config / "rules.json"))
     ap.add_argument("--auth-header", default=None)
 
     args = ap.parse_args()
 
-    base_url = args.base_url or os.environ.get("DVGA_BASE_URL")
-    if not base_url:
-        print(
-            "[LOI] Chua co DVGA base URL. Dung --base-url "
-            "http://<DVGA_HOST>:<DVGA_PORT> hoac DVGA_BASE_URL.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    base_url = args.base_url or os.environ.get("DVGA_BASE_URL") or DVGA_TARGET.base_url
 
     endpoint = "/" + args.endpoint.strip("/")
     print(f"[INFO] GraphQL target: {base_url.rstrip('/')}{endpoint}")
 
+    rules_path = PROJECT_PATHS.resolve(args.rules, allow_outside=True)
     rules = None
-    if Path(args.rules).exists():
-        rules = rules_engine.load_rules(args.rules)
+    if rules_path.exists():
+        rules = rules_engine.load_rules(str(rules_path))
         n_cve = len(rules.get("cve_signals", []))
         last_upd = rules.get("meta", {}).get("cve_last_updated")
         print(
-            f"[INFO] Rules nap tu {args.rules}: {n_cve} CVE cache "
+            f"[INFO] Rules nap tu {rules_path}: {n_cve} CVE cache "
             f"(cap nhat: {last_upd or 'chua tung'})."
         )
     else:
@@ -761,10 +746,10 @@ def main() -> None:
               file=sys.stderr)
         sys.exit(1)
 
-    results_dir = Path(args.results_dir)
-    results_dir.mkdir(parents=True, exist_ok=True)
+    result_manager = ResultManager(PROJECT_ROOT, results_dir=args.results_dir)
+    results_dir = result_manager.ensure_results_dir()
 
-    RUN_ID = str(uuid.uuid4())[:8]
+    RUN_ID = result_manager.make_run_id(prefix="graphql")
     state = RunState(results_dir / "state_graphql.json")
 
     before_attempts = {}

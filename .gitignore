@@ -1,5 +1,8 @@
 tokens.env
 *.env
+.env
+.lab/
+.venv/
 results/
 __pycache__/
 *.py[cod]

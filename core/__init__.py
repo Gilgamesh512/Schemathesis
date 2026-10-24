@@ -16,6 +16,7 @@ from .evidence import (
     stable_finding_id,
 )
 from .path_manager import ProjectPaths, resolve_project_root, safe_project_path
+from .reporter import OWASP_METADATA, SecurityReporter
 from .result_manager import ResultManager, make_run_id
 from .schema_manager import SchemaManager, load_schema
 from .target_manager import TargetConfig, TargetManager, TargetRegistry, target_config
@@ -25,6 +26,8 @@ __all__ = [
     "ConfirmationResult",
     "Evidence",
     "Finding",
+    "OWASP_METADATA",
+    "SecurityReporter",
     "RequestScheduler",
     "ResponseObservation",
     "ResponseSnapshot",

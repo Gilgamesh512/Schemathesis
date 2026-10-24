@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit CLI for lab operations and the opt-in fuzzing pipeline."""
+"""Explicit CLI for lab operations, dynamic target scanning, and the opt-in fuzzing pipeline."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ DVGA_SCHEMA = ROOT / "targets" / "schemas" / "dvga" / "dvga_schema.json"
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Manage the local API lab. Fuzzing only runs with the 'run' command."
+        description="Manage the local API lab or scan targets dynamically. Fuzzing only runs with 'run' or 'scan'."
     )
     commands = parser.add_subparsers(dest="command")
     for command, description in (
@@ -34,6 +34,21 @@ def _parser() -> argparse.ArgumentParser:
         ("run", "Authenticate, refresh DVGA schema, then run all fuzzers"),
     ):
         commands.add_parser(command, help=description, description=description)
+
+    scan_parser = commands.add_parser(
+        "scan",
+        help="Scan a remote or local target API dynamically without local Docker setup",
+        description="Scan any API target dynamically by specifying --url and schema/auth options.",
+    )
+    scan_parser.add_argument("--url", required=True, help="Base URL of the target API (e.g. http://localhost:8000)")
+    scan_parser.add_argument("--schema", default=None, help="OpenAPI schema file path or URL (required for REST)")
+    scan_parser.add_argument("--auth-token", "--token", dest="auth_token", default=None, help="Bearer token, JWT, or 'Header: Value'")
+    scan_parser.add_argument("--protocol", choices=["rest", "graphql"], default="rest", help="Protocol (default: rest)")
+    scan_parser.add_argument("--endpoint", default="/graphql", help="GraphQL endpoint (if protocol=graphql)")
+    scan_parser.add_argument("--payloads", default=None, help="Path to custom payload corpus JSON")
+    scan_parser.add_argument("--target-id", default=None, help="Identifier for this target")
+    scan_parser.add_argument("--name", default=None, help="Display name for this target")
+
     return parser
 
 
@@ -129,6 +144,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"[X] Lab command failed: {exc}", file=sys.stderr)
             return 1
         return 0
+
+    if args.command == "scan":
+        scan_args = [
+            "--url", args.url,
+            "--protocol", args.protocol,
+        ]
+        if args.schema:
+            scan_args.extend(["--schema", args.schema])
+        if args.auth_token:
+            scan_args.extend(["--auth-token", args.auth_token])
+        if args.protocol == "graphql" and args.endpoint:
+            scan_args.extend(["--endpoint", args.endpoint])
+        if args.payloads:
+            scan_args.extend(["--payloads", args.payloads])
+        if args.target_id:
+            scan_args.extend(["--target-id", args.target_id])
+        if args.name:
+            scan_args.extend(["--name", args.name])
+
+        try:
+            run_script(RUN_SECURITY_TESTS, *scan_args)
+            return 0
+        except (FileNotFoundError, OSError, RuntimeError) as exc:
+            print(f"[X] Scan failed: {exc}", file=sys.stderr)
+            return 1
 
     try:
         return run_pipeline()

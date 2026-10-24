@@ -21,8 +21,10 @@ import contextvars
 import hashlib
 import json
 import os
+import shutil
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -107,7 +109,46 @@ class RunState:
         self.path = path
         self.data: dict[str, dict] = {}
         if path.exists():
-            self.data = json.loads(path.read_text(encoding="utf-8"))
+            try:
+                raw = path.read_text(encoding="utf-8")
+                parsed = json.loads(raw)
+                if not isinstance(parsed, dict):
+                    raise ValueError(
+                        f"State file must contain a JSON object, got {type(parsed).__name__}"
+                    )
+                self.data = parsed
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+                archive = self.path.with_name(f"{self.path.stem}_corrupted{self.path.suffix}")
+                suffix = 2
+                while archive.exists():
+                    archive = self.path.with_name(f"{self.path.stem}_corrupted_{suffix}{self.path.suffix}")
+                    suffix += 1
+                archive_saved = False
+                try:
+                    shutil.copy2(self.path, archive)
+                    archive_saved = True
+                except OSError as copy_exc:
+                    print(f"[CANH BAO] Khong the luu ban sao state bi hong: {copy_exc}", file=sys.stderr)
+
+                if archive_saved:
+                    archive_msg = f"File goc da duoc luu tai {archive}."
+                else:
+                    archive_msg = "Khong the tao ban sao luu tru; file goc van duoc giu nguyen tren dia."
+
+                print(
+                    f"[CANH BAO] State {self.path} bi loi ({exc}). "
+                    f"{archive_msg} "
+                    f"Khoi tao state moi rong (du lieu lich su chua duoc khoi phuc).",
+                    file=sys.stderr,
+                )
+                self.data = {}
+            except OSError as exc:
+                print(
+                    f"[CANH BAO] Khong the doc file state {self.path}: {exc}. "
+                    "Khoi tao state moi rong.",
+                    file=sys.stderr,
+                )
+                self.data = {}
 
     def status(self, fp: str) -> Optional[str]:
         return self.data.get(fp, {}).get("status")
@@ -118,11 +159,32 @@ class RunState:
     def record(self, fp: str, status: str) -> None:
         entry = self.data.setdefault(fp, {"attempts": 0, "status": "new"})
         entry["attempts"] += 1
-        entry["status"] = status
+
+        current = entry.get("status", "new")
+        if current == "confirmed":
+            pass
+        elif current == "candidate" and status == "rejected":
+            pass
+        else:
+            entry["status"] = status
+
         entry["last_seen"] = datetime.now(timezone.utc).isoformat()
 
     def save(self) -> None:
-        self.path.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
+        temp_path = self.path.with_name(f"{self.path.name}.tmp.{uuid.uuid4().hex[:8]}")
+        try:
+            temp_path.write_text(
+                json.dumps(self.data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            temp_path.replace(self.path)
+        except Exception:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+            raise
 
 
 MAX_ATTEMPTS_PER_FINGERPRINT = 3  # dung Nhiem vu 3.3: dung sau 3 lan thu that bai
@@ -467,35 +529,106 @@ def prepare_cases(payloads: list[Payload], targets: dict[str, tuple]) -> list[Pr
 
 def evaluate_response(resp, payload: Payload, rules: Optional[dict] = None
                        ) -> tuple[str, bool, str, list[str]]:
-    """Tra ve (severity, confirmed, evidence, matched_cve_ids).
-    Neu co rules (tu rules_engine.py) thi dung signal + CVE cache dong;
-    khong thi fallback ve DEFAULT_ERROR_SIGNALS tinh."""
+    """Return severity, candidate, evidence, and CVE enrichment.
+
+    Generic keywords are context only. They must not independently create
+    a candidate. Candidate status is not vulnerability confirmation.
+    """
     status = resp.status_code
     body_lower = (resp.text or "").lower()
+    attack_type = payload.attack_type.strip().upper()
 
-    if rules is not None:
-        signals = [s.lower() for s in payload.expected_signal] + rules_engine.get_all_signals(rules)
-    else:
-        signals = [s.lower() for s in payload.expected_signal] + DEFAULT_ERROR_SIGNALS
-    hit_signals = [s for s in signals if s in body_lower]
+    expected_signals = list(dict.fromkeys(
+        str(signal).strip().lower()
+        for signal in payload.expected_signal
+        if str(signal).strip()
+    ))
 
-    # CVE la enrichment/context, khong phai bang chung de tu dong nang risk.
+    # These are technical error indicators, unlike broad business words
+    # such as "admin", "success", "content", or "deleted".
+    technical_signals = [
+        str(signal).strip().lower()
+        for signal in DEFAULT_ERROR_SIGNALS
+        if str(signal).strip()
+    ]
+
+    generic_signals = []
     matched_cves: list[dict] = []
     if rules is not None:
+        generic_signals = [
+            str(signal).strip().lower()
+            for signal in rules_engine.get_all_signals(rules)
+            if str(signal).strip()
+        ]
         matched_cves = rules_engine.match_cves_by_keyword(
-            rules, payload.attack_type, payload.owasp_category, payload.technology)
-    cve_ids = [c["cve_id"] for c in matched_cves]
+            rules, payload.attack_type, payload.owasp_category,
+            payload.technology,
+        )
 
+    cve_ids = [item["cve_id"] for item in matched_cves]
+    expected_hits = [s for s in expected_signals if s in body_lower]
+    technical_hits = [s for s in technical_signals if s in body_lower]
+    generic_hits = [
+        s for s in dict.fromkeys(generic_signals)
+        if s not in technical_signals and s in body_lower
+    ]
+
+    # An invalid/rejected authorization probe is not evidence of a bypass.
+    if attack_type in ("BOLA", "IDOR", "BFLA", "AUTH_BYPASS") and status in (
+        400, 401, 403, 404
+    ):
+        return (
+            "info", False,
+            f"HTTP {status}; authorization probe rejected or invalid; "
+            "no bypass established",
+            cve_ids,
+        )
+
+    # Server errors warrant investigation, but do not prove exploitation.
     if status >= 500:
         severity = SEVERITY_BY_STATUS.get(status, "high")
-        return severity, True, f"HTTP {status}; matched: {hit_signals[:3]}", cve_ids
-    if hit_signals:
-        return "medium", True, f"HTTP {status}; leaked signal: {hit_signals[:3]}", cve_ids
-    if status in (401, 403) and payload.attack_type.upper() in ("BOLA", "BFLA"):
-        # that bai o day co the CHINH LA phat hien tot (bi chan dung) -
-        # nguoc lai neu tra 200 voi du lieu cua user khac moi la loi that.
-        return "info", False, f"HTTP {status}; bi chan (co the la dung)", cve_ids
-    return "info", False, f"HTTP {status}; khong phat hien dau hieu bat thuong", cve_ids
+        details = expected_hits + technical_hits
+        return (
+            severity, True,
+            f"HTTP {status}; server-error candidate; "
+            f"technical/payload signals: {details[:3]}",
+            cve_ids,
+        )
+
+    # Payload-specific signals can raise a candidate; they still do not
+    # establish confirmed=True. ConfirmationEngine remains authoritative.
+    if expected_hits:
+        return (
+            "medium", True,
+            f"HTTP {status}; payload-specific signal: {expected_hits[:3]}",
+            cve_ids,
+        )
+
+    # SQL-specific technical errors can be candidates even without a 5xx.
+    if technical_hits and attack_type in (
+        "SQLI", "SQL_INJECTION", "SQL INJECTION"
+    ):
+        return (
+            "medium", True,
+            f"HTTP {status}; technical SQL/error signal: {technical_hits[:3]}",
+            cve_ids,
+        )
+
+    # Broad rule keywords alone are weak evidence and must not create
+    # a candidate or increase severity.
+    if generic_hits:
+        return (
+            "info", False,
+            f"HTTP {status}; generic keywords ignored as insufficient "
+            f"evidence: {generic_hits[:3]}",
+            cve_ids,
+        )
+
+    return (
+        "info", False,
+        f"HTTP {status}; no sufficiently specific vulnerability signal",
+        cve_ids,
+    )
 
 
 # --------------------------------------------------------------------------

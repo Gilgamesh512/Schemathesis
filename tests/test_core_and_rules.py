@@ -85,12 +85,13 @@ def test_confirmation_comparator_exposes_behavioral_difference():
     }
 
 
-def test_confirmation_requires_attack_difference():
+def test_status_difference_alone_does_not_confirm_vulnerability():
     baseline = ResponseObservation(200, "same", "headers", 20)
     attack = ResponseObservation(500, "different", "headers", 25)
     result = confirmation_result(baseline, attack, True)
-    assert result.confirmed is True
-    assert result.confidence == 0.9
+    assert result.candidate is True
+    assert result.confirmed is False
+    assert result.confidence == 0.55
     assert "status_code" in result.evidence
 
 
@@ -162,7 +163,9 @@ def test_confirmation_engine_executes_baseline_then_attack():
 
     calls, result = asyncio.run(run())
     assert calls == ["baseline", "attack"]
-    assert result.confirmed is True
+    assert result.candidate is True
+    assert result.confirmed is False
+    assert result.confidence == 0.55
     assert result.attack.graphql_errors == ("database error",)
 
 

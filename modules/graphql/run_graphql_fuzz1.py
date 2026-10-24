@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
 run_graphql_fuzz.py
-GraphQL runner for DVGA.
+Generic GraphQL API fuzzer.
+
+Dispatches payloads against any GraphQL target registered in
+targets/registry.yaml with protocol: graphql.
 
 Expected payload format:
 {
-  "target_app": "dvga",
+  "target_app": "<target_id>",
   "query": "query { ... }",
   "variables": {},
   "operation_name": null,
@@ -17,21 +20,24 @@ Expected payload format:
   "expected_signal": ["..."]
 }
 
-URL/port is intentionally NOT hard-coded:
-  --base-url http://<DVGA_HOST>:<DVGA_PORT>
-or:
-  export DVGA_BASE_URL="http://<DVGA_HOST>:<DVGA_PORT>"
+The target's base_url and endpoint are resolved from the registry or
+overridden via CLI:
+  --base-url http://<HOST>:<PORT>
+  --endpoint /graphql
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import hashlib
 import json
 import os
+import shutil
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -95,8 +101,10 @@ def fingerprint_of(
     mutation_family: Optional[str] = None,
 ) -> str:
     query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:12]
+    clean = endpoint.strip().strip("/") if endpoint else ""
+    normalized_endpoint = "/" + clean if clean else (endpoint or "/")
     raw = (
-        f"{target_app.lower()}|POST|{endpoint}|"
+        f"{target_app.lower()}|POST|{normalized_endpoint}|"
         f"{operation or ''}|{attack_type.lower()}|{mutation_family or ''}|{query_hash}"
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
@@ -108,13 +116,45 @@ class RunState:
         self.data: dict[str, dict[str, Any]] = {}
         if path.exists():
             try:
-                self.data = json.loads(path.read_text(encoding="utf-8"))
-            except Exception as exc:
+                raw = path.read_text(encoding="utf-8")
+                parsed = json.loads(raw)
+                if not isinstance(parsed, dict):
+                    raise ValueError(
+                        f"State file must contain a JSON object, got {type(parsed).__name__}"
+                    )
+                self.data = parsed
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+                archive = self.path.with_name(f"{self.path.stem}_corrupted{self.path.suffix}")
+                suffix = 2
+                while archive.exists():
+                    archive = self.path.with_name(f"{self.path.stem}_corrupted_{suffix}{self.path.suffix}")
+                    suffix += 1
+                archive_saved = False
+                try:
+                    shutil.copy2(self.path, archive)
+                    archive_saved = True
+                except OSError as copy_exc:
+                    print(f"[CANH BAO] Khong the luu ban sao state bi hong: {copy_exc}", file=sys.stderr)
+
+                if archive_saved:
+                    archive_msg = f"File goc da duoc luu tai {archive}."
+                else:
+                    archive_msg = "Khong the tao ban sao luu tru; file goc van duoc giu nguyen tren dia."
+
                 print(
-                    f"[CANH BAO] Khong doc duoc state {path}: {exc}. "
-                    "Khoi tao state moi.",
+                    f"[CANH BAO] State {self.path} bi loi ({exc}). "
+                    f"{archive_msg} "
+                    f"Khoi tao state moi rong (du lieu lich su chua duoc khoi phuc).",
                     file=sys.stderr,
                 )
+                self.data = {}
+            except OSError as exc:
+                print(
+                    f"[CANH BAO] Khong the doc file state {self.path}: {exc}. "
+                    "Khoi tao state moi rong.",
+                    file=sys.stderr,
+                )
+                self.data = {}
 
     def status(self, fp: str) -> Optional[str]:
         return self.data.get(fp, {}).get("status")
@@ -125,17 +165,98 @@ class RunState:
     def record(self, fp: str, status: str) -> None:
         entry = self.data.setdefault(fp, {"attempts": 0, "status": "new"})
         entry["attempts"] += 1
-        entry["status"] = status
+
+        current = entry.get("status", "new")
+        if current == "confirmed":
+            pass
+        elif current == "candidate" and status == "rejected":
+            pass
+        else:
+            entry["status"] = status
+
         entry["last_seen"] = datetime.now(timezone.utc).isoformat()
         self.save()
 
     def save(self) -> None:
-        temp_path = self.path.with_name(self.path.name + ".tmp")
-        temp_path.write_text(
-            json.dumps(self.data, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        temp_path.replace(self.path)
+        temp_path = self.path.with_name(f"{self.path.name}.tmp.{uuid.uuid4().hex[:8]}")
+        try:
+            temp_path.write_text(
+                json.dumps(self.data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            temp_path.replace(self.path)
+        except Exception:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+            raise
+
+
+def load_durable_confirmed_fingerprints(results_dir: Path) -> set[str]:
+    """Return the set of fingerprints confirmed in durable report artifacts.
+
+    A finding is durable if it is recorded as confirmed in all existing report
+    stores (vulnerabilities.csv and vulnerabilities.ndjson).
+    """
+    csv_path = results_dir / "vulnerabilities.csv"
+    ndjson_path = results_dir / "vulnerabilities.ndjson"
+
+    has_csv = csv_path.exists() and csv_path.stat().st_size > 0
+    has_ndjson = ndjson_path.exists() and ndjson_path.stat().st_size > 0
+
+    if not has_csv and not has_ndjson:
+        return set()
+
+    csv_confirmed: set[str] = set()
+    if has_csv:
+        try:
+            with csv_path.open("r", newline="", encoding="utf-8-sig") as handle:
+                reader = csv.DictReader(handle)
+                for row in reader:
+                    is_confirmed = (
+                        str(row.get("confirmed", "")).strip().lower() == "true"
+                        or str(row.get("lifecycle", "")).strip().lower() == "confirmed"
+                    )
+                    fp = str(row.get("fingerprint", "")).strip()
+                    if is_confirmed and fp:
+                        csv_confirmed.add(fp)
+        except (csv.Error, OSError, UnicodeDecodeError) as exc:
+            print(f"[CANH BAO] Khong the doc CSV de kiem tra bao cao ben vung: {exc}", file=sys.stderr)
+            return set()
+
+    ndjson_confirmed: set[str] = set()
+    if has_ndjson:
+        try:
+            with ndjson_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    is_confirmed = (
+                        record.get("confirmed") is True
+                        or record.get("lifecycle") == "confirmed"
+                    )
+                    fp = str(record.get("fingerprint", "")).strip()
+                    if is_confirmed and fp:
+                        ndjson_confirmed.add(fp)
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"[CANH BAO] Khong the doc NDJSON de kiem tra bao cao ben vung: {exc}", file=sys.stderr)
+            return set()
+
+    if has_csv and has_ndjson:
+        return csv_confirmed & ndjson_confirmed
+    return csv_confirmed if has_csv else ndjson_confirmed
+
+
+def is_finding_durable(results_dir: Path, fp: str) -> bool:
+    """Return True if the confirmed finding is durably persisted in required report artifacts."""
+    return fp in load_durable_confirmed_fingerprints(results_dir)
 
 
 def load_payloads(payload_path: str) -> list[GraphQLPayload]:
@@ -473,9 +594,9 @@ async def process_payload(
         payload.mutation_family,
     )
 
-    if state.status(fp) == "confirmed":
+    if state.status(fp) == "confirmed" and is_finding_durable(state.path.parent, fp):
         return None
-    if state.attempts(fp) >= MAX_ATTEMPTS_PER_FINGERPRINT:
+    if state.attempts(fp) >= MAX_ATTEMPTS_PER_FINGERPRINT and state.status(fp) != "confirmed":
         return None
 
     url = base_url.rstrip("/") + "/" + endpoint.lstrip("/")
@@ -633,6 +754,8 @@ async def run_all(
     target_id: str = "dvga",
 ) -> list[Finding]:
     scheduler = RequestScheduler(concurrency=concurrency, global_rps=global_rps)
+    results_dir = state.path.parent
+    durable_confirmed = load_durable_confirmed_fingerprints(results_dir)
 
     # Deduplicate identical fingerprints within this batch while preserving order.
     unique_payloads = []
@@ -651,10 +774,22 @@ async def run_all(
             continue
         seen_fingerprints.add(fp)
 
-        # Skip findings already confirmed or fingerprints at the retry limit.
-        if state.status(fp) == "confirmed":
+        # Skip findings already confirmed in the durable report artifacts.
+        if fp in durable_confirmed:
+            if state.status(fp) != "confirmed":
+                state.record(fp, "confirmed")
             continue
-        if state.attempts(fp) >= MAX_ATTEMPTS_PER_FINGERPRINT:
+
+        # If state marks it confirmed, but report artifacts do not have it:
+        # It was interrupted before persistence! Do NOT skip it!
+        if state.status(fp) == "confirmed" and fp not in durable_confirmed:
+            print(
+                f"[CANH BAO] Fingerprint '{fp}' da duoc ghi nhan confirmed trong state "
+                "nhung chua co trong bao cao ben vung (vulnerabilities.csv/ndjson). "
+                "Khoi phuc de chay lai va bao cao.",
+                file=sys.stderr,
+            )
+        elif state.attempts(fp) >= MAX_ATTEMPTS_PER_FINGERPRINT:
             continue
 
         unique_payloads.append(payload)
@@ -681,28 +816,74 @@ def write_results(
     total_skipped_dedup: int,
 ) -> None:
     result_manager = ResultManager(PROJECT_ROOT, results_dir=results_dir)
-    result_manager.append_findings(
-        findings,
-        source="graphql",
-        fieldnames=list(Finding.model_fields.keys()),
-    )
+
+    # Avoid duplicate rows in vulnerabilities.csv if some findings were already in CSV
+    # (e.g. prior interrupted run that wrote CSV but failed before NDJSON or state save).
+    existing_csv_fps: set[str] = set()
+    csv_path = results_dir / "vulnerabilities.csv"
+    if csv_path.exists() and csv_path.stat().st_size > 0:
+        try:
+            with csv_path.open("r", newline="", encoding="utf-8-sig") as handle:
+                reader = csv.DictReader(handle)
+                for row in reader:
+                    if str(row.get("confirmed", "")).strip().lower() == "true":
+                        fp = str(row.get("fingerprint", "")).strip()
+                        if fp:
+                            existing_csv_fps.add(fp)
+        except Exception:
+            pass
+
+    new_findings = [f for f in findings if f.fingerprint not in existing_csv_fps]
+
+    if new_findings:
+        result_manager.append_findings(
+            new_findings,
+            source="graphql",
+            fieldnames=list(Finding.model_fields.keys()),
+        )
+    elif findings:
+        # All findings already in CSV; ensure NDJSON has them without duplicating CSV
+        ndjson_path = results_dir / "vulnerabilities.ndjson"
+        existing_ndjson_fps: set[str] = set()
+        if ndjson_path.exists() and ndjson_path.stat().st_size > 0:
+            try:
+                with ndjson_path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        try:
+                            record = json.loads(line)
+                            if record.get("confirmed") is True and record.get("fingerprint"):
+                                existing_ndjson_fps.add(str(record["fingerprint"]).strip())
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+        missing_ndjson = [f for f in findings if f.fingerprint not in existing_ndjson_fps]
+        if missing_ndjson:
+            with ndjson_path.open("a", encoding="utf-8") as output:
+                for finding in missing_ndjson:
+                    record = finding.model_dump()
+                    record["source"] = "graphql"
+                    output.write(json.dumps(record, ensure_ascii=False) + "\n")
+
     fields = [
         "run_id", "timestamp", "tool", "targets", "total_payloads",
         "total_dropped_at_prepare", "total_fired", "total_skipped_dedup",
         "total_confirmed", "llm_used",
     ]
     result_manager.append_run_summary({
-            "run_id": run_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "tool": "graphql",
-            "targets": target_desc,
-            "total_payloads": total_payloads,
-            "total_dropped_at_prepare": 0,
-            "total_fired": len(findings),
-            "total_skipped_dedup": total_skipped_dedup,
-            "total_confirmed": sum(1 for x in findings if x.confirmed),
-            "llm_used": True,
-        }, fields)
+        "run_id": run_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "tool": "graphql",
+        "targets": target_desc,
+        "total_payloads": total_payloads,
+        "total_dropped_at_prepare": 0,
+        "total_fired": len(findings),
+        "total_skipped_dedup": total_skipped_dedup,
+        "total_confirmed": sum(1 for x in findings if x.confirmed),
+        "llm_used": True,
+    }, fields)
     result_manager.write_manifest(
         target_desc,
         run_id=run_id,
@@ -723,12 +904,13 @@ def main() -> None:
         description="GraphQL API fuzzer"
     )
 
-    ap.add_argument("--target-id", default="dvga")
+    ap.add_argument("--target-id", default="dvga",
+                     help="Target identifier from targets/registry.yaml (default: dvga)")
     ap.add_argument("--payloads", required=True)
     ap.add_argument(
         "--base-url",
         default=None,
-        help="http://<DVGA_HOST>:<DVGA_PORT> hoặc DVGA_BASE_URL",
+        help="Override target base URL from registry (or DVGA_BASE_URL when target is dvga)",
     )
     ap.add_argument(
         "--endpoint",
@@ -843,8 +1025,6 @@ def main() -> None:
         )
     )
 
-    state.save()
-
     fired_fps = {x.fingerprint for x in findings}
     total_skipped_dedup = sum(
         1
@@ -855,14 +1035,20 @@ def main() -> None:
         )
     )
 
-    write_results(
-        findings,
-        results_dir,
-        RUN_ID,
-        f"{base_url.rstrip('/')}{endpoint}",
-        total_payloads,
-        total_skipped_dedup,
-    )
+    try:
+        write_results(
+            findings,
+            results_dir,
+            RUN_ID,
+            f"{base_url.rstrip('/')}{endpoint}",
+            total_payloads,
+            total_skipped_dedup,
+        )
+    except Exception as exc:
+        print(f"[LOI] Khong the luu bao cao ket qua: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    state.save()
 
     print(
         f"[XONG] run_id={RUN_ID} | "

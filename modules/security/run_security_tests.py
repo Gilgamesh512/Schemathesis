@@ -110,7 +110,7 @@ def build_target_command(
 
     payload_source = target.settings.get("payload_source")
     payload_path = (
-        TARGETS.resolve_source(payload_source)
+        targets.resolve_source(payload_source)
         if isinstance(payload_source, str) and payload_source
         else None
     )
@@ -187,23 +187,39 @@ def main() -> int:
         help="Target to run; repeat for multiple targets (default: all configured)",
     )
     args = parser.parse_args()
-    selected = args.target or sorted(TARGETS.targets)
+    selected = list(dict.fromkeys(args.target)) if args.target else sorted(TARGETS.targets)
 
     banner("API SECURITY TESTING")
     print(f"[i] Results: {RESULTS.results_dir}")
     tokens = parse_tokens_env()
+    successful: list[str] = []
+    failures: list[tuple[str, str]] = []
     try:
         for target_id in selected:
-            run_target(target_id, tokens=tokens)
-        banner("SECURITY TESTING COMPLETE")
-        print(f"[+] Findings: {RESULTS.results_dir / 'vulnerabilities.csv'}")
-        return 0
+            try:
+                run_target(target_id, tokens=tokens)
+                successful.append(target_id)
+            except (FileNotFoundError, KeyError, OSError, RuntimeError, ValueError) as exc:
+                print(f"\n[X] Target '{target_id}' failed: {exc}")
+                failures.append((target_id, str(exc)))
     except KeyboardInterrupt:
         print("\n[!] Interrupted by user.")
         return 130
-    except (FileNotFoundError, KeyError, OSError, RuntimeError, ValueError) as exc:
-        print(f"\n[X] SECURITY TESTING FAILED: {exc}")
+
+    if failures:
+        banner("SECURITY TESTING PARTIAL FAILURE")
+        for target_id, reason in failures:
+            print(f"[X] Failed: {target_id} ({reason})")
+        if successful:
+            print(f"[+] Succeeded: {', '.join(successful)}")
+        print(f"[+] Findings (if any): {RESULTS.results_dir / 'vulnerabilities.csv'}")
         return 1
+
+    banner("SECURITY TESTING COMPLETE")
+    if successful:
+        print(f"[+] Succeeded: {', '.join(successful)}")
+    print(f"[+] Findings: {RESULTS.results_dir / 'vulnerabilities.csv'}")
+    return 0
 
 
 if __name__ == "__main__":

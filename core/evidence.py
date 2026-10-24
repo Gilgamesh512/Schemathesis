@@ -200,20 +200,27 @@ class ConfirmationResult:
 def confirmation_result(baseline: Optional[ResponseSnapshot],
                         attack: ResponseSnapshot,
                         candidate: bool) -> ConfirmationResult:
-    """Confirm a candidate only when attack behavior differs from baseline."""
+    """Keep candidates unconfirmed until vulnerability-specific validation."""
     if baseline is None:
-        return ConfirmationResult(candidate, False, 0.35 if candidate else 0.1, {}, None, attack)
+        return ConfirmationResult(
+            candidate, False, 0.35 if candidate else 0.1,
+            {}, None, attack,
+        )
+
     differences = compare_responses(baseline, attack)
+
     if not candidate:
-        return ConfirmationResult(False, False, 0.2 if differences else 0.1, differences, baseline, attack)
-    # Raw body/header hashes are useful evidence, but dynamic values such as
-    # timestamps, request IDs, and JSON ordering must not confirm a finding.
-    # GraphQL validation errors often echo the supplied payload.
-    # A changed error message alone does not prove vulnerability execution.
-    strong_difference = any(name in differences for name in (
-        "status_code", "data_shape",
-    ))
-    return ConfirmationResult(candidate, strong_difference, 0.9 if strong_difference else 0.55, differences, baseline, attack)
+        return ConfirmationResult(
+            False, False, 0.2 if differences else 0.1,
+            differences, baseline, attack,
+        )
+
+    # Behavioral differences are supporting evidence, not proof of exploitation.
+    # A vulnerability-specific validation strategy is required for confirmation.
+    confidence = 0.55 if differences else 0.35
+    return ConfirmationResult(
+        True, False, confidence, differences, baseline, attack,
+    )
 
 
 class Finding(BaseModel):

@@ -298,6 +298,94 @@ def load_payloads(payload_path: str) -> list[GraphQLPayload]:
     return valid
 
 
+def generate_builtin_graphql_payloads(target_id: str, schema_file: Optional[Path] = None) -> list[GraphQLPayload]:
+    """Generate dynamic GraphQL security test cases from schema or introspection."""
+    payloads: list[GraphQLPayload] = []
+
+    # 1. Universal Security Misconfiguration: Introspection query enabled probe (API8:2023)
+    payloads.append(GraphQLPayload(
+        query="query { __schema { types { name } } }",
+        attack_type="GRAPHQL_INTROSPECTION",
+        payload_value="__schema",
+        owasp_category="API8:2023",
+        expected_signal=["__schema", "types", "queryType"],
+        target_app=target_id,
+        operation="query",
+    ))
+
+    # 2. Universal Resource Exhaustion: Circular/deep batch query probe (API4:2023)
+    payloads.append(GraphQLPayload(
+        query="query { q1: __typename q2: __typename q3: __typename q4: __typename q5: __typename }",
+        attack_type="GRAPHQL_BATCHING_DOS",
+        payload_value="__typename",
+        owasp_category="API4:2023",
+        expected_signal=["q1", "q2", "q3", "q4", "q5"],
+        target_app=target_id,
+        operation="query",
+    ))
+
+    # 3. Dynamic schema-driven queries if schema file exists
+    if schema_file and schema_file.exists():
+        try:
+            schema_data = json.loads(schema_file.read_text(encoding="utf-8"))
+            if isinstance(schema_data, dict):
+                raw_fields = (
+                    schema_data.get("schema", {})
+                    .get("data", {})
+                    .get("__schema", {})
+                    .get("queryType", {})
+                    .get("fields", [])
+                )
+                if not raw_fields and "data" in schema_data:
+                    raw_fields = (
+                        schema_data.get("data", {})
+                        .get("__schema", {})
+                        .get("queryType", {})
+                        .get("fields", [])
+                    )
+                for f in raw_fields:
+                    name = f.get("name")
+                    args = f.get("args", [])
+                    if not name or name.startswith("__"):
+                        continue
+                    arg_names = [a.get("name") for a in args if a.get("name")]
+                    if "id" in arg_names:
+                        payloads.append(GraphQLPayload(
+                            query=f"query {{ {name}(id: \"1' OR '1'='1\") {{ id }} }}",
+                            attack_type="SQL_INJECTION",
+                            payload_value="1' OR '1'='1",
+                            owasp_category="API8:2023",
+                            expected_signal=["sql", "syntax", "sqlite", "psql", "traceback"],
+                            target_app=target_id,
+                            operation="query",
+                        ))
+                    if any(cmd_arg in arg_names for cmd_arg in ("cmd", "arg", "command")):
+                        arg_key = next(a for a in arg_names if a in ("cmd", "arg", "command"))
+                        payloads.append(GraphQLPayload(
+                            query=f"query {{ {name}({arg_key}: \"id; echo DVGA_MARKER\") }}",
+                            attack_type="COMMAND_INJECTION",
+                            payload_value="id; echo DVGA_MARKER",
+                            owasp_category="API8:2023",
+                            expected_signal=["uid=", "gid=", "DVGA_MARKER"],
+                            target_app=target_id,
+                            operation="query",
+                        ))
+                    if not args:
+                        payloads.append(GraphQLPayload(
+                            query=f"query {{ {name} }}",
+                            attack_type="INFORMATION_DISCLOSURE",
+                            payload_value=name,
+                            owasp_category="API8:2023",
+                            expected_signal=[name],
+                            target_app=target_id,
+                            operation="query",
+                        ))
+        except Exception as exc:
+            print(f"[CANH BAO] Khong the phan tich schema GraphQL de sinh test cases: {exc}", file=sys.stderr)
+
+    return payloads
+
+
 def build_graphql_request(payload: GraphQLPayload) -> dict[str, Any]:
     body: dict[str, Any] = {
         "query": payload.query,
@@ -972,7 +1060,17 @@ def main() -> None:
                 file=sys.stderr,
             )
 
-    payloads = load_payloads(args.payloads)
+    if args.payloads:
+        payloads = load_payloads(args.payloads)
+    else:
+        schema_path = None
+        if target.schema_source:
+            try:
+                schema_path = TargetManager(PROJECT_ROOT).resolve_source(target.schema_source)
+            except Exception:
+                pass
+        payloads = generate_builtin_graphql_payloads(args.target_id, schema_path)
+        print(f"[INFO] Built-in GraphQL Engine: sinh {len(payloads)} test cases bao mat tu dong.")
     total_payloads = len(payloads)
 
     selected = []

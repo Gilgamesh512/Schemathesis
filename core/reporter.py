@@ -825,7 +825,98 @@ class SecurityReporter:
         except Exception:
             pass
 
+        # Also automatically generate/update SARIF report for CI/CD integration
+        try:
+            self.generate_sarif_report(findings, target_info)
+        except Exception:
+            pass
+
         return report_path
+
+    def generate_sarif_report(
+        self,
+        findings: list[dict[str, Any]],
+        target_info: dict[str, Any] | None = None,
+        output_file: str | Path | None = None,
+    ) -> Path:
+        """Generate an industry-standard OASIS SARIF v2.1.0 report for DevSecOps/CI-CD."""
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        if output_file:
+            sarif_path = self.paths.resolve(output_file, allow_outside=True)
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            sarif_path = self.results_dir / f"report_{timestamp}.sarif"
+
+        rules_map: dict[str, dict[str, Any]] = {}
+        sarif_results: list[dict[str, Any]] = []
+
+        for f in findings:
+            rule_id = f.get("owasp_category") or "API-SECURITY"
+            if rule_id not in rules_map:
+                meta = OWASP_METADATA.get(rule_id, {})
+                rules_map[rule_id] = {
+                    "id": rule_id,
+                    "name": meta.get("name", rule_id),
+                    "shortDescription": {"text": meta.get("name", rule_id)},
+                    "fullDescription": {"text": f"OWASP API Security Top 10 category {rule_id}"},
+                    "help": {
+                        "text": meta.get("remediation", "Apply strict authorization, input validation, and access controls.")
+                    },
+                    "defaultConfiguration": {
+                        "level": "error" if f.get("severity") in ("critical", "high") else "warning"
+                    },
+                }
+
+            level = "error" if f.get("severity") in ("critical", "high") else ("warning" if f.get("severity") == "medium" else "note")
+            msg_text = (
+                f"[{f.get('method', 'GET')}] {f.get('endpoint', '/')} - "
+                f"{f.get('attack_type', 'Vulnerability')} ({f.get('severity', 'info').upper()}). "
+                f"Confirmed: {f.get('confirmed', False)}. {f.get('evidence', '')}"
+            )
+
+            sarif_results.append({
+                "ruleId": rule_id,
+                "level": level,
+                "message": {"text": msg_text},
+                "locations": [{
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": f.get("endpoint", "/")},
+                        "region": {"startLine": 1}
+                    }
+                }],
+                "properties": {
+                    "finding_id": f.get("finding_id", ""),
+                    "target_app": f.get("target_app", ""),
+                    "confirmed": f.get("confirmed", False),
+                    "severity": f.get("severity", "info"),
+                    "matched_cve": f.get("matched_cve", []),
+                }
+            })
+
+        sarif_doc = {
+            "version": "2.1.0",
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+            "runs": [{
+                "tool": {
+                    "driver": {
+                        "name": "Schemathesis API Security Fuzzer",
+                        "informationUri": "https://github.com/Gilgamesh512/Schemathesis",
+                        "version": "1.0.0",
+                        "rules": list(rules_map.values()),
+                    }
+                },
+                "results": sarif_results,
+            }]
+        }
+
+        sarif_path.write_text(json.dumps(sarif_doc, indent=2, ensure_ascii=False), encoding="utf-8")
+        canonical_sarif = self.results_dir / "vulnerabilities.sarif"
+        try:
+            shutil.copy2(sarif_path, canonical_sarif)
+        except Exception:
+            pass
+
+        return sarif_path
 
 
 __all__ = ["SecurityReporter", "OWASP_METADATA"]

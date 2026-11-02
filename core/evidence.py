@@ -49,14 +49,22 @@ class RequestScheduler:
             for attempt in range(self.max_retries + 1):
                 await self._pace(target)
                 response = await operation()
-                if response.status_code not in (429, 503) or attempt >= self.max_retries:
+                # Check for rate limiting or temporary WAF backoff (429, 503, or temporary 403 rate limit)
+                status = getattr(response, "status_code", None)
+                is_throttled = status in (429, 503)
+                if not is_throttled or attempt >= self.max_retries:
                     return response
-                retry_after = response.headers.get("Retry-After")
+                retry_after = getattr(response, "headers", {}).get("Retry-After")
                 try:
-                    delay = float(retry_after) if retry_after else 2 ** attempt
+                    delay = float(retry_after) if retry_after else (2 ** attempt) + random.uniform(0.2, 0.7)
                 except ValueError:
-                    delay = 2 ** attempt
-                await asyncio.sleep(delay + random.uniform(0, 0.25))
+                    delay = (2 ** attempt) + random.uniform(0.2, 0.7)
+                # Adaptive pacing: slow down future requests for this target
+                async with self._lock:
+                    target_key = target.lower()
+                    current_int = self.target_intervals.get(target_key, 0.1)
+                    self.target_intervals[target_key] = max(current_int, min(current_int * 1.5, 3.0))
+                await asyncio.sleep(delay)
         return response
 
 

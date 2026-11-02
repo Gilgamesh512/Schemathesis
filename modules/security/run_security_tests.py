@@ -108,7 +108,18 @@ def auth_env_for(
     elif "AUTH_TOKEN" in tokens:
         value = normalize_auth_header(tokens["AUTH_TOKEN"])
 
-    return {"FUZZ_AUTH_HEADER": value} if value else None
+    env_res: dict[str, str] = {}
+    if value:
+        env_res["FUZZ_AUTH_HEADER"] = value
+
+    # Check for User 2 token (Dual-user auth for BOLA / IDOR cross-account testing)
+    if isinstance(token_env, str):
+        user2_key = f"{token_env}_USER2"
+        user2_val = tokens.get(user2_key) or os.environ.get(user2_key)
+        if user2_val:
+            env_res["FUZZ_AUTH_HEADER_USER2"] = user2_val
+
+    return env_res if env_res else None
 
 
 def build_target_command(
@@ -163,10 +174,8 @@ def build_target_command(
             )
         command.extend(["--payloads", str(payload_path)])
     elif protocol == "graphql":
-        raise FileNotFoundError(
-            f"GraphQL target '{target_id}' requires a payload file; "
-            f"configured source: {payload_path or '<not configured>'}"
-        )
+        # Built-in GraphQL mutation engine activates automatically when no custom payload file is supplied
+        pass
 
     results_dir = RESULTS.ensure_results_dir()
     command.extend([

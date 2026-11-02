@@ -58,6 +58,35 @@ TARGETS = {
     },
 }
 
+TARGETS_USER2 = {
+    "vampi": {
+        "base_url": TARGET_PROFILES.get_target("vampi").base_url,
+        "login_url": f"{TARGET_PROFILES.get_target('vampi').base_url.rstrip('/')}/users/v1/login",
+        "register_url": f"{TARGET_PROFILES.get_target('vampi').base_url.rstrip('/')}/users/v1/register",
+        "creds": {"username": "attacker_user2", "password": "password123"},
+        "register_payload": {
+            "username": "attacker_user2",
+            "password": "password123",
+            "email": "attacker_user2@example.com",
+        },
+    },
+    "crapi": {
+        "base_url": TARGET_PROFILES.get_target("crapi").base_url,
+        "login_url": f"{TARGET_PROFILES.get_target('crapi').base_url.rstrip('/')}/identity/api/auth/login",
+        "register_url": f"{TARGET_PROFILES.get_target('crapi').base_url.rstrip('/')}/identity/api/auth/signup",
+        "creds": {
+            "email": "attacker_user2@example.com",
+            "password": "Password123!",
+        },
+        "register_payload": {
+            "name": "Attacker User2",
+            "email": "attacker_user2@example.com",
+            "number": "0901234569",
+            "password": "Password123!",
+        },
+    },
+}
+
 
 def get_json(response: requests.Response) -> dict:
     try:
@@ -226,6 +255,16 @@ def main() -> int:
             headers[f"{name.upper()}_AUTH_HEADER"] = f"Authorization: Bearer {token}"
         else:
             failures.append(name)
+
+    # Optional: Authenticate User 2 for dual-token BOLA/IDOR cross-user testing
+    for name, config in TARGETS_USER2.items():
+        try:
+            token2 = authenticate(f"{name}-user2", config)
+            if token2:
+                headers[f"{name.upper()}_AUTH_HEADER_USER2"] = f"Authorization: Bearer {token2}"
+                print(f"[+] User 2 for {name.upper()} ready for BOLA verification.")
+        except Exception as exc:
+            print(f"[!] User 2 auth skipped for {name}: {exc}")
 
     update_tokens_env(headers)
 

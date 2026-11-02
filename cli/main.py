@@ -53,7 +53,7 @@ def _render_menu_banner() -> None:
     print("  \033[1;32m[2]\033[0m 🌐 \033[1mScan Custom Target\033[0m (Dynamic URL, Schema, Auth Token)")
     print("  \033[1;32m[3]\033[0m 📊 \033[1mView Latest Dashboard\033[0m (Render directly in Terminal)")
     print("  \033[1;32m[4]\033[0m 🌍 \033[1mOpen HTML Web Report in Browser\033[0m (Interactive Dark Dashboard)")
-    print("  \033[1;32m[5]\033[0m 📑 \033[1mGenerate Fresh HTML Report\033[0m (From findings history)")
+    print("  \033[1;32m[5]\033[0m 📑 \033[1mGenerate Fresh HTML & SARIF Report\033[0m (From findings history)")
     print("  \033[1;32m[6]\033[0m 🐳 \033[1mDocker Lab Management\033[0m (Start / Check Health / Stop)")
     print("  \033[1;31m[q]\033[0m 🚪 \033[1mExit\033[0m")
     print("\033[90m" + "─" * 76 + "\033[0m")
@@ -201,8 +201,11 @@ def _menu_generate_html() -> None:
         print("\n[!] No findings found in results/ to generate report.")
         return
     report_path = reporter.generate_html_report(findings)
-    print(f"\n[+] Generated standalone report: {report_path}")
-    print(f"[+] Updated latest report link: {RESULTS.results_dir / 'latest_report.html'}")
+    sarif_path = RESULTS.results_dir / "vulnerabilities.sarif"
+    print(f"\n[+] Generated standalone HTML report: {report_path}")
+    print(f"[+] Updated latest report link:       {RESULTS.results_dir / 'latest_report.html'}")
+    if sarif_path.exists():
+        print(f"[+] Exported OASIS SARIF report:     {sarif_path}")
     _prompt_open_browser(report_path)
 
 
@@ -261,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--target-id", default=None, help="Identifier for dynamic target")
     parser.add_argument("--name", default=None, help="Display name for dynamic target")
     parser.add_argument("--report", action="store_true", help="Generate and open the latest HTML report in browser")
+    parser.add_argument("--sarif", action="store_true", help="Generate and export the latest findings to OASIS SARIF format")
     parser.add_argument("--dashboard", action="store_true", help="Print the latest security dashboard to the terminal")
     parser.add_argument("--interactive", "-i", action="store_true", help="Force interactive terminal dashboard")
 
@@ -278,6 +282,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.report:
         _menu_open_report()
+        return 0
+
+    if args.sarif:
+        reporter = SecurityReporter(RESULTS.results_dir)
+        findings = reporter.load_findings()
+        if not findings:
+            print("[!] No findings found in results/ to generate SARIF.")
+            return 1
+        sarif_file = reporter.generate_sarif_report(findings)
+        print(f"[+] SARIF report generated at: {sarif_file}")
+        print(f"[+] Updated: {RESULTS.results_dir / 'vulnerabilities.sarif'}")
         return 0
 
     if args.url and not args.interactive:

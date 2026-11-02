@@ -6,23 +6,28 @@ setlocal EnableDelayedExpansion
 
 cd /d "%~dp0"
 
-REM Find Python in active virtualenv, local .venv, or system PATH
+REM Find Python in active virtualenv, local .venv, or compatible Python via py/PATH
 if defined VIRTUAL_ENV if exist "%VIRTUAL_ENV%\Scripts\python.exe" (
     set "PYTHON=%VIRTUAL_ENV%\Scripts\python.exe"
 ) else if exist ".venv\Scripts\python.exe" (
     set "PYTHON=.venv\Scripts\python.exe"
 ) else (
-    where python >nul 2>&1
+    py -3.12 -c "import sys" >nul 2>&1
     if !errorlevel! equ 0 (
-        set "PYTHON=python"
+        set "PYTHON=py -3.12"
     ) else (
-        where py >nul 2>&1
+        where python >nul 2>&1
         if !errorlevel! equ 0 (
-            set "PYTHON=py"
+            set "PYTHON=python"
         ) else (
-            echo [X] Error: Python was not found in PATH or .venv.
-            pause
-            exit /b 1
+            where py >nul 2>&1
+            if !errorlevel! equ 0 (
+                set "PYTHON=py"
+            ) else (
+                echo [X] Error: Python was not found in PATH or .venv.
+                pause
+                exit /b 1
+            )
         )
     )
 )

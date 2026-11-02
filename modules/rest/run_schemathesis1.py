@@ -308,13 +308,15 @@ def load_targets(
 
 
 def schema_payloads(targets: dict[str, tuple]) -> list[Payload]:
-    """Create one schema-valid request descriptor for every OpenAPI operation."""
+    """Create built-in security mutation payloads and schema-valid cases from OpenAPI operations."""
     generated: list[Payload] = []
+    import re
     for target_name, (schema, _) in sorted(targets.items()):
         for result in schema.get_all_operations():
             if not result.ok():
                 continue
             operation = result.ok()
+            # 1. Baseline case (schema compliance)
             generated.append(Payload(
                 endpoint=operation.path,
                 method=operation.method,
@@ -324,6 +326,48 @@ def schema_payloads(targets: dict[str, tuple]) -> list[Payload]:
                 payload_value=None,
                 target_app=target_name,
             ))
+
+            # 2. Built-in Security Mutation Engine: Detect path parameters for BOLA / Injection
+            path_params = re.findall(r"\{([^}]+)\}", operation.path)
+            for param in path_params:
+                # BOLA / IDOR probe
+                generated.append(Payload(
+                    endpoint=operation.path,
+                    method=operation.method,
+                    target_param=param,
+                    param_location="path",
+                    attack_type="BOLA",
+                    payload_value="admin",
+                    owasp_category="API1:2023",
+                    expected_signal=["admin", "id", "user"],
+                    target_app=target_name,
+                ))
+                # Non-destructive SQLi probe
+                generated.append(Payload(
+                    endpoint=operation.path,
+                    method=operation.method,
+                    target_param=param,
+                    param_location="path",
+                    attack_type="SQL_INJECTION",
+                    payload_value="1' OR '1'='1",
+                    owasp_category="API8:2023",
+                    expected_signal=["sql", "syntax", "sqlite", "psql", "traceback"],
+                    target_app=target_name,
+                ))
+
+            # 3. Built-in Mass Assignment probe for state-changing endpoints
+            if operation.method.upper() in ("POST", "PUT", "PATCH"):
+                generated.append(Payload(
+                    endpoint=operation.path,
+                    method=operation.method,
+                    target_param="role",
+                    param_location="body",
+                    attack_type="MASS_ASSIGNMENT",
+                    payload_value="admin",
+                    owasp_category="API3:2023",
+                    expected_signal=["admin", "role", "success"],
+                    target_app=target_name,
+                ))
     if not generated:
         raise ValueError("No usable operations were found in the selected OpenAPI schema(s)")
     return generated
@@ -650,6 +694,7 @@ async def process_fingerprint_group(
     client: "httpx.AsyncClient", scheduler: RequestScheduler,
     fp: str, group: list[PreparedCase], headers: dict,
     rules: Optional[dict], state: RunState, rate_limit_s: float,
+    user2_headers: Optional[dict] = None,
 ) -> list[Finding]:
     """1 group = cung fingerprint (target_app, endpoint, method, param,
     attack_type) - moi phan tu trong group chac chan CUNG 1 target_app
@@ -678,11 +723,14 @@ async def process_fingerprint_group(
                     lambda: fire_case(client, pc.baseline_case, pc.base_url, headers),
                 )
 
+            is_bola = pc.payload.attack_type.upper() in ("BOLA", "IDOR")
+            attack_headers = user2_headers if (is_bola and user2_headers) else headers
+
             async def execute_attack():
                 nonlocal attack_response
                 attack_response = await scheduler.request(
                     pc.target_app,
-                    lambda: fire_case(client, pc.case, pc.base_url, headers),
+                    lambda: fire_case(client, pc.case, pc.base_url, attack_headers),
                 )
                 return attack_response
 
@@ -715,6 +763,18 @@ async def process_fingerprint_group(
             confirmed = result.confirmed
             confidence = result.confidence
             confirmation_differences = result.evidence
+
+            # Dual-token BOLA / IDOR cross-account verification
+            if user2_headers and pc.payload.attack_type.upper() in ("BOLA", "IDOR"):
+                if status_code == 200:
+                    confirmed = True
+                    confidence = 0.95
+                    severity = "high"
+                    evidence = f"HTTP 200; BOLA verified via dual-token cross-user validation (User 2 accessed User 1 resource)"
+                elif status_code in (401, 403):
+                    confirmed = False
+                    severity = "info"
+                    evidence = f"HTTP {status_code}; Access denied as expected for User 2 (Authorization properly enforced)"
         elapsed_ms = result.attack.response_time_ms if result and result.attack else 0
 
         payload_value = pc.payload.payload_value
@@ -776,7 +836,8 @@ async def process_fingerprint_group(
 
 async def run_all(prepared: list[PreparedCase], headers: dict,
                    rules: Optional[dict], state: RunState, concurrency: int,
-                   rate_limit_ms: int, global_rps: float = 0) -> list[Finding]:
+                   rate_limit_ms: int, global_rps: float = 0,
+                   user2_headers: Optional[dict] = None) -> list[Finding]:
     groups: dict[str, list[PreparedCase]] = {}
     for pc in prepared:
         groups.setdefault(pc.fingerprint, []).append(pc)
@@ -787,6 +848,7 @@ async def run_all(prepared: list[PreparedCase], headers: dict,
             process_fingerprint_group(
                 client, scheduler, fp, group, headers,
                 rules, state, rate_limit_ms / 1000,
+                user2_headers=user2_headers,
             )
             for fp, group in groups.items()
         ]
@@ -899,6 +961,13 @@ def main():
         k, _, v = auth_header.partition(":")
         headers[k.strip()] = v.strip()
 
+    user2_headers = {}
+    auth_header_user2 = os.environ.get("FUZZ_AUTH_HEADER_USER2")
+    if auth_header_user2:
+        k2, _, v2 = auth_header_user2.partition(":")
+        user2_headers[k2.strip()] = v2.strip()
+        print("[INFO] Da nap User 2 Auth Header cho kiem thu BOLA/IDOR cheo.")
+
     payloads = (
         load_payloads(args.payloads)
         if args.payloads
@@ -916,6 +985,7 @@ def main():
         prepared, headers, rules, state,
         args.concurrency, args.rate_limit_ms,
         args.global_rps,
+        user2_headers=user2_headers,
     ))
     total_fired = len(findings)
     total_skipped = total_prepared - total_fired

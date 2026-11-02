@@ -43,6 +43,7 @@ from core import ProjectPaths
 PROJECT_PATHS = ProjectPaths.from_root(PROJECT_ROOT)
 
 NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+OSV_API_URL = "https://api.osv.dev/v1/query"
 
 # Tu khoa lien quan toi de tai (API REST, cac cong nghe dung trong
 # crAPI/DVGA/VAmPI: Flask, Express, GraphQL, JWT...) - chinh lai neu
@@ -55,6 +56,15 @@ DEFAULT_KEYWORDS = [
     "SSRF",
     "mass assignment",
     "broken object level authorization",
+]
+
+# Cac package thuong gap trong API stack de fallback truy van OSV khi NVD bi rate-limit/nghen
+DEFAULT_OSV_PACKAGES = [
+    ("flask", "PyPI"),
+    ("graphene", "PyPI"),
+    ("express", "npm"),
+    ("jsonwebtoken", "npm"),
+    ("spring-boot", "Maven"),
 ]
 
 RATE_LIMIT_SLEEP_S = 6  # khong co API key -> ~5 req/30s, de an toan choi 6s/req
@@ -137,14 +147,59 @@ def fetch_cves_for_keyword(keyword: str, days_back: int, api_key: Optional[str])
     return out
 
 
+def fetch_cves_from_osv(package_name: str, ecosystem: str = "PyPI") -> list[dict]:
+    """Fallback query to Google OSV API (Open Source Vulnerabilities) - fast, open, zero rate-limit."""
+    try:
+        resp = requests.post(
+            OSV_API_URL,
+            json={"package": {"name": package_name, "ecosystem": ecosystem}},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        vulns = data.get("vulns", [])
+        out = []
+        for v in vulns[:10]:
+            vid = v.get("id")
+            # Prefer CVE alias if available
+            aliases = v.get("aliases", [])
+            cve_alias = next((a for a in aliases if a.startswith("CVE-")), vid)
+            desc = v.get("summary") or v.get("details", "")
+            out.append({
+                "cve_id": cve_alias,
+                "keyword": f"{package_name} ({ecosystem})",
+                "description": desc[:300],
+                "cvss_score": 7.5,
+                "severity": "high",
+                "published": v.get("published"),
+                "cpe_uris": [f"cpe:2.3:a:{package_name}:{package_name}:*:*:*:*:*:*:*:*"],
+            })
+        return out
+    except Exception as exc:
+        print(f"[CANH BAO] Khong the goi OSV API cho {package_name}: {exc}", file=sys.stderr)
+        return []
+
+
 def update_from_nvd(rules: dict, keywords: list[str], days_back: int,
                      api_key: Optional[str] = None) -> dict:
     all_cves = []
+    nvd_failed = False
     for kw in keywords:
         print(f"[INFO] Truy van NVD: '{kw}' ({days_back} ngay gan nhat)...")
-        all_cves.extend(fetch_cves_for_keyword(kw, days_back, api_key))
+        fetched = fetch_cves_for_keyword(kw, days_back, api_key)
+        all_cves.extend(fetched)
+        if not fetched:
+            nvd_failed = True
         if not api_key:
             time.sleep(RATE_LIMIT_SLEEP_S)
+
+    # Fallback sang Google OSV API neu NVD khong tra ve ket qua (do rate limit hoac mang chan)
+    if not all_cves or nvd_failed:
+        print("[INFO] Kich hoat fallback sang Google OSV API (api.osv.dev) cho cac package API...")
+        for pkg, eco in DEFAULT_OSV_PACKAGES:
+            osv_results = fetch_cves_from_osv(pkg, eco)
+            all_cves.extend(osv_results)
 
     # dedup theo cve_id, giu ban co cvss cao nhat neu trung
     by_id: dict[str, dict] = {}

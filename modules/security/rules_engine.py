@@ -256,6 +256,10 @@ ATTACK_TYPE_SYNONYMS = {
     "jwt": ["jwt", "json web token", "authentication bypass"],
     "xxe": ["xml external entity", "xxe"],
     "deserialization": ["deserialization", "insecure deserialization"],
+    "pathtraversal": ["path traversal", "directory traversal", "local file inclusion", "lfi"],
+    "ssti": ["template injection", "server-side template injection", "ssti"],
+    "nosqlinjection": ["nosql injection", "nosql", "mongodb injection"],
+    "timebasedsqli": ["sql", "sql injection", "blind sql", "sleep"],
 }
 
 

@@ -81,7 +81,7 @@ class TokenVerifier:
         )
 
     @classmethod
-    def generate_verification_probes(cls, raw_token: str) -> dict[str, str]:
+    def generate_verification_probes(cls, raw_token: str, extended: bool = False) -> dict[str, str]:
         """Generate RFC 7519 compliance verification probe tokens.
 
         Returns:
@@ -110,6 +110,15 @@ class TokenVerifier:
         exp_bytes = b64url_encode(json.dumps(expired_payload, separators=(",", ":")).encode("utf-8"))
         probes["expired_claim"] = f"{h_orig}.{exp_bytes}.invalid_sig_probe"
 
+        # Probe 4: Tampered Role Claim with Original Signature (optional extended probe)
+        if extended:
+            tampered_payload = dict(payload)
+            tampered_payload["role"] = "admin"
+            tampered_payload["is_admin"] = True
+            t_bytes = b64url_encode(json.dumps(tampered_payload, separators=(",", ":")).encode("utf-8"))
+            orig_sig = inspection.raw_token.split(".")[2] if len(inspection.raw_token.split(".")) == 3 else "probe_sig"
+            probes["tampered_payload"] = f"{h_orig}.{t_bytes}.{orig_sig}"
+
         return probes
 
     async def verify_endpoint(
@@ -120,16 +129,36 @@ class TokenVerifier:
         valid_auth_header: str,
         base_url: str,
         run_id: str,
+        require_auth_challenge: bool = False,
     ) -> list[Finding]:
-        """Test a protected endpoint with verification probe tokens."""
+        """Test a protected endpoint with verification probe tokens.
+        
+        If require_auth_challenge is True, an unauthenticated baseline check is first
+        performed to verify that the route actually requires authentication, avoiding
+        false positives on public/unauthenticated endpoints.
+        """
         inspection = self.inspect_token(valid_auth_header)
         if not inspection:
             return []
 
-        probes = self.generate_verification_probes(valid_auth_header)
         clean_ep = "/" + endpoint.lstrip("/")
         full_url = f"{base_url.rstrip('/')}{clean_ep}"
 
+        # Enterprise False-Positive Guard: Verify route is truly authenticated
+        if require_auth_challenge:
+            try:
+                unauth_resp = await client.request(
+                    method=method.upper(),
+                    url=full_url,
+                    headers={},  # Zero auth headers
+                )
+                # If endpoint responds with success without credentials, it is a public endpoint
+                if unauth_resp.status_code in (200, 201, 204):
+                    return []
+            except Exception:
+                pass
+
+        probes = self.generate_verification_probes(valid_auth_header)
         findings: list[Finding] = []
 
         for probe_name, probe_token in probes.items():
@@ -150,6 +179,7 @@ class TokenVerifier:
                         "alg_none": "Accepted token with alg=none (Broken Authentication)",
                         "stripped_signature": "Accepted token without signature verification",
                         "expired_claim": "Accepted token with expired 'exp' timestamp claim",
+                        "tampered_payload": "Accepted modified payload without verifying cryptographic signature",
                     }
                     evidence_text = f"HTTP 200 OK; {desc_map.get(probe_name, 'Token accepted')}"
                     finding = Finding(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .auth_manager import AuthConfig, AuthManager
 from .callback_verifier import (
     CallbackEvent,
     CallbackVerifier,
@@ -44,6 +45,8 @@ from .workflow_engine import (
 )
 
 __all__ = [
+    "AuthConfig",
+    "AuthManager",
     "CallbackEvent",
     "CallbackVerifier",
     "ConfirmationEngine",

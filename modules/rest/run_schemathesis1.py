@@ -358,6 +358,30 @@ def schema_payloads(targets: dict[str, tuple]) -> list[Payload]:
                     expected_signal=["sql", "syntax", "sqlite", "psql", "traceback"],
                     target_app=target_name,
                 ))
+                # Path Traversal probe (API8:2023)
+                generated.append(Payload(
+                    endpoint=operation.path,
+                    method=operation.method,
+                    target_param=param,
+                    param_location="path",
+                    attack_type="PATH_TRAVERSAL",
+                    payload_value="../../../../etc/passwd",
+                    owasp_category="API8:2023",
+                    expected_signal=["root:x:0:0", "daemon:x:", "[boot loader]", "for 16-bit app support"],
+                    target_app=target_name,
+                ))
+                # Server-Side Template Injection (SSTI) Canary (API8:2023)
+                generated.append(Payload(
+                    endpoint=operation.path,
+                    method=operation.method,
+                    target_param=param,
+                    param_location="path",
+                    attack_type="SSTI",
+                    payload_value="{{7*7}}",
+                    owasp_category="API8:2023",
+                    expected_signal=["49"],
+                    target_app=target_name,
+                ))
 
             # 3. Built-in Mass Assignment probe for state-changing endpoints
             if operation.method.upper() in ("POST", "PUT", "PATCH"):
@@ -370,6 +394,17 @@ def schema_payloads(targets: dict[str, tuple]) -> list[Payload]:
                     payload_value="admin",
                     owasp_category="API3:2023",
                     expected_signal=["admin", "role", "success"],
+                    target_app=target_name,
+                ))
+                generated.append(Payload(
+                    endpoint=operation.path,
+                    method=operation.method,
+                    target_param="is_admin",
+                    param_location="body",
+                    attack_type="MASS_ASSIGNMENT",
+                    payload_value=True,
+                    owasp_category="API3:2023",
+                    expected_signal=["is_admin", "true", "admin"],
                     target_app=target_name,
                 ))
     if not generated:
@@ -661,6 +696,28 @@ def evaluate_response(resp, payload: Payload, rules: Optional[dict] = None
             f"HTTP {status}; technical SQL/error signal: {technical_hits[:3]}",
             cve_ids,
         )
+
+    # Time-based blind injection evaluation
+    elapsed_ms = None
+    try:
+        if hasattr(resp, "elapsed_ms"):
+            elapsed_ms = getattr(resp, "elapsed_ms", None)
+        elif hasattr(resp, "_elapsed") and getattr(resp, "_elapsed", None) is not None:
+            elapsed_ms = resp._elapsed.total_seconds() * 1000
+    except Exception:
+        elapsed_ms = None
+
+    if elapsed_ms is not None and elapsed_ms >= 3500:
+        is_time_attack = "TIME" in attack_type or any(
+            k in str(payload.payload_value).lower()
+            for k in ("sleep", "waitfor", "pg_sleep", "delay")
+        )
+        if is_time_attack:
+            return (
+                "high", True,
+                f"HTTP {status}; significant time delay observed ({round(elapsed_ms, 1)}ms >= 3500ms)",
+                cve_ids,
+            )
 
     # Broad rule keywords alone are weak evidence and must not create
     # a candidate or increase severity.

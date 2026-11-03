@@ -269,6 +269,7 @@ def run_token_audit(
     endpoints: list[tuple[str, str]] | None = None,
     proxy: str | None = None,
     insecure: bool = False,
+    require_auth_challenge: bool = True,
 ) -> list[Finding]:
     """Audit protected endpoints for RFC 7519 compliance (Broken Authentication)."""
     verifier = TokenVerifier()
@@ -308,6 +309,7 @@ def run_token_audit(
                     valid_auth_header=clean_token,
                     base_url=base_url,
                     run_id=run_id,
+                    require_auth_challenge=require_auth_challenge,
                 )
                 all_findings.extend(findings)
 
@@ -329,14 +331,23 @@ def run_callback_audit(
     proxy: str | None = None,
     insecure: bool = False,
     external_url: str | None = None,
+    poll_url: str | None = None,
+    advertised_host: str | None = None,
 ) -> list[Finding]:
     """Audit potential URL-accepting parameters for SSRF & destination whitelisting."""
-    verifier = CallbackVerifier(external_callback_url=external_url)
+    verifier = CallbackVerifier(
+        external_callback_url=external_url,
+        poll_url=poll_url,
+        advertised_host=advertised_host,
+    )
     banner("DESTINATION WHITELIST & CALLBACK AUDIT (SSRF)")
     if external_url:
         print(f"[i] External Canary Callback URL: {external_url}")
+        if verifier.poll_url:
+            print(f"[i] Canary Polling Endpoint:      {verifier.poll_url}")
     else:
-        print("[i] Using dynamic in-memory loopback callback listener (127.0.0.1)")
+        reported = advertised_host or "127.0.0.1"
+        print(f"[i] Using dynamic in-memory loopback callback listener ({reported})")
 
     candidates = candidate_params or [
         ("POST", "/webhook", "url", "body"),
@@ -392,6 +403,8 @@ def run_dynamic_target(
     verify_tokens: bool = False,
     verify_callbacks: bool = False,
     callback_url: str | None = None,
+    callback_poll_url: str | None = None,
+    advertised_host: str | None = None,
     targets: TargetManager | None = None,
 ) -> int:
     """Dynamically register and run security fuzzing on an ad-hoc target URL."""
@@ -513,6 +526,8 @@ def run_dynamic_target(
                 proxy=proxy,
                 insecure=insecure,
                 external_url=callback_url,
+                poll_url=callback_poll_url,
+                advertised_host=advertised_host,
             )
             if callback_findings:
                 RESULTS.append_findings(
@@ -637,6 +652,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verify-tokens", action="store_true", help="Audit protected endpoints for RFC 7519 Broken Authentication")
     parser.add_argument("--verify-callbacks", action="store_true", help="Audit endpoints for loopback/SSRF callback vulnerabilities")
     parser.add_argument("--callback-url", default=None, help="External canary callback URL for OOB SSRF detection")
+    parser.add_argument("--poll-url", default=None, help="External Canary API polling endpoint URL (use {token} placeholder)")
+    parser.add_argument("--advertised-host", default=None, help="Host/IP advertised to targets for loopback callback (e.g. host.docker.internal)")
 
     args = parser.parse_args(argv)
 
@@ -666,6 +683,8 @@ def main(argv: list[str] | None = None) -> int:
             verify_tokens=args.verify_tokens,
             verify_callbacks=args.verify_callbacks,
             callback_url=args.callback_url,
+            callback_poll_url=args.poll_url,
+            advertised_host=args.advertised_host,
         )
 
     selected = list(dict.fromkeys(args.target)) if args.target else sorted(TARGETS.targets)

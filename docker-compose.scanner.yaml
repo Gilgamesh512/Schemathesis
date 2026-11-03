@@ -1,0 +1,14 @@
+services:
+  api-scanner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: schemathesis-scanner
+    volumes:
+      - ./results:/app/results
+      - ./targets:/app/targets
+      - ./payloads:/app/payloads
+    network_mode: "host"
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: ["scan", "--help"]

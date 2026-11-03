@@ -559,6 +559,21 @@ def evaluate_response(
     # shared baseline-vs-attack engine after this detector returns.
     # ------------------------------------------------------------
 
+    # Time-based blind injection evaluation
+    elapsed_ms = None
+    try:
+        if hasattr(resp, "elapsed_ms"):
+            elapsed_ms = getattr(resp, "elapsed_ms", None)
+        elif hasattr(resp, "_elapsed") and getattr(resp, "_elapsed", None) is not None:
+            elapsed_ms = resp._elapsed.total_seconds() * 1000
+    except Exception:
+        elapsed_ms = None
+
+    is_time_attack = "TIME" in (payload.attack_type or "").upper() or any(
+        k in str(payload.payload_value).lower()
+        for k in ("sleep", "waitfor", "pg_sleep", "delay")
+    )
+
     # Server-side 5xx is a strong candidate signal, not confirmation.
     if status >= 500:
         severity = SEVERITY_BY_STATUS.get(status, "high")
@@ -607,6 +622,11 @@ def evaluate_response(
             )
 
         evidence = "; ".join(evidence_parts)
+
+    elif is_time_attack and elapsed_ms and elapsed_ms >= 3500:
+        severity = "high"
+        candidate = True
+        evidence = f"HTTP {status}; significant time delay observed ({round(elapsed_ms, 1)}ms >= 3500ms)"
 
     # Generic signal only: evidence, NOT a candidate.
     elif generic_hits:

@@ -125,9 +125,15 @@ def compare_responses(baseline: Any, attack: Any) -> dict[str, Any]:
     baseline_time = getattr(baseline, "response_time_ms", None)
     attack_time = getattr(attack, "response_time_ms", None)
     if baseline_time is not None and attack_time is not None:
-        differences["response_time_ms"] = {
-            "baseline": baseline_time, "attack": attack_time,
+        delta = round(attack_time - baseline_time, 1)
+        resp_time_diff = {
+            "baseline": baseline_time,
+            "attack": attack_time,
         }
+        if delta >= 3500.0 and attack_time >= 3500.0:
+            resp_time_diff["significant_delay"] = True
+            resp_time_diff["delta_ms"] = delta
+        differences["response_time_ms"] = resp_time_diff
     return differences
 
 

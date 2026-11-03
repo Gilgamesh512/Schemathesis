@@ -56,6 +56,8 @@ def _parser() -> argparse.ArgumentParser:
     scan_parser.add_argument("--verify-tokens", action="store_true", help="Audit protected endpoints for RFC 7519 Broken Authentication")
     scan_parser.add_argument("--verify-callbacks", action="store_true", help="Audit endpoints for loopback/SSRF callback vulnerabilities")
     scan_parser.add_argument("--callback-url", default=None, help="External canary callback URL for OOB SSRF detection")
+    scan_parser.add_argument("--poll-url", default=None, help="External canary polling API endpoint (use {token} placeholder)")
+    scan_parser.add_argument("--advertised-host", default=None, help="Advertised host/IP for container callbacks (e.g. host.docker.internal)")
 
     wf_parser = commands.add_parser(
         "workflow",
@@ -211,6 +213,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             scan_args.append("--verify-callbacks")
         if args.callback_url:
             scan_args.extend(["--callback-url", args.callback_url])
+        if args.poll_url:
+            scan_args.extend(["--poll-url", args.poll_url])
+        if args.advertised_host:
+            scan_args.extend(["--advertised-host", args.advertised_host])
 
         try:
             run_script(RUN_SECURITY_TESTS, *scan_args)

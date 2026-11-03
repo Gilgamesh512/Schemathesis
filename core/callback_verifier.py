@@ -41,8 +41,9 @@ class CallbackEvent(BaseModel):
 class LocalCallbackListener:
     """Lightweight in-memory loopback HTTP listener for verifying local SSRF callbacks."""
 
-    def __init__(self, host: str = "127.0.0.1"):
+    def __init__(self, host: str = "127.0.0.1", advertised_host: Optional[str] = None):
         self.host = host
+        self.advertised_host = advertised_host
         self.port: int = 0
         self.server: Optional[asyncio.Server] = None
         self.hits: dict[str, CallbackEvent] = {}
@@ -60,7 +61,8 @@ class LocalCallbackListener:
         if sockets:
             self.port = sockets[0].getsockname()[1]
         self._running = True
-        return f"http://{self.host}:{self.port}"
+        reported_host = self.advertised_host or self.host
+        return f"http://{reported_host}:{self.port}"
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -133,8 +135,22 @@ class LocalCallbackListener:
 class CallbackVerifier:
     """Verifies whether API endpoints properly restrict URL parameters against SSRF."""
 
-    def __init__(self, external_callback_url: Optional[str] = None):
+    def __init__(
+        self,
+        external_callback_url: Optional[str] = None,
+        poll_url: Optional[str] = None,
+        advertised_host: Optional[str] = None,
+    ):
         self.external_url = external_callback_url.rstrip("/") if external_callback_url else None
+        self.poll_url = poll_url
+        self.advertised_host = advertised_host
+
+        # Auto-configure polling endpoint for Webhook.site
+        if self.external_url and not self.poll_url and "webhook.site" in self.external_url:
+            parts = self.external_url.strip("/").split("/")
+            if len(parts) >= 4 and parts[-2] == "webhook.site":
+                webhook_uuid = parts[-1]
+                self.poll_url = f"https://webhook.site/token/{webhook_uuid}/requests?query={{token}}&sorting=newest"
 
     @staticmethod
     def is_callback_parameter(param_name: str) -> bool:
@@ -143,6 +159,39 @@ class CallbackVerifier:
         return norm in CALLBACK_PARAM_NAMES or any(
             k in norm for k in ("callback", "webhook", "redirect", "url", "uri", "target", "dest")
         )
+
+    async def poll_external_hit(self, client: httpx.AsyncClient, token: str) -> Optional[CallbackEvent]:
+        """Poll external canary listener (e.g. Webhook.site or custom OOB API) for incoming hits."""
+        if not self.poll_url:
+            return None
+        try:
+            target_poll = self.poll_url.replace("{token}", token)
+            resp = await client.get(target_poll, timeout=4.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                # Webhook.site response structure: {"data": [...]}
+                if isinstance(data, dict) and "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
+                    req_entry = data["data"][0]
+                    return CallbackEvent(
+                        received_at=req_entry.get("created_at") or datetime.now(timezone.utc).isoformat(),
+                        client_ip=req_entry.get("ip") or "canary_remote",
+                        path=req_entry.get("url") or f"/{token}",
+                        method=req_entry.get("method") or "GET",
+                        headers=req_entry.get("headers") or {},
+                    )
+                # Generic list response
+                elif isinstance(data, list) and len(data) > 0:
+                    first = data[0] if isinstance(data[0], dict) else {}
+                    return CallbackEvent(
+                        received_at=datetime.now(timezone.utc).isoformat(),
+                        client_ip=first.get("client_ip") or first.get("ip") or "canary_remote",
+                        path=first.get("path") or f"/{token}",
+                        method=first.get("method") or "GET",
+                        headers=first.get("headers") or {},
+                    )
+        except Exception:
+            pass
+        return None
 
     async def verify_endpoint_url_parameter(
         self,
@@ -156,8 +205,8 @@ class CallbackVerifier:
         headers: Optional[dict[str, str]] = None,
         timeout: float = 3.0,
     ) -> Optional[Finding]:
-        """Test parameter with a unique canary loopback URL and check for SSRF callback."""
-        listener = LocalCallbackListener()
+        """Test parameter with a unique canary loopback/external URL and check for SSRF callback."""
+        listener = LocalCallbackListener(advertised_host=self.advertised_host)
         token = f"ssrf_{int(time.time())}_{abs(hash((endpoint, param_name))) % 10000}"
 
         if self.external_url:
@@ -193,11 +242,15 @@ class CallbackVerifier:
             # Wait briefly for server-side asynchronous callback
             await asyncio.sleep(min(timeout, 1.5))
 
-            hit = listener.check_hit(token) if not self.external_url else None
+            if not self.external_url:
+                hit = listener.check_hit(token)
+            else:
+                hit = await self.poll_external_hit(client, token)
 
             if hit:
+                src_desc = "loopback " if not self.external_url else "external "
                 evidence_text = (
-                    f"Server made outbound loopback request to canary listener at {hit.path} "
+                    f"Server made outbound {src_desc}request to canary listener at {hit.path} "
                     f"(Client IP: {hit.client_ip}, Method: {hit.method})"
                 )
                 finding = Finding(

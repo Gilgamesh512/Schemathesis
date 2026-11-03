@@ -171,15 +171,40 @@ python run_all.py scan --url https://api.example.com --schema ./openapi.json --p
 # Dynamic scanning with RFC 7519 Token Authentication & SSRF Callback Auditing
 python run_all.py scan --url https://api.example.com --schema ./openapi.json --auth-token "Bearer <TOKEN>" --verify-tokens --verify-callbacks
 
-# Scanning with External Canary Callback Listener (for Blind SSRF / API7:2023)
-python run_all.py scan --url https://api.example.com --schema ./openapi.json --verify-callbacks --callback-url https://webhook.site/your-uuid
+# Scanning with External Canary Callback Listener with automated Polling (Blind SSRF / API7:2023)
+python run_all.py scan --url https://api.example.com --schema ./openapi.json --verify-callbacks --callback-url https://webhook.site/your-uuid --poll-url "https://webhook.site/token/your-uuid/requests?query={token}&sorting=newest"
+
+# Scanning targets inside Docker containers with advertised host override
+python run_all.py scan --url http://127.0.0.1:8000 --schema ./openapi.json --verify-callbacks --advertised-host host.docker.internal
 
 # GraphQL API with endpoint
 python run_all.py scan --url https://api.example.com --protocol graphql --endpoint /graphql --auth-token "Bearer <TOKEN>"
 ```
 
 If no custom payload corpus is supplied via `--payloads`, the built-in security
-mutation engine automatically constructs security probes from the target schema.
+mutation engine automatically constructs security probes from the target schema
+(including SQL Injection, Time-based blind delay probes, Path Traversal, SSTI,
+BOLA/IDOR, and Mass Assignment).
+
+## Enterprise DevSecOps & Container Execution
+
+Run the scanner in an isolated, pre-built Docker container within CI/CD pipelines (GitHub Actions, GitLab CI, Jenkins):
+
+```bash
+# Build scanner image
+docker build -t schemathesis-scanner:latest .
+
+# Run dynamic scan from container with results mounted locally
+docker run --rm --net=host \
+  -v "$(pwd)/results:/app/results" \
+  schemathesis-scanner:latest scan \
+  --url https://api.example.com \
+  --schema https://api.example.com/openapi.json \
+  --auth-token "Bearer <TOKEN>"
+
+# Or using docker-compose
+docker compose -f docker-compose.scanner.yaml run --rm api-scanner scan --url https://api.example.com --schema https://api.example.com/openapi.json
+```
 
 ## Stateful Workflow Chaining Engine
 

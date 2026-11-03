@@ -9,6 +9,7 @@ import httpx
 import yaml
 
 from .path_manager import ProjectPaths
+from .schema_converter import convert_any_to_openapi
 
 
 class SchemaManager:
@@ -56,7 +57,8 @@ class SchemaManager:
                 payload = yaml.safe_load(text)
         if not isinstance(payload, dict):
             raise ValueError(f"Schema file must contain a mapping: {path}")
-        return payload
+        converted, _ = convert_any_to_openapi(payload)
+        return converted
 
     def load_remote(self, url: str) -> dict[str, Any]:
         parsed = urlparse(url)
@@ -81,7 +83,8 @@ class SchemaManager:
                 payload = yaml.safe_load(response.text)
         if not isinstance(payload, dict):
             raise ValueError(f"Schema response from {url} was not a mapping")
-        return payload
+        converted, _ = convert_any_to_openapi(payload)
+        return converted
 
 
 def load_schema(

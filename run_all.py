@@ -42,12 +42,30 @@ def _parser() -> argparse.ArgumentParser:
     )
     scan_parser.add_argument("--url", required=True, help="Base URL of the target API (e.g. http://localhost:8000)")
     scan_parser.add_argument("--schema", default=None, help="OpenAPI schema file path or URL (required for REST)")
+    scan_parser.add_argument("--postman", default=None, help="Postman collection JSON file path")
+    scan_parser.add_argument("--har", default=None, help="HTTP Archive (.har) log file path")
+    scan_parser.add_argument("--workflow", default=None, help="Stateful workflow YAML file path")
     scan_parser.add_argument("--auth-token", "--token", dest="auth_token", default=None, help="Bearer token, JWT, or 'Header: Value'")
     scan_parser.add_argument("--protocol", choices=["rest", "graphql"], default="rest", help="Protocol (default: rest)")
     scan_parser.add_argument("--endpoint", default="/graphql", help="GraphQL endpoint (if protocol=graphql)")
     scan_parser.add_argument("--payloads", default=None, help="Path to custom payload corpus JSON")
     scan_parser.add_argument("--target-id", default=None, help="Identifier for this target")
     scan_parser.add_argument("--name", default=None, help="Display name for this target")
+    scan_parser.add_argument("--proxy", default=None, help="Upstream HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:8080)")
+    scan_parser.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification")
+    scan_parser.add_argument("--verify-tokens", action="store_true", help="Audit protected endpoints for RFC 7519 Broken Authentication")
+    scan_parser.add_argument("--verify-callbacks", action="store_true", help="Audit endpoints for loopback/SSRF callback vulnerabilities")
+    scan_parser.add_argument("--callback-url", default=None, help="External canary callback URL for OOB SSRF detection")
+
+    wf_parser = commands.add_parser(
+        "workflow",
+        help="Execute a stateful multi-step API workflow YAML",
+        description="Run chained API workflow steps with sequential variable extraction and BOLA verification.",
+    )
+    wf_parser.add_argument("file", help="Path to workflow YAML file")
+    wf_parser.add_argument("--url", default=None, help="Base URL override")
+    wf_parser.add_argument("--proxy", default=None, help="Upstream HTTP/HTTPS proxy URL")
+    wf_parser.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification")
 
     return parser
 
@@ -145,6 +163,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         return 0
 
+    if args.command == "workflow":
+        wf_args = ["--workflow", args.file]
+        if args.url:
+            wf_args.extend(["--url", args.url])
+        if args.proxy:
+            wf_args.extend(["--proxy", args.proxy])
+        if args.insecure:
+            wf_args.append("--insecure")
+        try:
+            run_script(RUN_SECURITY_TESTS, *wf_args)
+            return 0
+        except (FileNotFoundError, OSError, RuntimeError) as exc:
+            print(f"[X] Workflow failed: {exc}", file=sys.stderr)
+            return 1
+
     if args.command == "scan":
         scan_args = [
             "--url", args.url,
@@ -152,6 +185,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         ]
         if args.schema:
             scan_args.extend(["--schema", args.schema])
+        if args.postman:
+            scan_args.extend(["--postman", args.postman])
+        if args.har:
+            scan_args.extend(["--har", args.har])
+        if args.workflow:
+            scan_args.extend(["--workflow", args.workflow])
         if args.auth_token:
             scan_args.extend(["--auth-token", args.auth_token])
         if args.protocol == "graphql" and args.endpoint:
@@ -162,6 +201,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             scan_args.extend(["--target-id", args.target_id])
         if args.name:
             scan_args.extend(["--name", args.name])
+        if args.proxy:
+            scan_args.extend(["--proxy", args.proxy])
+        if args.insecure:
+            scan_args.append("--insecure")
+        if args.verify_tokens:
+            scan_args.append("--verify-tokens")
+        if args.verify_callbacks:
+            scan_args.append("--verify-callbacks")
+        if args.callback_url:
+            scan_args.extend(["--callback-url", args.callback_url])
 
         try:
             run_script(RUN_SECURITY_TESTS, *scan_args)

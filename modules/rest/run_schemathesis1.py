@@ -239,7 +239,11 @@ def load_schema(
             resolved_spec = spec_path
         else:
             resolved_spec = schema_manager.resolve_local_schema(spec_path)
-            schema = schemathesis.openapi.from_path(str(resolved_spec))
+            schema_document = schema_manager.load_local(resolved_spec)
+            try:
+                schema = schemathesis.openapi.from_dict(schema_document)
+            except Exception:
+                schema = schemathesis.openapi.from_path(str(resolved_spec))
     except Exception as exc:  # spec loi cu phap / version khong ho tro
         print(f"[LOI] Khong doc duoc OpenAPI spec tu A: {spec_path}\n  -> {exc}",
               file=sys.stderr)
@@ -837,13 +841,22 @@ async def process_fingerprint_group(
 async def run_all(prepared: list[PreparedCase], headers: dict,
                    rules: Optional[dict], state: RunState, concurrency: int,
                    rate_limit_ms: int, global_rps: float = 0,
-                   user2_headers: Optional[dict] = None) -> list[Finding]:
+                   user2_headers: Optional[dict] = None,
+                   proxy: Optional[str] = None,
+                   insecure: bool = False) -> list[Finding]:
     groups: dict[str, list[PreparedCase]] = {}
     for pc in prepared:
         groups.setdefault(pc.fingerprint, []).append(pc)
 
     scheduler = RequestScheduler(concurrency=concurrency, global_rps=global_rps)
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    client_kwargs: dict[str, Any] = {"timeout": 20.0}
+    proxy_url = proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("ALL_PROXY")
+    if proxy_url:
+        client_kwargs["proxy"] = proxy_url
+    if insecure or os.environ.get("PYTHONHTTPSVERIFY") == "0":
+        client_kwargs["verify"] = False
+
+    async with httpx.AsyncClient(**client_kwargs) as client:
         tasks = [
             process_fingerprint_group(
                 client, scheduler, fp, group, headers,
@@ -905,6 +918,8 @@ def main():
         default=str(PROJECT_PATHS.config / "rules.json"),
         help="File rules OWASP+CVE (rules_engine.py)",
     )
+    ap.add_argument("--proxy", default=None, help="Upstream HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:8080)")
+    ap.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification")
     args = ap.parse_args()
 
     rules_path = PROJECT_PATHS.resolve(args.rules, allow_outside=True)
@@ -986,6 +1001,8 @@ def main():
         args.concurrency, args.rate_limit_ms,
         args.global_rps,
         user2_headers=user2_headers,
+        proxy=args.proxy,
+        insecure=args.insecure,
     ))
     total_fired = len(findings)
     total_skipped = total_prepared - total_fired

@@ -840,6 +840,8 @@ async def run_all(
     rate_limit_ms: int,
     global_rps: float = 0,
     target_id: str = "dvga",
+    proxy: Optional[str] = None,
+    insecure: bool = False,
 ) -> list[Finding]:
     scheduler = RequestScheduler(concurrency=concurrency, global_rps=global_rps)
     results_dir = state.path.parent
@@ -882,7 +884,14 @@ async def run_all(
 
         unique_payloads.append(payload)
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    client_kwargs: dict[str, Any] = {"timeout": 20.0}
+    proxy_url = proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("ALL_PROXY")
+    if proxy_url:
+        client_kwargs["proxy"] = proxy_url
+    if insecure or os.environ.get("PYTHONHTTPSVERIFY") == "0":
+        client_kwargs["verify"] = False
+
+    async with httpx.AsyncClient(**client_kwargs) as client:
         tasks = [
             process_payload(
                 client, scheduler, payload, base_url, endpoint,
@@ -1011,6 +1020,8 @@ def main() -> None:
                     help="Gioi han request/giay toan cuc (0 = tat)")
     ap.add_argument("--rules", default=str(PROJECT_PATHS.config / "rules.json"))
     ap.add_argument("--auth-header", default=None)
+    ap.add_argument("--proxy", default=None, help="Upstream HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:8080)")
+    ap.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification")
 
     args = ap.parse_args()
 
@@ -1120,6 +1131,8 @@ def main() -> None:
             max(0, args.rate_limit_ms),
             args.global_rps,
             args.target_id,
+            proxy=args.proxy,
+            insecure=args.insecure,
         )
     )
 

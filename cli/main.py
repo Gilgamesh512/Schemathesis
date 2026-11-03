@@ -22,6 +22,7 @@ from modules.security.run_security_tests import (
     parse_tokens_env,
     run_dynamic_target,
     run_target,
+    run_workflow,
 )
 
 RESULTS = ResultManager(PROJECT_ROOT)
@@ -55,6 +56,7 @@ def _render_menu_banner() -> None:
     print("  \033[1;32m[4]\033[0m 🌍 \033[1mOpen HTML Web Report in Browser\033[0m (Interactive Dark Dashboard)")
     print("  \033[1;32m[5]\033[0m 📑 \033[1mGenerate Fresh HTML & SARIF Report\033[0m (From findings history)")
     print("  \033[1;32m[6]\033[0m 🐳 \033[1mDocker Lab Management\033[0m (Start / Check Health / Stop)")
+    print("  \033[1;32m[7]\033[0m 🔄 \033[1mRun Stateful Workflow YAML\033[0m (Chained Steps & Business Logic)")
     print("  \033[1;31m[q]\033[0m 🚪 \033[1mExit\033[0m")
     print("\033[90m" + "─" * 76 + "\033[0m")
 
@@ -141,14 +143,21 @@ def _menu_scan_custom() -> None:
     schema = ""
     endpoint = "/graphql"
     if protocol == "rest":
-        schema = _safe_input("OpenAPI Schema URL or local file path (e.g. http://.../openapi.json or ./spec.yaml): ")
+        schema = _safe_input("Schema path/URL (OpenAPI json/yaml, Postman Collection, or HAR log): ")
         if not schema:
-            print("[!] REST target requires an OpenAPI schema source.")
+            print("[!] REST target requires a schema source (OpenAPI, Postman, or HAR).")
             return
     else:
         endpoint = _safe_input("GraphQL endpoint [/graphql]: ") or "/graphql"
 
     auth_token = _safe_input("Auth Token (optional, Bearer token, JWT, or 'Header: Value'): ")
+    proxy = _safe_input("Upstream Proxy URL (optional, e.g. http://127.0.0.1:8080 for Burp): ")
+    insecure_ans = _safe_input("Disable SSL verification (for Burp/ZAP self-signed cert)? [y/N]: ").lower()
+    insecure = insecure_ans in {"y", "yes"}
+    verify_tokens_ans = _safe_input("Enable RFC 7519 Token Authentication Auditor? [y/N]: ").lower()
+    verify_tokens = verify_tokens_ans in {"y", "yes"}
+    verify_cb_ans = _safe_input("Enable Destination Whitelist & Loopback SSRF Auditor? [y/N]: ").lower()
+    verify_cb = verify_cb_ans in {"y", "yes"}
     payloads = _safe_input("Custom Payloads JSON file path (optional, press Enter to auto-generate): ")
 
     print("\n[i] Starting dynamic scan against:", url)
@@ -159,6 +168,10 @@ def _menu_scan_custom() -> None:
         protocol=protocol,
         endpoint=endpoint,
         payloads=payloads or None,
+        proxy=proxy or None,
+        insecure=insecure,
+        verify_tokens=verify_tokens,
+        verify_callbacks=verify_cb,
     )
 
     if exit_code == 0:
@@ -225,11 +238,35 @@ def _menu_docker_lab() -> None:
         subprocess.run([PYTHON, str(LAB_SCRIPT), "stop"], cwd=PROJECT_ROOT)
 
 
+def _menu_run_workflow() -> None:
+    print("\n\033[1;36m🔄 STATEFUL WORKFLOW EXECUTION\033[0m")
+    print("Execute multi-step API workflows with dynamic variable extraction and BOLA validation.\n")
+
+    default_wf = "targets/workflows/sample_workflow.yaml"
+    wf_path = _safe_input(f"Path to workflow YAML file [{default_wf}]: ") or default_wf
+    base_url = _safe_input("Base URL override (optional, e.g. http://localhost:5002): ") or None
+    proxy = _safe_input("Upstream Proxy URL (optional, e.g. http://127.0.0.1:8080): ") or None
+    insecure_ans = _safe_input("Disable SSL verification? [y/N]: ").lower()
+    insecure = insecure_ans in {"y", "yes"}
+
+    try:
+        run_workflow(
+            wf_path,
+            base_url=base_url,
+            proxy=proxy,
+            insecure=insecure,
+        )
+    except Exception as exc:
+        print(f"\n[X] Workflow failed: {exc}", file=sys.stderr)
+
+    _safe_input("\nPress Enter to return to main menu...")
+
+
 def interactive_terminal_ui() -> int:
     """Run full interactive terminal website / console."""
     while True:
         _render_menu_banner()
-        choice = _safe_input("Enter choice [1-6, q]: ").strip().lower()
+        choice = _safe_input("Enter choice [1-7, q]: ").strip().lower()
 
         if choice in {"q", "quit", "exit"}:
             print("\nGoodbye! Happy security testing.")
@@ -246,8 +283,10 @@ def interactive_terminal_ui() -> int:
             _menu_generate_html()
         elif choice == "6":
             _menu_docker_lab()
+        elif choice == "7":
+            _menu_run_workflow()
         else:
-            print("\n[!] Invalid choice. Please enter 1-6 or q.")
+            print("\n[!] Invalid choice. Please enter 1-7 or q.")
         print()
 
 
@@ -257,12 +296,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--url", default=None, help="Target base URL (e.g. https://api.example.com)")
     parser.add_argument("--schema", default=None, help="OpenAPI schema path or URL (required for REST)")
+    parser.add_argument("--postman", default=None, help="Postman collection JSON file path")
+    parser.add_argument("--har", default=None, help="HTTP Archive (.har) log file path")
+    parser.add_argument("--workflow", default=None, help="Stateful workflow YAML file path")
     parser.add_argument("--auth-token", "--token", dest="auth_token", default=None, help="Bearer token, JWT, or 'Header: Value'")
     parser.add_argument("--protocol", choices=["rest", "graphql"], default="rest", help="Protocol (default: rest)")
     parser.add_argument("--endpoint", default="/graphql", help="GraphQL endpoint (default: /graphql)")
     parser.add_argument("--payloads", default=None, help="Path to custom payload corpus JSON")
     parser.add_argument("--target-id", default=None, help="Identifier for dynamic target")
     parser.add_argument("--name", default=None, help="Display name for dynamic target")
+    parser.add_argument("--proxy", default=None, help="Upstream HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:8080)")
+    parser.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification")
+    parser.add_argument("--verify-tokens", action="store_true", help="Audit protected endpoints for RFC 7519 Broken Authentication")
+    parser.add_argument("--verify-callbacks", action="store_true", help="Audit endpoints for loopback/SSRF callback vulnerabilities")
+    parser.add_argument("--callback-url", default=None, help="External canary callback URL for OOB SSRF detection")
     parser.add_argument("--report", action="store_true", help="Generate and open the latest HTML report in browser")
     parser.add_argument("--sarif", action="store_true", help="Generate and export the latest findings to OASIS SARIF format")
     parser.add_argument("--dashboard", action="store_true", help="Print the latest security dashboard to the terminal")
@@ -295,17 +342,40 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[+] Updated: {RESULTS.results_dir / 'vulnerabilities.sarif'}")
         return 0
 
-    if args.url and not args.interactive:
-        return run_dynamic_target(
-            url=args.url,
-            schema=args.schema,
-            auth_token=args.auth_token,
-            protocol=args.protocol,
-            endpoint=args.endpoint,
-            payloads=args.payloads,
-            target_id=args.target_id,
-            name=args.name,
+    if args.workflow:
+        return run_workflow(
+            args.workflow,
+            base_url=args.url,
+            proxy=args.proxy,
+            insecure=args.insecure,
         )
+
+    if args.url and not args.interactive:
+        kwargs: dict[str, Any] = {
+            "url": args.url,
+            "schema": args.schema,
+            "auth_token": args.auth_token,
+            "protocol": args.protocol,
+            "endpoint": args.endpoint,
+            "payloads": args.payloads,
+            "target_id": args.target_id,
+            "name": args.name,
+        }
+        if args.postman:
+            kwargs["postman"] = args.postman
+        if args.har:
+            kwargs["har"] = args.har
+        if args.proxy:
+            kwargs["proxy"] = args.proxy
+        if args.insecure:
+            kwargs["insecure"] = args.insecure
+        if args.verify_tokens:
+            kwargs["verify_tokens"] = args.verify_tokens
+        if args.verify_callbacks:
+            kwargs["verify_callbacks"] = args.verify_callbacks
+        if args.callback_url:
+            kwargs["callback_url"] = args.callback_url
+        return run_dynamic_target(**kwargs)
 
     # Interactive terminal website mode
     return interactive_terminal_ui()

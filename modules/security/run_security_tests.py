@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import re
 import subprocess
@@ -12,11 +13,23 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import httpx
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from core import ProjectPaths, ResultManager, SecurityReporter, TargetManager
+from core import (
+    CallbackVerifier,
+    Finding,
+    ProjectPaths,
+    ResultManager,
+    SecurityReporter,
+    TargetManager,
+    TokenVerifier,
+    WorkflowDefinition,
+    WorkflowRunner,
+)
 
 
 PROJECT_PATHS = ProjectPaths.from_root(PROJECT_ROOT)
@@ -127,6 +140,8 @@ def build_target_command(
     *,
     include_payload: bool = True,
     targets: TargetManager = TARGETS,
+    proxy: str | None = None,
+    insecure: bool = False,
 ) -> tuple[str, list[str]]:
     target = targets.get_target(target_id)
     protocol = target.settings.get("protocol")
@@ -183,6 +198,13 @@ def build_target_command(
         "--results-dir", str(results_dir),
         "--concurrency", "3",
     ])
+
+    proxy_val = proxy or target.settings.get("proxy")
+    if proxy_val:
+        command.extend(["--proxy", str(proxy_val)])
+    if insecure or target.settings.get("insecure"):
+        command.append("--insecure")
+
     return target.name, command
 
 
@@ -216,29 +238,160 @@ def run_target(
     include_payload: bool = True,
     tokens: dict[str, str] | None = None,
     targets: TargetManager = TARGETS,
+    proxy: str | None = None,
+    insecure: bool = False,
 ) -> None:
     label, command = build_target_command(
         target_id,
         include_payload=include_payload,
         targets=targets,
+        proxy=proxy,
+        insecure=insecure,
     )
+    extra_env = auth_env_for(target_id, tokens or {}, targets=targets) or {}
+    proxy_val = proxy or targets.get_target(target_id).settings.get("proxy")
+    if proxy_val:
+        extra_env["HTTP_PROXY"] = str(proxy_val)
+        extra_env["HTTPS_PROXY"] = str(proxy_val)
+    if insecure or targets.get_target(target_id).settings.get("insecure"):
+        extra_env["PYTHONHTTPSVERIFY"] = "0"
+
     run_command(
         f"FUZZING - {label}",
         command,
-        auth_env_for(target_id, tokens or {}, targets=targets),
+        extra_env if extra_env else None,
     )
+
+
+def run_token_audit(
+    base_url: str,
+    auth_token: str,
+    endpoints: list[tuple[str, str]] | None = None,
+    proxy: str | None = None,
+    insecure: bool = False,
+) -> list[Finding]:
+    """Audit protected endpoints for RFC 7519 compliance (Broken Authentication)."""
+    verifier = TokenVerifier()
+    clean_token = auth_token.strip()
+    if clean_token.lower().startswith("bearer "):
+        clean_token = clean_token[7:].strip()
+
+    inspection = verifier.inspect_token(clean_token)
+    if not inspection:
+        print("[i] Token does not appear to be an RFC 7519 JWT, skipping token compliance probes.")
+        return []
+
+    banner("RFC 7519 TOKEN AUTHENTICATION COMPLIANCE AUDIT")
+    print(f"[i] Algorithm: {inspection.algorithm}")
+    print(f"[i] Expiration Claim: {'Present' if inspection.has_exp else 'Missing'}")
+    if inspection.is_expired:
+        print("[!] Warning: Provided token is already expired.")
+
+    target_eps = endpoints or [
+        ("GET", "/"),
+        ("GET", "/api/v1/user"),
+        ("GET", "/api/v1/profile"),
+        ("GET", "/users/v1/_me"),
+    ]
+
+    all_findings: list[Finding] = []
+    run_id = f"token-audit-{uuid.uuid4().hex[:8]}"
+
+    async def _run():
+        transport = httpx.AsyncHTTPTransport(proxy=proxy, verify=not insecure)
+        async with httpx.AsyncClient(transport=transport, timeout=10.0) as client:
+            for method, ep in target_eps:
+                findings = await verifier.verify_endpoint(
+                    client=client,
+                    endpoint=ep,
+                    method=method,
+                    valid_auth_header=clean_token,
+                    base_url=base_url,
+                    run_id=run_id,
+                )
+                all_findings.extend(findings)
+
+    try:
+        asyncio.run(_run())
+    except Exception as exc:
+        print(f"[!] Token verification probe failed: {exc}")
+
+    if all_findings:
+        print(f"[!] Detected {len(all_findings)} token verification anomalies!")
+    else:
+        print("[+] Token verification completed: No broken authentication signatures accepted.")
+    return all_findings
+
+
+def run_callback_audit(
+    base_url: str,
+    candidate_params: list[tuple[str, str, str, str]] | None = None,
+    proxy: str | None = None,
+    insecure: bool = False,
+    external_url: str | None = None,
+) -> list[Finding]:
+    """Audit potential URL-accepting parameters for SSRF & destination whitelisting."""
+    verifier = CallbackVerifier(external_callback_url=external_url)
+    banner("DESTINATION WHITELIST & CALLBACK AUDIT (SSRF)")
+    if external_url:
+        print(f"[i] External Canary Callback URL: {external_url}")
+    else:
+        print("[i] Using dynamic in-memory loopback callback listener (127.0.0.1)")
+
+    candidates = candidate_params or [
+        ("POST", "/webhook", "url", "body"),
+        ("POST", "/api/v1/subscribe", "callback", "json"),
+        ("GET", "/redirect", "url", "query"),
+    ]
+
+    all_findings: list[Finding] = []
+    run_id = f"callback-audit-{uuid.uuid4().hex[:8]}"
+
+    async def _run():
+        transport = httpx.AsyncHTTPTransport(proxy=proxy, verify=not insecure)
+        async with httpx.AsyncClient(transport=transport, timeout=10.0) as client:
+            for method, ep, param, loc in candidates:
+                finding = await verifier.verify_endpoint_url_parameter(
+                    client=client,
+                    endpoint=ep,
+                    method=method,
+                    param_name=param,
+                    param_location=loc,
+                    base_url=base_url,
+                    run_id=run_id,
+                )
+                if finding:
+                    all_findings.append(finding)
+
+    try:
+        asyncio.run(_run())
+    except Exception as exc:
+        print(f"[!] Callback audit error: {exc}")
+
+    if all_findings:
+        print(f"[!] Detected {len(all_findings)} callback destination whitelist issues!")
+    else:
+        print("[+] Callback destination audit completed: No loopback callbacks received.")
+    return all_findings
 
 
 def run_dynamic_target(
     *,
     url: str,
     schema: str | None = None,
+    postman: str | None = None,
+    har: str | None = None,
     auth_token: str | None = None,
     protocol: str = "rest",
     endpoint: str = "/graphql",
     payloads: str | None = None,
     target_id: str | None = None,
     name: str | None = None,
+    proxy: str | None = None,
+    insecure: bool = False,
+    verify_tokens: bool = False,
+    verify_callbacks: bool = False,
+    callback_url: str | None = None,
     targets: TargetManager | None = None,
 ) -> int:
     """Dynamically register and run security fuzzing on an ad-hoc target URL."""
@@ -250,8 +403,9 @@ def run_dynamic_target(
     if protocol not in {"rest", "graphql"}:
         raise ValueError(f"Protocol must be 'rest' or 'graphql', got '{protocol}'")
 
-    if protocol == "rest" and not schema:
-        raise ValueError("REST target requires an OpenAPI schema (--schema <URL or file path>)")
+    effective_schema = schema or postman or har
+    if protocol == "rest" and not effective_schema:
+        raise ValueError("REST target requires an OpenAPI/Postman/HAR schema (--schema, --postman, or --har)")
 
     if not target_id:
         host = parsed_url.netloc.split(":")[0]
@@ -265,14 +419,19 @@ def run_dynamic_target(
     target_name = name or f"Dynamic target ({url})"
 
     settings: dict[str, Any] = {"protocol": protocol}
-    resolved_schema = schema
+    if proxy:
+        settings["proxy"] = proxy
+    if insecure:
+        settings["insecure"] = True
+
+    resolved_schema = effective_schema
     if protocol == "rest":
-        if schema and schema.startswith(("http://", "https://")):
+        if effective_schema and effective_schema.startswith(("http://", "https://")):
             settings["allow_remote_schema"] = True
-        elif schema:
-            schema_file = Path(schema).resolve()
+        elif effective_schema:
+            schema_file = Path(effective_schema).resolve()
             if not schema_file.is_file():
-                raise FileNotFoundError(f"OpenAPI schema file not found: {schema}")
+                raise FileNotFoundError(f"Schema file not found: {effective_schema}")
             resolved_schema = str(schema_file)
     elif protocol == "graphql":
         ep = endpoint if endpoint.startswith("/") else f"/{endpoint}"
@@ -313,6 +472,10 @@ def run_dynamic_target(
         print(f"[i] GraphQL Endpoint: {settings.get('endpoint')}")
     if auth.get("header"):
         print("[i] Auth: Configured via CLI")
+    if proxy:
+        print(f"[i] Upstream Proxy: {proxy}")
+    if insecure:
+        print("[i] SSL Verify: Disabled (--insecure)")
     if resolved_payloads:
         print(f"[i] Payloads: {resolved_payloads}")
     else:
@@ -320,7 +483,44 @@ def run_dynamic_target(
     print(f"[i] Results dir: {RESULTS.results_dir}")
 
     try:
-        run_target(target_id, include_payload=bool(resolved_payloads), targets=mgr)
+        kwargs: dict[str, Any] = {
+            "include_payload": bool(resolved_payloads),
+            "targets": mgr,
+        }
+        if proxy:
+            kwargs["proxy"] = proxy
+        if insecure:
+            kwargs["insecure"] = insecure
+        run_target(target_id, **kwargs)
+
+        if verify_tokens and auth_token:
+            token_findings = run_token_audit(
+                base_url=url,
+                auth_token=auth_token,
+                proxy=proxy,
+                insecure=insecure,
+            )
+            if token_findings:
+                RESULTS.append_findings(
+                    token_findings,
+                    source="token_verifier",
+                    fieldnames=list(Finding.model_fields.keys()),
+                )
+
+        if verify_callbacks:
+            callback_findings = run_callback_audit(
+                base_url=url,
+                proxy=proxy,
+                insecure=insecure,
+                external_url=callback_url,
+            )
+            if callback_findings:
+                RESULTS.append_findings(
+                    callback_findings,
+                    source="callback_verifier",
+                    fieldnames=list(Finding.model_fields.keys()),
+                )
+
         banner("FUZZING COMPLETE")
 
         # Render terminal dashboard and generate HTML report
@@ -336,6 +536,82 @@ def run_dynamic_target(
         return 1
 
 
+def run_workflow(
+    workflow_path: str | Path,
+    *,
+    base_url: str | None = None,
+    proxy: str | None = None,
+    insecure: bool = False,
+    tokens: dict[str, str] | None = None,
+) -> int:
+    path = Path(workflow_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Workflow file not found: {workflow_path}")
+
+    workflow = WorkflowDefinition.from_yaml(path)
+    banner(f"STATEFUL WORKFLOW EXECUTION: {workflow.name}")
+    print(f"[i] Workflow File: {path}")
+    if base_url:
+        print(f"[i] Base URL Override: {base_url}")
+    if proxy:
+        print(f"[i] Upstream Proxy: {proxy}")
+    if insecure:
+        print("[i] SSL Verify: Disabled (--insecure)")
+    print(f"[i] Total Defined Steps: {len(workflow.steps)}")
+
+    token_dict = tokens if tokens is not None else parse_tokens_env()
+    user_tokens = {
+        "user1": token_dict.get("FUZZ_AUTH_HEADER") or token_dict.get("AUTH_TOKEN") or "",
+        "user2": token_dict.get("FUZZ_AUTH_HEADER_USER2") or token_dict.get("AUTH_TOKEN_USER2") or "",
+    }
+    for k, v in token_dict.items():
+        if k.endswith("_AUTH_HEADER"):
+            app = k.replace("_AUTH_HEADER", "").lower()
+            user_tokens[app] = v
+        elif k.endswith("_AUTH_HEADER_USER2"):
+            app = k.replace("_AUTH_HEADER_USER2", "").lower() + "_user2"
+            user_tokens[app] = v
+
+    runner = WorkflowRunner(
+        base_url=base_url or workflow.base_url,
+        proxy=proxy,
+        insecure=insecure,
+        user_tokens=user_tokens,
+    )
+
+    report = asyncio.run(runner.run(workflow))
+
+    print(f"\n[+] Workflow execution completed in {report.duration_ms} ms")
+    print(f"    Passed: {report.passed_steps}/{report.total_steps} steps")
+    print(f"    Failed: {report.failed_steps}/{report.total_steps} steps")
+
+    for idx, res in enumerate(report.results, start=1):
+        status_label = f"HTTP {res.status_code}" if res.status_code else "ERROR"
+        mark = "✓" if res.success else "✗"
+        print(f"    [{mark}] Step {idx}: {res.step_name} [{res.method} {res.url}] -> {status_label} ({res.elapsed_ms}ms)")
+        if res.extracted:
+            print(f"        Extracted Context: {res.extracted}")
+        if res.error_message:
+            print(f"        Failure Reason: {res.error_message}")
+
+    # Record findings if any
+    if report.findings:
+        banner("WORKFLOW SECURITY FINDINGS DETECTED")
+        RESULTS.append_findings(
+            report.findings,
+            source="workflow_engine",
+            fieldnames=list(Finding.model_fields.keys()),
+        )
+        reporter = SecurityReporter(RESULTS.results_dir)
+        findings = reporter.load_latest_findings()
+        reporter.render_terminal_dashboard(findings, target_info={"name": workflow.name, "url": str(path)})
+        html_report = reporter.generate_html_report(findings, target_info={"name": workflow.name, "url": str(path)})
+        print(f"[+] Standalone HTML Report: {html_report}")
+        print(f"[+] Latest Report Link:     {RESULTS.results_dir / 'latest_report.html'}")
+
+    return 0 if report.success else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run configured or dynamic API security targets")
     parser.add_argument(
@@ -347,39 +623,71 @@ def main(argv: list[str] | None = None) -> int:
     # Dynamic target ingestion options
     parser.add_argument("--url", default=None, help="Dynamic target base URL (e.g. https://api.example.com)")
     parser.add_argument("--schema", default=None, help="OpenAPI schema path or URL (required for REST)")
+    parser.add_argument("--postman", default=None, help="Path to Postman collection v2.1/v2.0 JSON file")
+    parser.add_argument("--har", default=None, help="Path to HTTP Archive (.har) log file")
+    parser.add_argument("--workflow", default=None, help="Path to stateful workflow YAML file")
     parser.add_argument("--auth-token", "--token", dest="auth_token", default=None, help="Bearer token, JWT, or 'Header: Value'")
     parser.add_argument("--protocol", choices=["rest", "graphql"], default="rest", help="Protocol (default: rest)")
     parser.add_argument("--endpoint", default="/graphql", help="GraphQL endpoint (default: /graphql)")
     parser.add_argument("--payloads", default=None, help="Path to custom payload corpus JSON")
     parser.add_argument("--target-id", default=None, help="Identifier for dynamic target")
     parser.add_argument("--name", default=None, help="Display name for dynamic target")
+    parser.add_argument("--proxy", default=None, help="Upstream HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:8080)")
+    parser.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification")
+    parser.add_argument("--verify-tokens", action="store_true", help="Audit protected endpoints for RFC 7519 Broken Authentication")
+    parser.add_argument("--verify-callbacks", action="store_true", help="Audit endpoints for loopback/SSRF callback vulnerabilities")
+    parser.add_argument("--callback-url", default=None, help="External canary callback URL for OOB SSRF detection")
 
     args = parser.parse_args(argv)
+
+    if args.workflow:
+        return run_workflow(
+            args.workflow,
+            base_url=args.url,
+            proxy=args.proxy,
+            insecure=args.insecure,
+        )
 
     # Dynamic target scan mode:
     if args.url:
         return run_dynamic_target(
             url=args.url,
             schema=args.schema,
+            postman=args.postman,
+            har=args.har,
             auth_token=args.auth_token,
             protocol=args.protocol,
             endpoint=args.endpoint,
             payloads=args.payloads,
             target_id=args.target_id,
             name=args.name,
+            proxy=args.proxy,
+            insecure=args.insecure,
+            verify_tokens=args.verify_tokens,
+            verify_callbacks=args.verify_callbacks,
+            callback_url=args.callback_url,
         )
 
     selected = list(dict.fromkeys(args.target)) if args.target else sorted(TARGETS.targets)
 
     banner("API SECURITY TESTING")
     print(f"[i] Results: {RESULTS.results_dir}")
+    if args.proxy:
+        print(f"[i] Proxy: {args.proxy}")
+    if args.insecure:
+        print("[i] SSL Verify: Disabled (--insecure)")
     tokens = parse_tokens_env()
     successful: list[str] = []
     failures: list[tuple[str, str]] = []
     try:
         for target_id in selected:
             try:
-                run_target(target_id, tokens=tokens)
+                target_kwargs: dict[str, Any] = {"tokens": tokens}
+                if args.proxy:
+                    target_kwargs["proxy"] = args.proxy
+                if args.insecure:
+                    target_kwargs["insecure"] = args.insecure
+                run_target(target_id, **target_kwargs)
                 successful.append(target_id)
             except (FileNotFoundError, KeyError, OSError, RuntimeError, ValueError) as exc:
                 print(f"\n[X] Target '{target_id}' failed: {exc}")

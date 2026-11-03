@@ -29,6 +29,7 @@ from core import (
     TokenVerifier,
     WorkflowDefinition,
     WorkflowRunner,
+    discover_api,
 )
 
 
@@ -124,6 +125,11 @@ def auth_env_for(
     env_res: dict[str, str] = {}
     if value:
         env_res["FUZZ_AUTH_HEADER"] = value
+
+    # Check for custom multi-headers
+    headers_dict = target.auth.get("headers")
+    if isinstance(headers_dict, dict) and headers_dict:
+        env_res["FUZZ_EXTRA_HEADERS_JSON"] = json.dumps(headers_dict)
 
     # Check for User 2 token (Dual-user auth for BOLA / IDOR cross-account testing)
     if isinstance(token_env, str):
@@ -393,6 +399,7 @@ def run_dynamic_target(
     postman: str | None = None,
     har: str | None = None,
     auth_token: str | None = None,
+    custom_headers: dict[str, str] | None = None,
     protocol: str = "rest",
     endpoint: str = "/graphql",
     payloads: str | None = None,
@@ -406,6 +413,7 @@ def run_dynamic_target(
     callback_poll_url: str | None = None,
     advertised_host: str | None = None,
     targets: TargetManager | None = None,
+    save_profile: bool = False,
 ) -> int:
     """Dynamically register and run security fuzzing on an ad-hoc target URL."""
     parsed_url = urlparse(url)
@@ -418,7 +426,25 @@ def run_dynamic_target(
 
     effective_schema = schema or postman or har
     if protocol == "rest" and not effective_schema:
-        raise ValueError("REST target requires an OpenAPI/Postman/HAR schema (--schema, --postman, or --har)")
+        print(f"\n[i] No schema specified. Starting Auto-Discovery on {url} ...")
+        discovery = discover_api(url, proxy=proxy, insecure=insecure, headers=custom_headers)
+        if discovery.is_discovered:
+            if discovery.protocol == "graphql":
+                protocol = "graphql"
+                endpoint = discovery.endpoint or "/graphql"
+                print(f"[+] AUTO-DISCOVERY: Found GraphQL endpoint: {endpoint}")
+            elif discovery.schema_url:
+                effective_schema = discovery.schema_url
+                if discovery.title and not name:
+                    name = f"{discovery.title} ({url})"
+                print(f"[+] AUTO-DISCOVERY: Found OpenAPI/Swagger schema: {discovery.schema_url}")
+                if discovery.title:
+                    print(f"    API Title: {discovery.title} (v{discovery.version or 'unknown'})")
+        else:
+            raise ValueError(
+                f"Auto-Discovery could not find an OpenAPI or GraphQL specification at {url}.\n"
+                "Please provide a schema source explicitly using --schema, --postman, or --har."
+            )
 
     if not target_id:
         host = parsed_url.netloc.split(":")[0]
@@ -461,6 +487,8 @@ def run_dynamic_target(
     auth: dict[str, Any] = {}
     if auth_token:
         auth["header"] = normalize_auth_header(auth_token)
+    if custom_headers:
+        auth["headers"] = custom_headers
 
     mgr = targets or TargetManager(PROJECT_ROOT)
     # If target_id collides in manager, give it a unique suffix
@@ -475,6 +503,9 @@ def run_dynamic_target(
         auth=auth,
         settings=settings,
     )
+    if save_profile:
+        saved_path = mgr.save_profile(target_id, overwrite=True)
+        print(f"[+] Saved target profile: {saved_path}")
 
     banner(f"DYNAMIC TARGET FUZZING: {target_name}")
     print(f"[i] Base URL: {url}")

@@ -193,12 +193,12 @@ class TargetManager:
         self._register(config)
         return self.targets[config.target_id]
 
-    def save_profile(self, target_id: str) -> Path:
+    def save_profile(self, target_id: str, overwrite: bool = True) -> Path:
         config = self.get_target(target_id)
         profile_dir = self.paths.targets / "profiles"
         profile_dir.mkdir(parents=True, exist_ok=True)
         path = profile_dir / f"{config.target_id}.yaml"
-        if path.exists():
+        if path.exists() and not overwrite:
             raise FileExistsError(f"Target profile already exists: {path}")
         document = {
             "target_id": config.target_id,
@@ -213,6 +213,37 @@ class TargetManager:
             encoding="utf-8",
         )
         return path
+
+    def delete_profile(self, target_id: str) -> bool:
+        tid = target_id.strip().lower()
+        profile_dir = self.paths.targets / "profiles"
+        deleted = False
+        for ext in (".yaml", ".yml"):
+            p = profile_dir / f"{tid}{ext}"
+            if p.exists():
+                p.unlink()
+                deleted = True
+        if tid in self.targets:
+            self.targets.pop(tid, None)
+            deleted = True
+        return deleted
+
+    def list_custom_profiles(self) -> list[TargetConfig]:
+        profile_dir = self.paths.targets / "profiles"
+        if not profile_dir.exists():
+            return []
+        custom_ids = {
+            p.stem for p in (*profile_dir.glob("*.yaml"), *profile_dir.glob("*.yml"))
+        }
+        return [cfg for tid, cfg in self.targets.items() if tid in custom_ids]
+
+    def list_lab_profiles(self) -> list[TargetConfig]:
+        custom_tids = {cfg.target_id for cfg in self.list_custom_profiles()}
+        return [cfg for tid, cfg in self.targets.items() if tid not in custom_tids]
+
+    def refresh(self) -> None:
+        self.targets.clear()
+        self._load_default_profiles()
 
 
 TargetRegistry = TargetManager

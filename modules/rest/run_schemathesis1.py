@@ -331,15 +331,27 @@ def schema_payloads(targets: dict[str, tuple]) -> list[Payload]:
                 target_app=target_name,
             ))
 
-            # 2. Built-in Security Mutation Engine: Detect path parameters for BOLA / Injection
+            # 2. Built-in Security Mutation Engine: Collect path & query parameters
             path_params = re.findall(r"\{([^}]+)\}", operation.path)
-            for param in path_params:
+            query_params = []
+            try:
+                for p in operation.iter_parameters():
+                    loc_str = str(getattr(p, "location", "")).lower()
+                    if "query" in loc_str and getattr(p, "name", None):
+                        query_params.append(p.name)
+            except Exception:
+                pass
+
+            target_params = [(p, "path") for p in path_params]
+            target_params.extend([(qp, "query") for qp in query_params])
+
+            for param, loc in target_params:
                 # BOLA / IDOR probe
                 generated.append(Payload(
                     endpoint=operation.path,
                     method=operation.method,
                     target_param=param,
-                    param_location="path",
+                    param_location=loc,
                     attack_type="BOLA",
                     payload_value="admin",
                     owasp_category="API1:2023",
@@ -351,23 +363,35 @@ def schema_payloads(targets: dict[str, tuple]) -> list[Payload]:
                     endpoint=operation.path,
                     method=operation.method,
                     target_param=param,
-                    param_location="path",
+                    param_location=loc,
                     attack_type="SQL_INJECTION",
                     payload_value="1' OR '1'='1",
                     owasp_category="API8:2023",
                     expected_signal=["sql", "syntax", "sqlite", "psql", "traceback"],
                     target_app=target_name,
                 ))
-                # Path Traversal probe (API8:2023)
+                # Linux Path Traversal probe (API8:2023)
                 generated.append(Payload(
                     endpoint=operation.path,
                     method=operation.method,
                     target_param=param,
-                    param_location="path",
+                    param_location=loc,
                     attack_type="PATH_TRAVERSAL",
                     payload_value="../../../../etc/passwd",
                     owasp_category="API8:2023",
                     expected_signal=["root:x:0:0", "daemon:x:", "[boot loader]", "for 16-bit app support"],
+                    target_app=target_name,
+                ))
+                # Windows Path Traversal probe (API8:2023)
+                generated.append(Payload(
+                    endpoint=operation.path,
+                    method=operation.method,
+                    target_param=param,
+                    param_location=loc,
+                    attack_type="PATH_TRAVERSAL",
+                    payload_value=r"..\..\..\..\windows\win.ini",
+                    owasp_category="API8:2023",
+                    expected_signal=["[extensions]", "[fonts]", "[mci extensions]"],
                     target_app=target_name,
                 ))
                 # Server-Side Template Injection (SSTI) Canary (API8:2023)
@@ -375,13 +399,50 @@ def schema_payloads(targets: dict[str, tuple]) -> list[Payload]:
                     endpoint=operation.path,
                     method=operation.method,
                     target_param=param,
-                    param_location="path",
+                    param_location=loc,
                     attack_type="SSTI",
                     payload_value="{{7*7}}",
                     owasp_category="API8:2023",
                     expected_signal=["49"],
                     target_app=target_name,
                 ))
+                # NoSQL Injection Canary (API8:2023)
+                generated.append(Payload(
+                    endpoint=operation.path,
+                    method=operation.method,
+                    target_param=param,
+                    param_location=loc,
+                    attack_type="NOSQL_INJECTION",
+                    payload_value='{"$ne": null}',
+                    owasp_category="API8:2023",
+                    expected_signal=["$ne", "mongo", "bson", "syntaxerror"],
+                    target_app=target_name,
+                ))
+                # Cross-Site Scripting (XSS) Reflected Canary (API8:2023)
+                generated.append(Payload(
+                    endpoint=operation.path,
+                    method=operation.method,
+                    target_param=param,
+                    param_location=loc,
+                    attack_type="XSS",
+                    payload_value="<script>alert(1)</script>",
+                    owasp_category="API8:2023",
+                    expected_signal=["<script>alert(1)</script>"],
+                    target_app=target_name,
+                ))
+                # SSRF Canary (API7:2023)
+                if any(k in param.lower() for k in ("url", "dest", "uri", "callback", "redirect", "webhook", "target", "host")):
+                    generated.append(Payload(
+                        endpoint=operation.path,
+                        method=operation.method,
+                        target_param=param,
+                        param_location=loc,
+                        attack_type="SSRF",
+                        payload_value="http://127.0.0.1:80/",
+                        owasp_category="API7:2023",
+                        expected_signal=["localhost", "127.0.0.1", "connection refused"],
+                        target_app=target_name,
+                    ))
 
             # 3. Built-in Mass Assignment probe for state-changing endpoints
             if operation.method.upper() in ("POST", "PUT", "PATCH"):
@@ -1032,6 +1093,15 @@ def main():
     if auth_header:
         k, _, v = auth_header.partition(":")
         headers[k.strip()] = v.strip()
+    extra_json = os.environ.get("FUZZ_EXTRA_HEADERS_JSON")
+    if extra_json:
+        try:
+            extra_map = json.loads(extra_json)
+            if isinstance(extra_map, dict):
+                for hk, hv in extra_map.items():
+                    headers[str(hk).strip()] = str(hv).strip()
+        except Exception:
+            pass
 
     user2_headers = {}
     auth_header_user2 = os.environ.get("FUZZ_AUTH_HEADER_USER2")

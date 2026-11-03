@@ -6,6 +6,7 @@ from .callback_verifier import (
     CallbackVerifier,
     LocalCallbackListener,
 )
+from .discovery import ApiDiscoveryEngine, DiscoveryResult, discover_api
 from .evidence import (
     ConfirmationEngine,
     ConfirmationResult,
@@ -45,12 +46,14 @@ from .workflow_engine import (
 )
 
 __all__ = [
+    "ApiDiscoveryEngine",
     "AuthConfig",
     "AuthManager",
     "CallbackEvent",
     "CallbackVerifier",
     "ConfirmationEngine",
     "ConfirmationResult",
+    "DiscoveryResult",
     "Evidence",
     "Finding",
     "LocalCallbackListener",
@@ -78,6 +81,7 @@ __all__ = [
     "convert_any_to_openapi",
     "convert_file_to_openapi",
     "detect_schema_format",
+    "discover_api",
     "har_to_openapi",
     "interpolate_template",
     "load_schema",

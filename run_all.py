@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit CLI for lab operations, dynamic target scanning, and the opt-in fuzzing pipeline."""
+"""Explicit CLI for lab operations, dynamic target scanning, and universal API security fuzzing."""
 
 from __future__ import annotations
 
@@ -12,7 +12,31 @@ from typing import Sequence
 
 
 ROOT = Path(__file__).resolve().parent
-PYTHON = sys.executable
+
+
+def _get_python_command() -> list[str]:
+    try:
+        import schemathesis  # noqa: F401
+        return [sys.executable]
+    except ImportError:
+        pass
+
+    venv_py = ROOT / ".venv" / "Scripts" / "python.exe"
+    if venv_py.exists():
+        return [str(venv_py)]
+
+    if sys.platform == "win32":
+        try:
+            res = subprocess.run(["py", "-3.12", "-c", "import schemathesis"], capture_output=True, check=False)
+            if res.returncode == 0:
+                return ["py", "-3.12"]
+        except Exception:
+            pass
+
+    return [sys.executable]
+
+
+PYTHON_CMD = _get_python_command()
 LAB_SCRIPT = ROOT / "lab" / "start_lab.py"
 RUN_AUTH = ROOT / "auth" / "run_auth.py"
 RUN_DVGA = ROOT / "auth" / "run_dvga.py"
@@ -23,7 +47,7 @@ DVGA_SCHEMA = ROOT / "targets" / "schemas" / "dvga" / "dvga_schema.json"
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Manage the local API lab or scan targets dynamically. Fuzzing only runs with 'run' or 'scan'."
+        description="Manage the local API lab or scan targets dynamically with auto-discovery."
     )
     commands = parser.add_subparsers(dest="command")
     for command, description in (
@@ -38,10 +62,10 @@ def _parser() -> argparse.ArgumentParser:
     scan_parser = commands.add_parser(
         "scan",
         help="Scan a remote or local target API dynamically without local Docker setup",
-        description="Scan any API target dynamically by specifying --url and schema/auth options.",
+        description="Scan any API target dynamically by specifying --url and optional schema/auth options.",
     )
     scan_parser.add_argument("--url", required=True, help="Base URL of the target API (e.g. http://localhost:8000)")
-    scan_parser.add_argument("--schema", default=None, help="OpenAPI schema file path or URL (required for REST)")
+    scan_parser.add_argument("--schema", default=None, help="OpenAPI schema file path or URL (auto-discovered if omitted)")
     scan_parser.add_argument("--postman", default=None, help="Postman collection JSON file path")
     scan_parser.add_argument("--har", default=None, help="HTTP Archive (.har) log file path")
     scan_parser.add_argument("--workflow", default=None, help="Stateful workflow YAML file path")
@@ -53,6 +77,7 @@ def _parser() -> argparse.ArgumentParser:
     scan_parser.add_argument("--name", default=None, help="Display name for this target")
     scan_parser.add_argument("--proxy", default=None, help="Upstream HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:8080)")
     scan_parser.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification")
+    scan_parser.add_argument("--save-profile", action="store_true", help="Save target profile to targets/profiles/ for future one-click scans")
     scan_parser.add_argument("--verify-tokens", action="store_true", help="Audit protected endpoints for RFC 7519 Broken Authentication")
     scan_parser.add_argument("--verify-callbacks", action="store_true", help="Audit endpoints for loopback/SSRF callback vulnerabilities")
     scan_parser.add_argument("--callback-url", default=None, help="External canary callback URL for OOB SSRF detection")
@@ -130,7 +155,8 @@ def run_script(script: Path, *arguments: str) -> None:
     if not script.is_file():
         raise FileNotFoundError(f"Missing required script: {script}")
     print(f"\n[+] RUNNING: {script.relative_to(ROOT)} {' '.join(arguments)}".rstrip())
-    result = subprocess.run([PYTHON, str(script), *arguments], cwd=ROOT, check=False)
+    cmd = list(PYTHON_CMD) + [str(script), *arguments]
+    result = subprocess.run(cmd, cwd=ROOT, check=False)
     if result.returncode:
         raise RuntimeError(
             f"{script.relative_to(ROOT)} failed with exit code {result.returncode}"
@@ -207,6 +233,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             scan_args.extend(["--proxy", args.proxy])
         if args.insecure:
             scan_args.append("--insecure")
+        if args.save_profile:
+            scan_args.append("--save-profile")
         if args.verify_tokens:
             scan_args.append("--verify-tokens")
         if args.verify_callbacks:

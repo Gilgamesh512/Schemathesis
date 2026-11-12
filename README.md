@@ -106,6 +106,26 @@ No container startup or fuzzing is needed for the unit tests:
 python -m pytest
 ```
 
+## One-Click Quick Launchers (fuzz.bat & fuzz.sh)
+
+To avoid typing long command lines, use the provided one-click launchers:
+
+```bash
+# Windows (or simply double-click fuzz.bat)
+fuzz.bat               # Interactive 1-click launcher (Press Enter to auto-run BOLA workflow)
+fuzz.bat auto          # Direct 1-touch execution of Autonomous BOLA Workflow
+fuzz.bat all           # Direct 1-touch execution of Full Security Pipeline
+fuzz.bat scan <URL>    # Quick scan any API target with auto-discovery
+fuzz.bat report        # Immediately open interactive HTML report in browser
+
+# Linux / macOS
+./fuzz.sh              # Interactive 1-click launcher (Press Enter to auto-run BOLA workflow)
+./fuzz.sh auto         # Direct 1-touch execution of Autonomous BOLA Workflow
+./fuzz.sh all          # Direct 1-touch execution of Full Security Pipeline
+./fuzz.sh scan <URL>   # Quick scan any API target with auto-discovery
+./fuzz.sh report       # Immediately open interactive HTML report in browser
+```
+
 ## Lab operations
 
 All commands below are run from the repository root with `.venv` activated:

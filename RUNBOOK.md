@@ -22,6 +22,22 @@ python -m pip install --upgrade pip && \
 
 Start the local container runtime before starting the lab.
 
+## One-click quick execution
+
+```bash
+# Windows
+fuzz.bat auto          # 1-click Autonomous BOLA workflow
+fuzz.bat all           # 1-click Full Security Testing Pipeline
+fuzz.bat scan <URL>    # 1-click Quick scan API target
+fuzz.bat report        # Open latest HTML report in browser
+
+# Linux / macOS
+./fuzz.sh auto         # 1-click Autonomous BOLA workflow
+./fuzz.sh all          # 1-click Full Security Testing Pipeline
+./fuzz.sh scan <URL>   # 1-click Quick scan API target
+./fuzz.sh report       # Open latest HTML report in browser
+```
+
 ## Normal lab lifecycle
 
 ```bash

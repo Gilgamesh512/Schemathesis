@@ -99,8 +99,8 @@ def _parser() -> argparse.ArgumentParser:
         help="Auto-infer and synthesize stateful multi-step BOLA workflows directly from OpenAPI schema",
         description="Automatically inspect OpenAPI spec, pair Producers and Consumers, and execute synthesized workflows.",
     )
-    auto_wf_parser.add_argument("schema", help="Path to OpenAPI schema file (JSON/YAML)")
-    auto_wf_parser.add_argument("--url", default=None, help="Base URL override")
+    auto_wf_parser.add_argument("schema", nargs="?", default="targets/schemas/vampi/vampi_spec.yaml", help="Path to OpenAPI schema file (JSON/YAML) [default: targets/schemas/vampi/vampi_spec.yaml]")
+    auto_wf_parser.add_argument("--url", default="http://127.0.0.1:5002", help="Base URL override [default: http://127.0.0.1:5002]")
     auto_wf_parser.add_argument("--proxy", default=None, help="Upstream HTTP/HTTPS proxy URL")
     auto_wf_parser.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification")
 
@@ -217,9 +217,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
 
     if args.command == "auto-workflow":
-        auto_args = ["--auto-workflow", args.schema]
-        if args.url:
-            auto_args.extend(["--url", args.url])
+        schema_target = args.schema or "targets/schemas/vampi/vampi_spec.yaml"
+        url_target = args.url or "http://127.0.0.1:5002"
+        auto_args = ["--auto-workflow", schema_target, "--url", url_target]
         if args.proxy:
             auto_args.extend(["--proxy", args.proxy])
         if args.insecure:

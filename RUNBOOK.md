@@ -69,12 +69,15 @@ python run_all.py scan --url http://127.0.0.1:8000 --protocol graphql --endpoint
 If `--payloads` is omitted, the built-in security mutation engine generates
 test cases automatically from the schema.
 
-## Stateful workflow testing
+## Stateful workflow & autonomous BOLA testing
 
 Execute multi-step chained API workflows:
 
 ```bash
-# Run workflow YAML
+# Auto-synthesize and execute BOLA workflows directly from OpenAPI schema (Zero-YAML)
+python run_all.py auto-workflow targets/schemas/vampi/vampi_spec.yaml --url http://127.0.0.1:5002
+
+# Run declarative workflow YAML
 python run_all.py workflow targets/workflows/sample_workflow.yaml
 
 # Run workflow with upstream proxy

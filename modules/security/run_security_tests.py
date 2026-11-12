@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core import (
+    ApiDependencyGraph,
     CallbackVerifier,
     Finding,
     ProjectPaths,
@@ -583,20 +584,25 @@ def run_dynamic_target(
 
 
 def run_workflow(
-    workflow_path: str | Path,
+    workflow_source: str | Path | WorkflowDefinition,
     *,
     base_url: str | None = None,
     proxy: str | None = None,
     insecure: bool = False,
     tokens: dict[str, str] | None = None,
 ) -> int:
-    path = Path(workflow_path).resolve()
-    if not path.is_file():
-        raise FileNotFoundError(f"Workflow file not found: {workflow_path}")
+    if isinstance(workflow_source, WorkflowDefinition):
+        workflow = workflow_source
+        path_label = workflow.name
+    else:
+        path = Path(workflow_source).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Workflow file not found: {workflow_source}")
+        workflow = WorkflowDefinition.from_yaml(path)
+        path_label = str(path)
 
-    workflow = WorkflowDefinition.from_yaml(path)
     banner(f"STATEFUL WORKFLOW EXECUTION: {workflow.name}")
-    print(f"[i] Workflow File: {path}")
+    print(f"[i] Workflow Source: {path_label}")
     if base_url:
         print(f"[i] Base URL Override: {base_url}")
     if proxy:
@@ -658,6 +664,51 @@ def run_workflow(
     return 0 if report.success else 1
 
 
+def run_auto_workflow(
+    schema_path: str | Path,
+    *,
+    base_url: str | None = None,
+    proxy: str | None = None,
+    insecure: bool = False,
+    tokens: dict[str, str] | None = None,
+    max_workflows: int = 5,
+) -> int:
+    """Infer CRUD dependencies from OpenAPI schema, synthesize workflows, and execute BOLA assertions."""
+    path = Path(schema_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Schema file for auto-workflow not found: {schema_path}")
+
+    banner("AUTONOMOUS API DEPENDENCY GRAPH & WORKFLOW SYNTHESIS")
+    print(f"[i] Analyzing OpenAPI Schema: {path}")
+    graph = ApiDependencyGraph.from_file(path)
+    print(f"[i] Discovered Resource Producers: {len(graph.producers)}")
+    print(f"[i] Discovered Resource Consumers: {len(graph.consumers)}")
+
+    workflows = graph.synthesize_workflows(max_workflows=max_workflows)
+    if not workflows:
+        print("[!] No matching producer-consumer entity pairings could be inferred automatically.")
+        return 0
+
+    print(f"[+] Synthesized {len(workflows)} stateful end-to-end BOLA workflows!")
+
+    all_passed = True
+    for idx, wf in enumerate(workflows, start=1):
+        print(f"\n--- [Executing Flow {idx}/{len(workflows)}: {wf.name}] ---")
+        if base_url:
+            wf.base_url = base_url
+        exit_code = run_workflow(
+            wf,
+            base_url=base_url or wf.base_url,
+            proxy=proxy,
+            insecure=insecure,
+            tokens=tokens,
+        )
+        if exit_code != 0:
+            all_passed = False
+
+    return 0 if all_passed else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run configured or dynamic API security targets")
     parser.add_argument(
@@ -672,6 +723,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--postman", default=None, help="Path to Postman collection v2.1/v2.0 JSON file")
     parser.add_argument("--har", default=None, help="Path to HTTP Archive (.har) log file")
     parser.add_argument("--workflow", default=None, help="Path to stateful workflow YAML file")
+    parser.add_argument("--auto-workflow", default=None, help="OpenAPI schema path to auto-infer and execute stateful workflows")
     parser.add_argument("--auth-token", "--token", dest="auth_token", default=None, help="Bearer token, JWT, or 'Header: Value'")
     parser.add_argument("--protocol", choices=["rest", "graphql"], default="rest", help="Protocol (default: rest)")
     parser.add_argument("--endpoint", default="/graphql", help="GraphQL endpoint (default: /graphql)")
@@ -691,6 +743,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.workflow:
         return run_workflow(
             args.workflow,
+            base_url=args.url,
+            proxy=args.proxy,
+            insecure=args.insecure,
+        )
+
+    if args.auto_workflow:
+        return run_auto_workflow(
+            args.auto_workflow,
             base_url=args.url,
             proxy=args.proxy,
             insecure=args.insecure,

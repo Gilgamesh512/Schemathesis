@@ -94,6 +94,16 @@ def _parser() -> argparse.ArgumentParser:
     wf_parser.add_argument("--proxy", default=None, help="Upstream HTTP/HTTPS proxy URL")
     wf_parser.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification")
 
+    auto_wf_parser = commands.add_parser(
+        "auto-workflow",
+        help="Auto-infer and synthesize stateful multi-step BOLA workflows directly from OpenAPI schema",
+        description="Automatically inspect OpenAPI spec, pair Producers and Consumers, and execute synthesized workflows.",
+    )
+    auto_wf_parser.add_argument("schema", help="Path to OpenAPI schema file (JSON/YAML)")
+    auto_wf_parser.add_argument("--url", default=None, help="Base URL override")
+    auto_wf_parser.add_argument("--proxy", default=None, help="Upstream HTTP/HTTPS proxy URL")
+    auto_wf_parser.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification")
+
     return parser
 
 
@@ -204,6 +214,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         except (FileNotFoundError, OSError, RuntimeError) as exc:
             print(f"[X] Workflow failed: {exc}", file=sys.stderr)
+            return 1
+
+    if args.command == "auto-workflow":
+        auto_args = ["--auto-workflow", args.schema]
+        if args.url:
+            auto_args.extend(["--url", args.url])
+        if args.proxy:
+            auto_args.extend(["--proxy", args.proxy])
+        if args.insecure:
+            auto_args.append("--insecure")
+        try:
+            run_script(RUN_SECURITY_TESTS, *auto_args)
+            return 0
+        except (FileNotFoundError, OSError, RuntimeError) as exc:
+            print(f"[X] Auto-workflow synthesis failed: {exc}", file=sys.stderr)
             return 1
 
     if args.command == "scan":

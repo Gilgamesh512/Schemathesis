@@ -6,6 +6,11 @@ from .callback_verifier import (
     CallbackVerifier,
     LocalCallbackListener,
 )
+from .dependency_graph import (
+    ApiDependencyGraph,
+    ConsumerCandidate,
+    ProducerCandidate,
+)
 from .discovery import ApiDiscoveryEngine, DiscoveryResult, discover_api
 from .evidence import (
     ConfirmationEngine,
@@ -22,6 +27,11 @@ from .evidence import (
     snapshot_response,
     stable_finding_id,
 )
+from .feedback_engine import (
+    FeedbackAnalysisResult,
+    FeedbackAnalyzer,
+    FieldValidationFailure,
+)
 from .path_manager import ProjectPaths, resolve_project_root, safe_project_path
 from .reporter import OWASP_METADATA, SecurityReporter
 from .result_manager import ResultManager, make_run_id
@@ -33,6 +43,11 @@ from .schema_converter import (
     postman_to_openapi,
 )
 from .schema_manager import SchemaManager, load_schema
+from .semantic_mutator import (
+    ParamSchema,
+    SemanticMutationEngine,
+    SemanticProbe,
+)
 from .target_manager import TargetConfig, TargetManager, TargetRegistry, target_config
 from .token_verifier import TokenInspection, TokenVerifier
 from .workflow_engine import (
@@ -46,6 +61,7 @@ from .workflow_engine import (
 )
 
 __all__ = [
+    "ApiDependencyGraph",
     "ApiDiscoveryEngine",
     "AuthConfig",
     "AuthManager",
@@ -53,15 +69,23 @@ __all__ = [
     "CallbackVerifier",
     "ConfirmationEngine",
     "ConfirmationResult",
+    "ConsumerCandidate",
     "DiscoveryResult",
     "Evidence",
+    "FeedbackAnalysisResult",
+    "FeedbackAnalyzer",
+    "FieldValidationFailure",
     "Finding",
     "LocalCallbackListener",
     "OWASP_METADATA",
+    "ParamSchema",
+    "ProducerCandidate",
     "SecurityReporter",
     "RequestScheduler",
     "ResponseObservation",
     "ResponseSnapshot",
+    "SemanticMutationEngine",
+    "SemanticProbe",
     "StepExecutionResult",
     "TargetConfig",
     "TargetManager",

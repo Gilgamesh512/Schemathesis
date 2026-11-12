@@ -1,25 +1,15 @@
 #!/usr/bin/env python3
 """
 rules_engine.py
-Quan ly rules dung chung cho tool cua Nguoi 1 (Schemathesis).
+Security Rules & CVE Enrichment Engine.
 
-- OWASP API Security Top 10: KHONG co API chinh thuc de "tu cap nhat" -
-  OWASP chi ra ban moi vai nam 1 lan. Nen luu tinh trong rules.json,
-  sua tay khi co ban moi (hien dang la ban 2023). Muc dich cua file nay
-  la giup cac category do de bao tri va gan vao tung finding, KHONG phai
-  "cao" du lieu OWASP tu dong.
+- OWASP API Security Top 10 (2023): Category mapping, heuristic matching, and remediation advice.
+- CVE API 2.0 Integration: Queries NVD NIST CVE API 2.0 with automatic fallback to Google OSV API (api.osv.dev).
+- CVSS v3.1 Scoring & Severity Evaluation.
 
-- CVE: co API chinh thuc (NVD - services.nvd.nist.gov), CAP NHAT DUOC
-  theo ngay. Module nay goi NVD CVE API 2.0, loc theo tu khoa lien quan
-  toi API security (SQLi, JWT, GraphQL, SSRF, framework REST pho bien),
-  luu ket qua vao rules.json["cve_signals"] kem CVSS score de tinh
-  severity, co cache + TTL de khong spam API (NVD rate-limit ~5
-  req/30s khong co API key, 50 req/30s co key).
-
-Cach dung:
+Usage:
     python3 -m modules.security.rules_engine --update
     python3 -m modules.security.rules_engine --update --days 90 --api-key <NVD_KEY>
-    The REST and GraphQL runners load config/rules.json by default.
 """
 
 from __future__ import annotations

@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
 run_schemathesis.py
-Vai trò: Nguoi 1 - tich hop Schemathesis vao pipeline LLM-fuzzing API REST.
+Core REST API Security Fuzzing & Mutation Execution Engine.
 
-Luong xu ly:
-  1) Load one or more OpenAPI schemas.
-  2) Optionally load mutation payloads; if omitted, generate valid cases
-     from the schema's operations.
-  3) Execute and confirm requests, preserving the existing fingerprint state.
-  4) Write findings and run metadata through ResultManager.
-
-Yeu cau: install the pinned project dependencies in its virtual environment.
+Workflow:
+  1) Load target OpenAPI specification (or auto-discover).
+  2) Generate schema-conforming security mutation probes (UUID, email, URI, boundary) or load external corpus.
+  3) Execute baseline and attack requests with adaptive concurrency and backoff.
+  4) Analyze responses with FeedbackAnalyzer to detect validation barriers and confirm vulnerabilities.
+  5) Persist deduplicated findings across execution lifecycles.
 """
 
 from __future__ import annotations
@@ -41,12 +39,13 @@ from pydantic import BaseModel, Field, ValidationError
 from modules.security import rules_engine
 from core import (ConfirmationEngine, Evidence, Finding, RequestScheduler,
                   ProjectPaths, ResultManager, SchemaManager, content_hash,
-                  redact_headers, snapshot_response, stable_finding_id)
+                  redact_headers, snapshot_response, stable_finding_id,
+                  FeedbackAnalyzer, SemanticMutationEngine, ParamSchema)
 
 PROJECT_PATHS = ProjectPaths.from_root(PROJECT_ROOT)
 
 # --------------------------------------------------------------------------
-# 1. Schema du lieu (payload tu B phai khop dung format nay)
+# 1. Payload Model
 # --------------------------------------------------------------------------
 
 class Payload(BaseModel):
@@ -61,9 +60,7 @@ class Payload(BaseModel):
     expected_signal: list[str] = Field(default_factory=list)  # tu khoa nghi ngo trong response
     technology: Optional[dict[str, str]] = None
     mutation_family: Optional[str] = None
-    target_app: Optional[str] = None  # "vampi" | "crapi" | ... - B NEN dien khi
-                                       # chay multi-target, tranh truong hop 1
-                                       # endpoint trung ten giua 2 app khac nhau
+    target_app: Optional[str] = None  # Identifier for multi-target tracking
 
 
 # --------------------------------------------------------------------------
@@ -312,7 +309,7 @@ def load_targets(
 
 
 def schema_payloads(targets: dict[str, tuple]) -> list[Payload]:
-    """Create built-in security mutation payloads and schema-valid cases from OpenAPI operations."""
+    """Create built-in schema-conforming security mutation payloads from OpenAPI operations."""
     generated: list[Payload] = []
     import re
     for target_name, (schema, _) in sorted(targets.items()):
@@ -331,120 +328,59 @@ def schema_payloads(targets: dict[str, tuple]) -> list[Payload]:
                 target_app=target_name,
             ))
 
-            # 2. Built-in Security Mutation Engine: Collect path & query parameters
-            path_params = re.findall(r"\{([^}]+)\}", operation.path)
-            query_params = []
+            # 2. Schema-Conforming Semantic Mutation Engine for Parameters
+            parameters_seen: set[str] = set()
             try:
                 for p in operation.iter_parameters():
-                    loc_str = str(getattr(p, "location", "")).lower()
-                    if "query" in loc_str and getattr(p, "name", None):
-                        query_params.append(p.name)
+                    p_name = getattr(p, "name", None)
+                    if not p_name or p_name in parameters_seen:
+                        continue
+                    parameters_seen.add(p_name)
+                    loc_str = str(getattr(p, "location", "query")).lower()
+                    p_def = getattr(p, "definition", {})
+
+                    param_schema = SemanticMutationEngine.inspect_param(p_name, loc_str, p_def)
+                    probes = SemanticMutationEngine.generate_probes(param_schema)
+
+                    for probe in probes:
+                        generated.append(Payload(
+                            endpoint=operation.path,
+                            method=operation.method,
+                            target_param=p_name,
+                            param_location=loc_str,
+                            attack_type=probe.attack_type,
+                            payload_value=probe.payload_value,
+                            owasp_category=probe.owasp_category,
+                            expected_signal=probe.expected_signal,
+                            context="schema_conformant",
+                            target_app=target_name,
+                        ))
             except Exception:
                 pass
 
-            target_params = [(p, "path") for p in path_params]
-            target_params.extend([(qp, "query") for qp in query_params])
-
-            for param, loc in target_params:
-                # BOLA / IDOR probe
-                generated.append(Payload(
-                    endpoint=operation.path,
-                    method=operation.method,
-                    target_param=param,
-                    param_location=loc,
-                    attack_type="BOLA",
-                    payload_value="admin",
-                    owasp_category="API1:2023",
-                    expected_signal=["admin", "id", "user"],
-                    target_app=target_name,
-                ))
-                # Non-destructive SQLi probe
-                generated.append(Payload(
-                    endpoint=operation.path,
-                    method=operation.method,
-                    target_param=param,
-                    param_location=loc,
-                    attack_type="SQL_INJECTION",
-                    payload_value="1' OR '1'='1",
-                    owasp_category="API8:2023",
-                    expected_signal=["sql", "syntax", "sqlite", "psql", "traceback"],
-                    target_app=target_name,
-                ))
-                # Linux Path Traversal probe (API8:2023)
-                generated.append(Payload(
-                    endpoint=operation.path,
-                    method=operation.method,
-                    target_param=param,
-                    param_location=loc,
-                    attack_type="PATH_TRAVERSAL",
-                    payload_value="../../../../etc/passwd",
-                    owasp_category="API8:2023",
-                    expected_signal=["root:x:0:0", "daemon:x:", "[boot loader]", "for 16-bit app support"],
-                    target_app=target_name,
-                ))
-                # Windows Path Traversal probe (API8:2023)
-                generated.append(Payload(
-                    endpoint=operation.path,
-                    method=operation.method,
-                    target_param=param,
-                    param_location=loc,
-                    attack_type="PATH_TRAVERSAL",
-                    payload_value=r"..\..\..\..\windows\win.ini",
-                    owasp_category="API8:2023",
-                    expected_signal=["[extensions]", "[fonts]", "[mci extensions]"],
-                    target_app=target_name,
-                ))
-                # Server-Side Template Injection (SSTI) Canary (API8:2023)
-                generated.append(Payload(
-                    endpoint=operation.path,
-                    method=operation.method,
-                    target_param=param,
-                    param_location=loc,
-                    attack_type="SSTI",
-                    payload_value="{{7*7}}",
-                    owasp_category="API8:2023",
-                    expected_signal=["49"],
-                    target_app=target_name,
-                ))
-                # NoSQL Injection Canary (API8:2023)
-                generated.append(Payload(
-                    endpoint=operation.path,
-                    method=operation.method,
-                    target_param=param,
-                    param_location=loc,
-                    attack_type="NOSQL_INJECTION",
-                    payload_value='{"$ne": null}',
-                    owasp_category="API8:2023",
-                    expected_signal=["$ne", "mongo", "bson", "syntaxerror"],
-                    target_app=target_name,
-                ))
-                # Cross-Site Scripting (XSS) Reflected Canary (API8:2023)
-                generated.append(Payload(
-                    endpoint=operation.path,
-                    method=operation.method,
-                    target_param=param,
-                    param_location=loc,
-                    attack_type="XSS",
-                    payload_value="<script>alert(1)</script>",
-                    owasp_category="API8:2023",
-                    expected_signal=["<script>alert(1)</script>"],
-                    target_app=target_name,
-                ))
-                # SSRF Canary (API7:2023)
-                if any(k in param.lower() for k in ("url", "dest", "uri", "callback", "redirect", "webhook", "target", "host")):
+            # Fallback path params if iter_parameters did not catch all path templates
+            path_params = re.findall(r"\{([^}]+)\}", operation.path)
+            for p_name in path_params:
+                if p_name in parameters_seen:
+                    continue
+                parameters_seen.add(p_name)
+                param_schema = SemanticMutationEngine.inspect_param(p_name, "path", {})
+                probes = SemanticMutationEngine.generate_probes(param_schema)
+                for probe in probes:
                     generated.append(Payload(
                         endpoint=operation.path,
                         method=operation.method,
-                        target_param=param,
-                        param_location=loc,
-                        attack_type="SSRF",
-                        payload_value="http://127.0.0.1:80/",
-                        owasp_category="API7:2023",
-                        expected_signal=["localhost", "127.0.0.1", "connection refused"],
+                        target_param=p_name,
+                        param_location="path",
+                        attack_type=probe.attack_type,
+                        payload_value=probe.payload_value,
+                        owasp_category=probe.owasp_category,
+                        expected_signal=probe.expected_signal,
+                        context="schema_conformant",
                         target_app=target_name,
                     ))
 
-            # 3. Built-in Mass Assignment probe for state-changing endpoints
+            # 3. Built-in Mass Assignment & Schema Property Injection for state-changing endpoints
             if operation.method.upper() in ("POST", "PUT", "PATCH"):
                 generated.append(Payload(
                     endpoint=operation.path,
@@ -455,6 +391,7 @@ def schema_payloads(targets: dict[str, tuple]) -> list[Payload]:
                     payload_value="admin",
                     owasp_category="API3:2023",
                     expected_signal=["admin", "role", "success"],
+                    context="schema_conformant",
                     target_app=target_name,
                 ))
                 generated.append(Payload(
@@ -466,6 +403,7 @@ def schema_payloads(targets: dict[str, tuple]) -> list[Payload]:
                     payload_value=True,
                     owasp_category="API3:2023",
                     expected_signal=["is_admin", "true", "admin"],
+                    context="schema_conformant",
                     target_app=target_name,
                 ))
     if not generated:
@@ -885,6 +823,13 @@ async def process_fingerprint_group(
             confirmed = result.confirmed
             confidence = result.confidence
             confirmation_differences = result.evidence
+
+            # Schema validation barrier & adaptive feedback analysis
+            if status_code in (400, 422):
+                feedback = FeedbackAnalyzer.analyze_response(status_code, resp.text, dict(resp.headers))
+                if feedback.is_validation_error and feedback.failed_fields:
+                    recs_summary = "; ".join(feedback.adaptive_recommendations[:2])
+                    evidence = f"HTTP {status_code}; Schema validation barrier ({feedback.framework_hint}): {recs_summary}"
 
             # Dual-token BOLA / IDOR cross-account verification
             if user2_headers and pc.payload.attack_type.upper() in ("BOLA", "IDOR"):

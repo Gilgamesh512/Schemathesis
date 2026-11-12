@@ -34,6 +34,7 @@ from core import (
 from modules.security.run_security_tests import (
     normalize_auth_header,
     parse_tokens_env,
+    run_auto_workflow,
     run_dynamic_target,
     run_target,
     run_workflow,
@@ -71,7 +72,8 @@ def _render_menu_banner() -> None:
     print("  \033[1;32m[5]\033[0m 🌍 \033[1mOpen HTML Web Report in Browser\033[0m (Interactive Dark Dashboard)")
     print("  \033[1;32m[6]\033[0m 📑 \033[1mExport Fresh Reports\033[0m (Standalone HTML & OASIS SARIF v2.1 for CI/CD)")
     print("  \033[1;32m[7]\033[0m 🔄 \033[1mRun Stateful Workflow YAML\033[0m (Multi-step business logic & BOLA testing)")
-    print("  \033[1;33m[8]\033[0m 🧪 \033[1mDemo Labs & Docker\033[0m (crAPI, VAmPI, DVGA container operations)")
+    print("  \033[1;32m[8]\033[0m 🤖 \033[1mAuto-Synthesize BOLA Workflows\033[0m (Zero-YAML Autonomous API Dependency Graph)")
+    print("  \033[1;33m[9]\033[0m 🧪 \033[1mDemo Labs & Docker\033[0m (crAPI, VAmPI, DVGA container operations)")
     print("  \033[1;31m[q]\033[0m 🚪 \033[1mExit\033[0m")
     print("\033[90m" + "─" * 97 + "\033[0m")
 
@@ -422,11 +424,35 @@ def _menu_run_workflow() -> None:
     _safe_input("\nPress Enter to return to main menu...")
 
 
+def _menu_auto_workflow() -> None:
+    print("\n\033[1;36m🤖 AUTONOMOUS API DEPENDENCY & BOLA WORKFLOW SYNTHESIS\033[0m")
+    print("Zero-YAML configuration: Automatically analyzes OpenAPI spec, pairs resource producers")
+    print("and consumers, extracts IDs, and synthesizes cross-user BOLA/IDOR assertions.\n")
+
+    default_schema = "targets/schemas/vampi/vampi_spec.yaml"
+    schema_path = _safe_input(f"Path to OpenAPI Schema JSON/YAML [{default_schema}]: ") or default_schema
+    base_url = _safe_input("Base URL override (optional, e.g. http://localhost:5002): ") or None
+    proxy = _safe_input("Upstream Proxy URL (optional, e.g. http://127.0.0.1:8080): ") or None
+    insecure = _safe_input("Disable SSL verification? [y/N]: ").lower() in {"y", "yes"}
+
+    try:
+        run_auto_workflow(
+            schema_path,
+            base_url=base_url,
+            proxy=proxy,
+            insecure=insecure,
+        )
+    except Exception as exc:
+        print(f"\n[X] Autonomous workflow synthesis failed: {exc}", file=sys.stderr)
+
+    _safe_input("\nPress Enter to return to main menu...")
+
+
 def interactive_terminal_ui() -> int:
     """Run full interactive terminal website / console."""
     while True:
         _render_menu_banner()
-        choice = _safe_input("Enter choice [1-8, q]: ").strip().lower()
+        choice = _safe_input("Enter choice [1-9, q]: ").strip().lower()
 
         if choice in {"q", "quit", "exit"}:
             print("\nGoodbye! Happy security testing.")
@@ -446,9 +472,11 @@ def interactive_terminal_ui() -> int:
         elif choice == "7":
             _menu_run_workflow()
         elif choice == "8":
+            _menu_auto_workflow()
+        elif choice == "9":
             _menu_demo_labs()
         else:
-            print("\n[!] Invalid choice. Please enter 1-8 or q.")
+            print("\n[!] Invalid choice. Please enter 1-9 or q.")
         print()
 
 
@@ -461,6 +489,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--postman", default=None, help="Postman collection JSON file path")
     parser.add_argument("--har", default=None, help="HTTP Archive (.har) log file path")
     parser.add_argument("--workflow", default=None, help="Stateful workflow YAML file path")
+    parser.add_argument("--auto-workflow", default=None, help="OpenAPI schema path to auto-infer and execute BOLA workflows")
     parser.add_argument("--auth-token", "--token", dest="auth_token", default=None, help="Bearer token, JWT, or 'Header: Value'")
     parser.add_argument("--protocol", choices=["rest", "graphql"], default="rest", help="Protocol (default: rest)")
     parser.add_argument("--endpoint", default="/graphql", help="GraphQL endpoint (default: /graphql)")
@@ -508,6 +537,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.workflow:
         return run_workflow(
             args.workflow,
+            base_url=args.url,
+            proxy=args.proxy,
+            insecure=args.insecure,
+        )
+
+    if args.auto_workflow:
+        return run_auto_workflow(
+            args.auto_workflow,
             base_url=args.url,
             proxy=args.proxy,
             insecure=args.insecure,

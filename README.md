@@ -12,29 +12,18 @@ The framework operates in two modes:
 
 ## Key Capabilities
 
-- **Built-in Security Mutation Engine**: Automatically generates benign security probes
-  for REST and GraphQL (SQL Injection canary probes, BOLA/IDOR object tampering,
-  Mass Assignment property injection, and GraphQL Introspection / Circular Query probes)
-  without requiring external static payload files.
-- **RFC 7519 Token Authentication Auditor**: Inspects JWT tokens and generates compliance
-  probes (`alg: none`, stripped signature verification, expired `exp` claim) to detect
-  Broken Authentication (OWASP API2:2023) vulnerabilities.
-- **Dual-Mode SSRF & Callback Auditor**: Verifies URL-receiving parameters using either
-  an in-memory loopback callback listener (localhost) or an external canary listener
-  (interactsh / webhook.site) to confirm SSRF (OWASP API7:2023) with zero false positives.
-- **Dual-User Authorization Verification**: Employs a paired user model (Victim vs. Attacker)
-  to cross-validate Broken Object Level Authorization (BOLA / IDOR - API1:2023) and
-  Broken Function Level Authorization (BFLA - API5:2023) with high confidence.
-- **WAF & Rate-Limit Resilience**: Intelligent `RequestScheduler` detects HTTP 429,
-  503, and WAF blocks, honors `Retry-After` response headers, and applies adaptive
-  exponential backoff with jitter to protect target availability.
+- **Schema-Conforming Semantic Mutation Engine**: Bypasses frontend/framework validation barriers (FastAPI/Pydantic, NestJS class-validator, Spring Boot) by tailoring security probes to match required data types and formats (UUID v4 tampering, RFC 5322 email canary probes, loopback URI probes, ISO-8601 date-time boundaries, integer overflow/boundaries, and privilege enum overrides) without being rejected at HTTP 400/422.
+- **Adaptive Validation Feedback Engine**: Inspects HTTP 400 and HTTP 422 error structures to identify specific rejected fields and constraints, generating adaptive recommendations and payload repairs.
+- **Autonomous API Dependency Graph & Workflow Synthesizer**: Inspects OpenAPI 3.x specifications to discover resource Producers (POST) and Consumers (GET, PUT, DELETE), pairing them automatically to execute end-to-end BOLA cross-user assertions with zero manual YAML authoring.
+- **RFC 7519 Token Authentication Auditor**: Inspects JWT tokens and generates compliance probes (`alg: none`, stripped signature verification, expired `exp` claim) to detect Broken Authentication (OWASP API2:2023) vulnerabilities.
+- **Dual-Mode SSRF & Callback Auditor**: Verifies URL-receiving parameters using either an in-memory loopback callback listener (localhost) or an external canary listener (interactsh / webhook.site) to confirm SSRF (OWASP API7:2023) with zero false positives.
+- **Dual-User Authorization Verification**: Employs a paired user model (Victim vs. Attacker) to cross-validate Broken Object Level Authorization (BOLA / IDOR - API1:2023) and Broken Function Level Authorization (BFLA - API5:2023) with high confidence.
+- **WAF & Rate-Limit Resilience**: Intelligent `RequestScheduler` detects HTTP 429, 503, and WAF blocks, honors `Retry-After` response headers, and applies adaptive exponential backoff with jitter to protect target availability.
 - **Multi-Format Reporting**:
   - Live ANSI Terminal Dashboard with KPI summaries and OWASP Top 10 breakdown.
   - Interactive, standalone Dark-Themed HTML report (zero external CDN dependencies).
-  - Standard **OASIS SARIF v2.1.0** export (`results/vulnerabilities.sarif`) for GitHub
-    Code Scanning and DevSecOps CI/CD integration.
-- **Resilient Rules Engine**: Enriches findings with CVSS scores from NVD NIST, with
-  automatic fallback to the Google Open Source Vulnerabilities (OSV) API (`api.osv.dev`).
+  - Standard **OASIS SARIF v2.1.0** export (`results/vulnerabilities.sarif`) for GitHub Code Scanning and DevSecOps CI/CD integration.
+- **Resilient Rules Engine**: Enriches findings with CVSS scores from NVD NIST, with automatic fallback to the Google Open Source Vulnerabilities (OSV) API (`api.osv.dev`).
 
 ## Requirements
 
@@ -206,15 +195,19 @@ docker run --rm --net=host \
 docker compose -f docker-compose.scanner.yaml run --rm api-scanner scan --url https://api.example.com --schema https://api.example.com/openapi.json
 ```
 
-## Stateful Workflow Chaining Engine
+## Stateful Workflow & Autonomous BOLA Chaining
 
 Execute multi-step business logic workflows with sequential variable extraction and BOLA validation:
 
 ```bash
-# Execute stateful workflow YAML
+# 1. Autonomous Workflow Synthesis (Zero manual YAML):
+# Auto-pairs CRUD producers and consumers directly from OpenAPI spec
+python run_all.py auto-workflow targets/schemas/vampi/vampi_spec.yaml --url http://127.0.0.1:5002
+
+# 2. Execute declarative stateful workflow YAML:
 python run_all.py workflow targets/workflows/sample_workflow.yaml
 
-# Execute workflow with upstream proxy and custom base URL
+# 3. Execute workflow with upstream proxy (Burp Suite/Caido/ZAP)
 python run_all.py workflow targets/workflows/sample_workflow.yaml --url http://127.0.0.1:5002 --proxy http://127.0.0.1:8080 --insecure
 ```
 

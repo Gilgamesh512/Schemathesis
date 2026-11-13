@@ -87,6 +87,12 @@ if "%~1"=="dashboard" (
     goto :end
 )
 
+if "%~1"=="gate" (
+    shift
+    "%PYTHON%" run_all.py gate %*
+    goto :end
+)
+
 if "%~1"=="scan" (
     if "%~2"=="" (
         echo [!] Please specify a target URL, e.g.: fuzz.bat scan http://localhost:8000
@@ -94,7 +100,14 @@ if "%~1"=="scan" (
         exit /b 1
     )
     shift
-    "%PYTHON%" run_all.py scan %*
+    set "FIRST_ARG=%~1"
+    if not "!FIRST_ARG:~0,2!"=="--" (
+        set "SCAN_URL=%~1"
+        shift
+        "%PYTHON%" run_all.py scan --url "!SCAN_URL!" %*
+    ) else (
+        "%PYTHON%" run_all.py scan %*
+    )
     goto :end
 )
 

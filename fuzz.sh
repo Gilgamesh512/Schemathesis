@@ -45,13 +45,24 @@ if [ "$1" = "dashboard" ]; then
     exec "$PYTHON" -m cli --dashboard
 fi
 
+if [ "$1" = "gate" ]; then
+    shift
+    exec "$PYTHON" run_all.py gate "$@"
+fi
+
 if [ "$1" = "scan" ]; then
     if [ -z "$2" ]; then
         echo "[!] Please specify a target URL, e.g.: ./fuzz.sh scan http://localhost:8000"
         exit 1
     fi
     shift
-    exec "$PYTHON" run_all.py scan "$@"
+    if [[ "$1" != --* ]]; then
+        TARGET_URL="$1"
+        shift
+        exec "$PYTHON" run_all.py scan --url "$TARGET_URL" "$@"
+    else
+        exec "$PYTHON" run_all.py scan "$@"
+    fi
 fi
 
 if [ -n "$1" ]; then

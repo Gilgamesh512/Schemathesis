@@ -80,6 +80,8 @@ def _parser() -> argparse.ArgumentParser:
     scan_parser.add_argument("--save-profile", action="store_true", help="Save target profile to targets/profiles/ for future one-click scans")
     scan_parser.add_argument("--verify-tokens", action="store_true", help="Audit protected endpoints for RFC 7519 Broken Authentication")
     scan_parser.add_argument("--verify-callbacks", action="store_true", help="Audit endpoints for loopback/SSRF callback vulnerabilities")
+    scan_parser.add_argument("--verify-concurrency", action="store_true", help="Audit state-changing endpoints for Race Condition (OWASP API4:2023)")
+    scan_parser.add_argument("--concurrency-burst", type=int, default=5, help="Number of synchronized burst requests (default: 5)")
     scan_parser.add_argument("--callback-url", default=None, help="External canary callback URL for OOB SSRF detection")
     scan_parser.add_argument("--poll-url", default=None, help="External canary polling API endpoint (use {token} placeholder)")
     scan_parser.add_argument("--advertised-host", default=None, help="Advertised host/IP for container callbacks (e.g. host.docker.internal)")
@@ -103,6 +105,16 @@ def _parser() -> argparse.ArgumentParser:
     auto_wf_parser.add_argument("--url", default="http://127.0.0.1:5002", help="Base URL override [default: http://127.0.0.1:5002]")
     auto_wf_parser.add_argument("--proxy", default=None, help="Upstream HTTP/HTTPS proxy URL")
     auto_wf_parser.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification")
+
+    gate_parser = commands.add_parser(
+        "gate",
+        help="DevSecOps Quality Gate: evaluate SARIF/results and enforce CI/CD policy",
+        description="Inspects latest SARIF/vulnerabilities findings and enforces CI/CD quality gate rules.",
+    )
+    gate_parser.add_argument("--sarif", default=None, help="Path to SARIF report file (default: results/vulnerabilities.sarif)")
+    gate_parser.add_argument("--max-critical", type=int, default=0, help="Maximum allowed Critical findings (default: 0)")
+    gate_parser.add_argument("--max-high", type=int, default=0, help="Maximum allowed High findings (default: 0)")
+    gate_parser.add_argument("--allow-confirmed", action="store_true", help="Do not fail on confirmed exploit findings (default: fails on confirmed)")
 
     return parser
 
@@ -264,6 +276,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             scan_args.append("--verify-tokens")
         if args.verify_callbacks:
             scan_args.append("--verify-callbacks")
+        if args.verify_concurrency:
+            scan_args.append("--verify-concurrency")
+        if args.concurrency_burst:
+            scan_args.extend(["--concurrency-burst", str(args.concurrency_burst)])
         if args.callback_url:
             scan_args.extend(["--callback-url", args.callback_url])
         if args.poll_url:
@@ -277,6 +293,58 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (FileNotFoundError, OSError, RuntimeError) as exc:
             print(f"[X] Scan failed: {exc}", file=sys.stderr)
             return 1
+
+    if args.command == "gate":
+        sarif_file = Path(args.sarif) if args.sarif else (ROOT / "results" / "vulnerabilities.sarif")
+        print("\n" + "=" * 70)
+        print("  🛡️  DEVSECOPS SECURITY QUALITY GATE EVALUATION  🛡️".center(68))
+        print("=" * 70)
+        if not sarif_file.exists():
+            print(f"[X] SARIF report not found at: {sarif_file}", file=sys.stderr)
+            return 1
+        try:
+            sarif_data = json.loads(sarif_file.read_text(encoding="utf-8"))
+            runs = sarif_data.get("runs", [])
+            results = runs[0].get("results", []) if runs else []
+        except Exception as exc:
+            print(f"[X] Failed to parse SARIF file: {exc}", file=sys.stderr)
+            return 1
+
+        crit_count = 0
+        high_count = 0
+        confirmed_count = 0
+        for r in results:
+            lvl = r.get("level", "note").lower()
+            msg = r.get("message", {}).get("text", "")
+            if "CONFIRMED" in msg or "Verified" in msg or "BOLA" in msg:
+                confirmed_count += 1
+            if lvl == "error":
+                crit_count += 1
+            elif lvl == "warning":
+                high_count += 1
+
+        print(f"[i] Evaluated SARIF Findings: {len(results)} total findings")
+        print(f"    - Critical / Errors: {crit_count} (Limit: {args.max_critical})")
+        print(f"    - High / Warnings:   {high_count} (Limit: {args.max_high})")
+        print(f"    - Confirmed Exploits: {confirmed_count} (Policy: {'Allow' if args.allow_confirmed else 'Reject any'})")
+
+        gate_failed = False
+        if crit_count > args.max_critical:
+            print(f"[✗] QUALITY GATE VIOLATION: Critical findings ({crit_count}) exceed threshold ({args.max_critical})!")
+            gate_failed = True
+        if high_count > args.max_high:
+            print(f"[✗] QUALITY GATE VIOLATION: High findings ({high_count}) exceed threshold ({args.max_high})!")
+            gate_failed = True
+        if not args.allow_confirmed and confirmed_count > 0:
+            print(f"[✗] QUALITY GATE VIOLATION: Confirmed vulnerability detected ({confirmed_count})!")
+            gate_failed = True
+
+        if gate_failed:
+            print("\n[🚨] RESULT: PIPELINE FAILED. DEPLOYMENT BLOCKED BY SECURITY POLICY.\n")
+            return 1
+        else:
+            print("\n[✅] RESULT: SECURITY QUALITY GATE PASSED. CODE APPROVED FOR DEPLOYMENT.\n")
+            return 0
 
     try:
         return run_pipeline()

@@ -6,6 +6,20 @@ from .callback_verifier import (
     CallbackVerifier,
     LocalCallbackListener,
 )
+try:
+    from .concurrency_fuzzer import (
+        ConcurrencyBurstResult,
+        ConcurrencyFuzzer,
+    )
+except (ImportError, ValueError):
+    try:
+        from core.concurrency_fuzzer import (  # type: ignore
+            ConcurrencyBurstResult,
+            ConcurrencyFuzzer,
+        )
+    except Exception:
+        ConcurrencyBurstResult = None  # type: ignore
+        ConcurrencyFuzzer = None  # type: ignore
 from .dependency_graph import (
     ApiDependencyGraph,
     ConsumerCandidate,
@@ -67,6 +81,8 @@ __all__ = [
     "AuthManager",
     "CallbackEvent",
     "CallbackVerifier",
+    "ConcurrencyBurstResult",
+    "ConcurrencyFuzzer",
     "ConfirmationEngine",
     "ConfirmationResult",
     "ConsumerCandidate",

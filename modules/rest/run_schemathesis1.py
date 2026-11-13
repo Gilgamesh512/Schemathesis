@@ -336,7 +336,9 @@ def schema_payloads(targets: dict[str, tuple]) -> list[Payload]:
                     if not p_name or p_name in parameters_seen:
                         continue
                     parameters_seen.add(p_name)
-                    loc_str = str(getattr(p, "location", "query")).lower()
+                    loc_raw = getattr(p, "location", "query")
+                    loc_val = getattr(loc_raw, "value", loc_raw)
+                    loc_str = str(loc_val).lower().strip().split(".")[-1]
                     p_def = getattr(p, "definition", {})
 
                     param_schema = SemanticMutationEngine.inspect_param(p_name, loc_str, p_def)
@@ -496,36 +498,71 @@ def find_operation_multi(targets: dict[str, tuple], payload: "Payload"):
     return candidates[0]
 
 
+def _normalize_location(loc: Any) -> str:
+    if hasattr(loc, "value"):
+        loc = loc.value
+    s = str(loc or "query").lower().strip()
+    return s.split(".")[-1]
+
+
 def _baseline_component(baseline_case, name: str):
     if baseline_case is None:
         return None
     value = getattr(baseline_case, name, None)
     if value is not None:
-        return value.copy() if isinstance(value, dict) else value
+        if type(value).__name__ == "NotSet" or getattr(value, "__class__", None).__name__ == "NotSet":
+            return None
+        if isinstance(value, dict):
+            return value.copy()
+        elif isinstance(value, list):
+            return list(value)
+        return value
     return None
 
 
 def build_case(schema, op, payload: Payload, baseline_case=None):
     kwargs: dict[str, Any] = {"operation": op, "method": op.method, "path": op.path}
-    if payload.param_location == "query":
-        values = _baseline_component(baseline_case, "query") or {}
+    loc = _normalize_location(payload.param_location)
+
+    if loc == "query":
+        values = _baseline_component(baseline_case, "query")
+        if not isinstance(values, dict):
+            values = {}
         values[payload.target_param] = payload.payload_value
         kwargs["query"] = values
-    elif payload.param_location == "path":
-        values = _baseline_component(baseline_case, "path_parameters") or {}
+    elif loc == "path":
+        values = _baseline_component(baseline_case, "path_parameters")
+        if not isinstance(values, dict):
+            values = {}
         values[payload.target_param] = payload.payload_value
         kwargs["path_parameters"] = values
-    elif payload.param_location == "header":
-        values = _baseline_component(baseline_case, "headers") or {}
+    elif loc in ("header", "headers"):
+        values = _baseline_component(baseline_case, "headers")
+        if not isinstance(values, dict):
+            values = {}
         values[payload.target_param] = str(payload.payload_value)
         kwargs["headers"] = values
-    elif payload.param_location == "body":
-        values = _baseline_component(baseline_case, "body") or {}
+    elif loc == "body":
+        values = _baseline_component(baseline_case, "body")
+        if not isinstance(values, dict):
+            values = {}
         values[payload.target_param] = payload.payload_value
         kwargs["body"] = values
+    elif loc in ("cookie", "cookies"):
+        values = _baseline_component(baseline_case, "cookies")
+        if not isinstance(values, dict):
+            values = {}
+        values[payload.target_param] = str(payload.payload_value)
+        kwargs["cookies"] = values
     else:
         raise ValueError(f"param_location khong ho tro: {payload.param_location}")
-    return schema.make_case(**kwargs)
+    try:
+        return schema.make_case(**kwargs)
+    except Exception as exc:
+        if "media type" in str(exc).lower() and "media_type" not in kwargs:
+            kwargs["media_type"] = "application/json"
+            return schema.make_case(**kwargs)
+        raise
 
 
 def build_baseline_case(schema, op):

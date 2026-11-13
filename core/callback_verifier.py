@@ -41,8 +41,8 @@ class CallbackEvent(BaseModel):
 class LocalCallbackListener:
     """Lightweight in-memory loopback HTTP listener for verifying local SSRF callbacks."""
 
-    def __init__(self, host: str = "127.0.0.1", advertised_host: Optional[str] = None):
-        self.host = host
+    def __init__(self, host: str = "0.0.0.0", advertised_host: Optional[str] = None):
+        self.bind_host = host
         self.advertised_host = advertised_host
         self.port: int = 0
         self.server: Optional[asyncio.Server] = None
@@ -54,14 +54,27 @@ class LocalCallbackListener:
         loop = asyncio.get_running_loop()
         self.server = await asyncio.start_server(
             self._handle_client,
-            self.host,
+            self.bind_host,
             0,  # OS dynamically selects free available port
         )
         sockets = self.server.sockets
         if sockets:
             self.port = sockets[0].getsockname()[1]
         self._running = True
-        reported_host = self.advertised_host or self.host
+
+        reported_host = self.advertised_host
+        if not reported_host:
+            # Attempt auto-detection for container network gateways
+            for candidate in ("host.docker.internal", "host.containers.internal"):
+                try:
+                    socket.gethostbyname(candidate)
+                    reported_host = candidate
+                    break
+                except Exception:
+                    pass
+            if not reported_host:
+                reported_host = "127.0.0.1"
+
         return f"http://{reported_host}:{self.port}"
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:

@@ -1,0 +1,67 @@
+name: API Security Fuzzing & Quality Gate
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+  schedule:
+    - cron: '0 2 * * 1' # Weekly security regression test on Mondays at 2AM UTC
+
+jobs:
+  api-security-audit:
+    name: API Fuzzing & OWASP Top 10 Security Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run Unit & Policy Verification Tests
+        run: |
+          python -m pytest
+
+      - name: Execute Security Fuzzing Scan
+        env:
+          TARGET_URL: ${{ secrets.API_TARGET_URL || 'https://petstore.swagger.io/v2' }}
+          TARGET_SCHEMA: ${{ secrets.API_SCHEMA_URL || 'https://petstore.swagger.io/v2/swagger.json' }}
+          AUTH_TOKEN: ${{ secrets.API_AUTH_TOKEN || '' }}
+        run: |
+          python run_all.py scan \
+            --url "$TARGET_URL" \
+            --schema "$TARGET_SCHEMA" \
+            --verify-tokens \
+            --verify-concurrency
+
+      - name: Evaluate DevSecOps Security Quality Gate
+        run: |
+          python run_all.py gate --max-critical 0 --max-high 2
+
+      - name: Upload OASIS SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: results/vulnerabilities.sarif
+          category: schemathesis-api-security
+
+      - name: Archive Security Reports & Dashboards
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: api-security-reports
+          path: |
+            results/latest_report.html
+            results/vulnerabilities.csv
+            results/vulnerabilities.sarif

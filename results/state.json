@@ -18,5 +18,880 @@
     "attempts": 1,
     "status": "confirmed",
     "last_seen": "2026-08-22T10:17:39.609168+00:00"
+  },
+  "7dda78e945f90f16": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:11.980447+00:00"
+  },
+  "87e0ed325ea390c2": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:11.980447+00:00"
+  },
+  "b040596fee545053": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:11.980447+00:00"
+  },
+  "4b1bc9eec7857ad2": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.070815+00:00"
+  },
+  "2a0f1fd23baa70d3": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.070815+00:00"
+  },
+  "d4972da470adab83": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.070815+00:00"
+  },
+  "28bcea95d6605192": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.070815+00:00"
+  },
+  "03148b174c7d2e58": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.070815+00:00"
+  },
+  "a81aa124982ba233": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.070815+00:00"
+  },
+  "e308168e084a8200": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.070815+00:00"
+  },
+  "63b183e5d020e095": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.070815+00:00"
+  },
+  "6c058367b150f96c": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.341277+00:00"
+  },
+  "0ec5b082022fcde5": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.341277+00:00"
+  },
+  "e79eb234abe89ea5": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.341277+00:00"
+  },
+  "4573bc89f4f57284": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.341277+00:00"
+  },
+  "dd9634c938f00052": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.341277+00:00"
+  },
+  "62f4a5a70dbdec3d": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.585114+00:00"
+  },
+  "84059d80065a6623": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.585114+00:00"
+  },
+  "038a2f86d9defe24": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.585114+00:00"
+  },
+  "049d5c75b18c03db": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.585114+00:00"
+  },
+  "c2532e93e63568ff": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.585114+00:00"
+  },
+  "538a7985c8493c60": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.585797+00:00"
+  },
+  "2a67580bf0689e19": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.585797+00:00"
+  },
+  "6e556742fcd2af81": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.585797+00:00"
+  },
+  "0460fa38c4dc669f": {
+    "attempts": 1,
+    "status": "candidate",
+    "last_seen": "2026-11-13T16:43:13.855677+00:00"
+  },
+  "30b33adc739c5247": {
+    "attempts": 1,
+    "status": "candidate",
+    "last_seen": "2026-11-13T16:43:13.855677+00:00"
+  },
+  "54ffbe510748a561": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:13.855677+00:00"
+  },
+  "e78153fa005ceac2": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:14.119540+00:00"
+  },
+  "495673ff24862d53": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:14.119540+00:00"
+  },
+  "559a8690b774b095": {
+    "attempts": 1,
+    "status": "candidate",
+    "last_seen": "2026-11-13T16:43:14.119540+00:00"
+  },
+  "1fbd051891db2b0e": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:14.381375+00:00"
+  },
+  "72f907e4a2821d98": {
+    "attempts": 1,
+    "status": "candidate",
+    "last_seen": "2026-11-13T16:43:14.381375+00:00"
+  },
+  "41ff7b11dd57562f": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:14.381375+00:00"
+  },
+  "e1ee860a2aa15f71": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T16:43:14.652983+00:00"
+  },
+  "e2c7e6840fe9b4ce": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:26:27.857182+00:00"
+  },
+  "d9ec16c5c1c6398a": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:26:28.086460+00:00"
+  },
+  "5085303eb473ea74": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:26:28.086460+00:00"
+  },
+  "eb193ca2a6b424f4": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:26:28.086460+00:00"
+  },
+  "43fbb43f5bd20566": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:26:28.086460+00:00"
+  },
+  "fb2a0533bea83516": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:26:28.086460+00:00"
+  },
+  "142502b09ac23c3b": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:26:28.148329+00:00"
+  },
+  "1b23f8c91ed9c410": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:26:28.148329+00:00"
+  },
+  "fb0942c5caac026d": {
+    "attempts": 3,
+    "status": "candidate",
+    "last_seen": "2026-11-13T17:08:44.031023+00:00"
+  },
+  "67586195c0b41c36": {
+    "attempts": 3,
+    "status": "candidate",
+    "last_seen": "2026-11-13T17:08:43.773699+00:00"
+  },
+  "aba2b4b007b4eeee": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:20:39.136297+00:00"
+  },
+  "dbeda7a7ec1a5dbb": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:20:39.331394+00:00"
+  },
+  "5f00c529a07fdaec": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:26:28.148329+00:00"
+  },
+  "c95a495c6a4dfba1": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:26:28.148329+00:00"
+  },
+  "7cbb52775c0cebe4": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:08:44.109748+00:00"
+  },
+  "86be09103d08a418": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:20:39.653163+00:00"
+  },
+  "d34ec1b96894fcf5": {
+    "attempts": 3,
+    "status": "candidate",
+    "last_seen": "2026-11-13T17:08:44.874798+00:00"
+  },
+  "5c03bd22f3884f27": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:20:40.171137+00:00"
+  },
+  "10844c0a6c502b89": {
+    "attempts": 3,
+    "status": "candidate",
+    "last_seen": "2026-11-13T17:08:44.340321+00:00"
+  },
+  "df15f9dcfb5e01a9": {
+    "attempts": 3,
+    "status": "candidate",
+    "last_seen": "2026-11-13T17:26:28.898011+00:00"
+  },
+  "67afaa55217f5cd2": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:20:39.465994+00:00"
+  },
+  "d1f8bd43bffa6a7c": {
+    "attempts": 3,
+    "status": "candidate",
+    "last_seen": "2026-11-13T17:08:44.427254+00:00"
+  },
+  "89a63775ff1acffa": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:20:39.542469+00:00"
+  },
+  "03eacd182e94b7f7": {
+    "attempts": 3,
+    "status": "candidate",
+    "last_seen": "2026-11-13T17:26:28.408607+00:00"
+  },
+  "9cdd1fed2621ae77": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:33.745865+00:00"
+  },
+  "b3e851a457f427ac": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:33.745865+00:00"
+  },
+  "5dd472fbd4f60742": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:33.745865+00:00"
+  },
+  "510964bba97aa053": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:35.763744+00:00"
+  },
+  "688e9f154cb88f93": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:35.763744+00:00"
+  },
+  "b80f7c8e54a858bc": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:37.779023+00:00"
+  },
+  "a1d30e24a24046c1": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:39.823615+00:00"
+  },
+  "a37c6be0234556ec": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:41.836981+00:00"
+  },
+  "a719c1dc6ca6ef11": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:41.836981+00:00"
+  },
+  "c97794fd44c797e4": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:41.836981+00:00"
+  },
+  "0bfda24d97df48d2": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:41.836981+00:00"
+  },
+  "43eb403a111e8ddb": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:43.854680+00:00"
+  },
+  "d362917fd966f814": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:45.881971+00:00"
+  },
+  "44fc960a1b7e547f": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:49.936420+00:00"
+  },
+  "efc3efbfbdeed986": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:51.951175+00:00"
+  },
+  "b6913bc6264a23ed": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:51.951175+00:00"
+  },
+  "e4126d243d1ca704": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:51.951175+00:00"
+  },
+  "3a596974581cede2": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:53.980354+00:00"
+  },
+  "131b6a1dd69b235e": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:28.517218+00:00"
+  },
+  "cf13764013c3c455": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:53.980812+00:00"
+  },
+  "cb40d655eb1f6805": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:56.017669+00:00"
+  },
+  "64ab704811a5cc51": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:56.017669+00:00"
+  },
+  "be48be537957be37": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:56.017669+00:00"
+  },
+  "f1c4d65845a48db7": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:58.047776+00:00"
+  },
+  "0df483c4856d6ccf": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:24:58.047776+00:00"
+  },
+  "4d216c2711be76b9": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:24.427540+00:00"
+  },
+  "81e6e652dbcc2837": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:00.085046+00:00"
+  },
+  "b59323cf2a3cc2e5": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:00.085046+00:00"
+  },
+  "86419ccd1e769a08": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:00.085046+00:00"
+  },
+  "fb15d18628e49ed1": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:26.477283+00:00"
+  },
+  "7e24788b568aa91d": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:02.091848+00:00"
+  },
+  "3567b5e39a34cd28": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:02.091848+00:00"
+  },
+  "ecac0e7773c5b1c6": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:02.091848+00:00"
+  },
+  "a7e019117dae3d84": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:02.091848+00:00"
+  },
+  "7553f3997cf2115d": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:02.091848+00:00"
+  },
+  "a7ae90eef176e191": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:02.091848+00:00"
+  },
+  "dd86a9ca4ddd39c6": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:24.427540+00:00"
+  },
+  "328cb55aca0b4f5b": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:02.091848+00:00"
+  },
+  "dc3e3704416ea678": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:04.124314+00:00"
+  },
+  "eabed9cf7b2f5f42": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:04.124314+00:00"
+  },
+  "92efb79649258ada": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:04.124314+00:00"
+  },
+  "f81c9df622ef12a2": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:06.138192+00:00"
+  },
+  "2bc30b9fc6aed078": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:26.477283+00:00"
+  },
+  "6cf6e4f7a551287d": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:06.138760+00:00"
+  },
+  "3b867f7040c6a807": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:06.138760+00:00"
+  },
+  "52904b85ffc90e5e": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:06.138760+00:00"
+  },
+  "11bedd8b899d0024": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:06.138760+00:00"
+  },
+  "9aacc58ebbc90788": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:24.427540+00:00"
+  },
+  "b813ebb7b9f63d27": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:06.138760+00:00"
+  },
+  "cc8a38af8ad5ea27": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:06.138760+00:00"
+  },
+  "4eb0350d09bf1a23": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:06.138760+00:00"
+  },
+  "6dd66e0c498cd4f0": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:06.138760+00:00"
+  },
+  "187be1d0a53e54b8": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:08.177172+00:00"
+  },
+  "3e907940ac98ca72": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:08.177172+00:00"
+  },
+  "e4597722894b0280": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:08.177172+00:00"
+  },
+  "ceb9c8c08e8d3d09": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:26.477283+00:00"
+  },
+  "59df38067b7a2edc": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:10.191645+00:00"
+  },
+  "951b5fdebf9825c4": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:10.191645+00:00"
+  },
+  "3d0468a9a56ace7f": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:10.191645+00:00"
+  },
+  "12ba6a0c233ac765": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:10.191645+00:00"
+  },
+  "0aff3b9635cb09f8": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:10.191645+00:00"
+  },
+  "217ee0bc615aa511": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:26.477283+00:00"
+  },
+  "14cc31fabf8cb530": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:10.191645+00:00"
+  },
+  "df5b2bb5e8574e7b": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:10.191645+00:00"
+  },
+  "1ee1b9076355ff9c": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:10.191645+00:00"
+  },
+  "8ce6b0339cc9eaeb": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:10.191645+00:00"
+  },
+  "3aab659c930832ad": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:12.228259+00:00"
+  },
+  "88c4c0f990bbcec9": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:12.228259+00:00"
+  },
+  "3328f772e56a9021": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:12.228259+00:00"
+  },
+  "95a7501df297e867": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:14.245939+00:00"
+  },
+  "3a0c6d8a062b8534": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:14.245939+00:00"
+  },
+  "7a4e68bd62e12704": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:14.245939+00:00"
+  },
+  "5c2574e495a466cb": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:28.517218+00:00"
+  },
+  "59cecaa0db34a750": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:16.279526+00:00"
+  },
+  "5d448fa8459a77d2": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:16.279526+00:00"
+  },
+  "0f737ec1682bb4bb": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:18.310177+00:00"
+  },
+  "58a163db1cad845b": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:18.310177+00:00"
+  },
+  "cf68d20519dcecde": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:18.310177+00:00"
+  },
+  "4a3366da3364775a": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:20.358087+00:00"
+  },
+  "919dab7036fd71b5": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:20.358087+00:00"
+  },
+  "6d1c49c3f675d9c3": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:28.517218+00:00"
+  },
+  "77aef71ad19fcd50": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:22.404540+00:00"
+  },
+  "49a43b85ce6617af": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:22.404540+00:00"
+  },
+  "e793d35ecb903086": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:28.517218+00:00"
+  },
+  "f8262512a1941e6a": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:22.404926+00:00"
+  },
+  "598ba3b54964e221": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:22.404926+00:00"
+  },
+  "78c8cd514bb02cef": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:22.404926+00:00"
+  },
+  "0083469c94dd309a": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:22.404926+00:00"
+  },
+  "dc071dabadbdbbb5": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:22.404926+00:00"
+  },
+  "a6a6e44f26f034f3": {
+    "attempts": 1,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:25:22.404926+00:00"
+  },
+  "d07eb9587c2c1118": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:39.098166+00:00"
+  },
+  "13feba3c046b87d0": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:39.147310+00:00"
+  },
+  "bfded9085b3c080b": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:39.439079+00:00"
+  },
+  "e53271a1a8555bc1": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:39.439079+00:00"
+  },
+  "7d130f73cb49b1c7": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:39.693842+00:00"
+  },
+  "04fe346dde938dd7": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:39.744054+00:00"
+  },
+  "fbd0c0e2499fc8a6": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:39.853205+00:00"
+  },
+  "01c17e13af2967ba": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:40.159268+00:00"
+  },
+  "fcd562eb58f99ada": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:40.192499+00:00"
+  },
+  "0fbcf4cb27173f69": {
+    "attempts": 3,
+    "status": "candidate",
+    "last_seen": "2026-11-13T17:27:03.173566+00:00"
+  },
+  "38ee68c0834e3d16": {
+    "attempts": 3,
+    "status": "candidate",
+    "last_seen": "2026-11-13T17:27:02.833667+00:00"
+  },
+  "f3d263c2a773594f": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:40.743574+00:00"
+  },
+  "4eefcc3fd8173c3e": {
+    "attempts": 3,
+    "status": "candidate",
+    "last_seen": "2026-11-13T17:27:02.702295+00:00"
+  },
+  "fb6658105b00cdb9": {
+    "attempts": 3,
+    "status": "candidate",
+    "last_seen": "2026-11-13T17:38:40.418046+00:00"
+  },
+  "556d39531f79c59a": {
+    "attempts": 3,
+    "status": "candidate",
+    "last_seen": "2026-11-13T17:38:40.676661+00:00"
+  },
+  "a6378c180eaf50d6": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:40.676661+00:00"
+  },
+  "65792a308827436c": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:40.466409+00:00"
+  },
+  "dc45421ec4a71768": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:40.945327+00:00"
+  },
+  "7d643d7cdb04d226": {
+    "attempts": 2,
+    "status": "candidate",
+    "last_seen": "2026-11-13T17:38:40.898020+00:00"
+  },
+  "95701091d33affcb": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:40.827774+00:00"
+  },
+  "e971037505c11d09": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:40.945327+00:00"
+  },
+  "e00f2da716ea8748": {
+    "attempts": 2,
+    "status": "candidate",
+    "last_seen": "2026-11-13T17:38:41.049717+00:00"
+  },
+  "8b00bdaf18737b9b": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:40.973511+00:00"
+  },
+  "24b5aee630d0c886": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:40.973511+00:00"
+  },
+  "03ac56f479596810": {
+    "attempts": 2,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:41.049717+00:00"
+  },
+  "1021fa1a08c39ae5": {
+    "attempts": 3,
+    "status": "rejected",
+    "last_seen": "2026-11-13T17:38:41.222833+00:00"
+  },
+  "86e688633be7574d": {
+    "attempts": 3,
+    "status": "candidate",
+    "last_seen": "2026-11-13T17:27:03.087894+00:00"
   }
 }

@@ -33,3 +33,13 @@ d6c815d8,2026-08-22T10:17:41.202705+00:00,graphql,http://localhost:5013/graphql,
 9cc9524b,2026-08-23T06:48:48.362854+00:00,schemathesis,vampi=/home/test/fuzzing-tool/main_pipeline/vampi_spec.yaml,1,0,0,1,0,True
 1b5514a5,2026-08-23T06:48:49.556876+00:00,schemathesis,crapi=/home/test/fuzzing-tool/main_pipeline/crapi_openapi_spec.json,3,0,0,3,0,True
 46c74983,2026-08-23T06:48:50.288460+00:00,graphql,http://localhost:5013/graphql,4,0,0,4,0,True
+rest-20261113T164308Z-baa6bcd7,2026-11-13T16:43:14.666253+00:00,schemathesis,target_petstore_swagger_io=https://petstore.swagger.io/v2/swagger.json,138,104,34,0,0,False
+rest-20261113T170839Z-1b3deec3,2026-11-13T17:08:44.882294+00:00,schemathesis,target_jsonplaceholder_typicode_com=D:\Schemathesis\targets\schemas\realworld\jsonplaceholder_spec.yaml,42,0,42,0,0,False
+rest-20261113T172037Z-f36acc79,2026-11-13T17:20:40.177425+00:00,schemathesis,target_jsonplaceholder_typicode_com=D:\Schemathesis\targets\schemas\realworld\jsonplaceholder_spec.yaml,42,0,18,24,0,False
+rest-20261113T172430Z-dda846bb,2026-11-13T17:25:28.527484+00:00,schemathesis,target_127_0_0_1=D:\Schemathesis\targets\schemas\vampi\vampi_spec.yaml,101,0,101,0,0,False
+rest-20261113T172626Z-d975a9f5,2026-11-13T17:26:28.903495+00:00,schemathesis,target_jsonplaceholder_typicode_com=D:\Schemathesis\targets\schemas\realworld\jsonplaceholder_spec.yaml,42,0,12,30,0,False
+rest-20261113T172657Z-20f8ae8b,2026-11-13T17:27:03.181952+00:00,schemathesis,target_dummyjson_com=D:\Schemathesis\targets\schemas\realworld\dummyjson_spec.yaml,40,0,40,0,0,False
+rest-20261113T173506Z-4ad82af4,2026-11-13T17:35:07.303189+00:00,schemathesis,target_jsonplaceholder_typicode_com=D:\Schemathesis\targets\schemas\realworld\jsonplaceholder_spec.yaml,42,0,0,42,0,False
+rest-20261113T173818Z-7c746a7f,2026-11-13T17:38:18.756928+00:00,schemathesis,target_jsonplaceholder_typicode_com=D:\Schemathesis\targets\schemas\jsonplaceholder_spec.yaml,42,0,0,42,0,False
+rest-20261113T173828Z-90565347,2026-11-13T17:38:28.748366+00:00,schemathesis,target_jsonplaceholder_typicode_com=D:\Schemathesis\targets\schemas\jsonplaceholder_spec.yaml,42,0,0,42,0,False
+rest-20261113T173837Z-9eb0d817,2026-11-13T17:38:41.230098+00:00,schemathesis,target_dummyjson_com=D:\Schemathesis\targets\schemas\dummyjson_spec.yaml,40,0,23,17,0,False

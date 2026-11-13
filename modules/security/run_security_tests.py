@@ -33,6 +33,15 @@ from core import (
     discover_api,
 )
 
+try:
+    from core.concurrency_fuzzer import ConcurrencyBurstResult, ConcurrencyFuzzer
+except Exception:
+    try:
+        from core import ConcurrencyBurstResult, ConcurrencyFuzzer  # type: ignore
+    except Exception:
+        ConcurrencyBurstResult = None  # type: ignore
+        ConcurrencyFuzzer = None  # type: ignore
+
 
 PROJECT_PATHS = ProjectPaths.from_root(PROJECT_ROOT)
 TARGETS = TargetManager(PROJECT_ROOT)
@@ -393,6 +402,61 @@ def run_callback_audit(
     return all_findings
 
 
+def run_concurrency_audit(
+    base_url: str,
+    candidate_endpoints: list[tuple[str, str]] | None = None,
+    auth_token: str | None = None,
+    burst_size: int = 5,
+    proxy: str | None = None,
+    insecure: bool = False,
+) -> list[Finding]:
+    """Audit state-changing endpoints for Race Conditions & Concurrency Flaws (OWASP API4:2023)."""
+    banner("CONCURRENCY & RACE CONDITION AUDIT (OWASP API4:2023)")
+    if ConcurrencyFuzzer is None:
+        print("[!] ConcurrencyFuzzer module is unavailable in this environment, skipping.")
+        return []
+    fuzzer = ConcurrencyFuzzer(burst_size=burst_size)
+    print(f"[i] Testing state-changing actions with synchronized burst size: {burst_size} req/burst")
+
+    candidates = candidate_endpoints or [
+        ("POST", "/community/api/v2/coupon/apply-coupon"),
+        ("POST", "/workshop/api/shop/apply_coupon"),
+        ("POST", "/coupon/apply"),
+        ("POST", "/api/v1/coupon/redeem"),
+        ("POST", "/orders"),
+    ]
+
+    all_findings: list[Finding] = []
+    run_id = f"race-audit-{uuid.uuid4().hex[:8]}"
+    headers = {"Authorization": auth_token} if auth_token else {}
+
+    async def _run():
+        for method, ep in candidates:
+            sample_body = {"coupon_code": "PROMO2026", "code": "DISCOUNT50"}
+            res = await fuzzer.execute_burst(
+                base_url=base_url,
+                endpoint=ep,
+                method=method,
+                headers=headers,
+                json_data=sample_body,
+            )
+            finding = fuzzer.convert_to_finding(res, target_app="dynamic_target", run_id=run_id)
+            if finding:
+                all_findings.append(finding)
+                print(f"[!] CONFIRMED RACE CONDITION on {method} {ep}: {res.vulnerability_reason}")
+
+    try:
+        asyncio.run(_run())
+    except Exception as exc:
+        print(f"[!] Concurrency audit error: {exc}")
+
+    if all_findings:
+        print(f"[!] Detected {len(all_findings)} confirmed Concurrency / Race Condition vulnerabilities!")
+    else:
+        print("[+] Concurrency audit completed: No race conditions or duplicate execution detected.")
+    return all_findings
+
+
 def run_dynamic_target(
     *,
     url: str,
@@ -410,6 +474,8 @@ def run_dynamic_target(
     insecure: bool = False,
     verify_tokens: bool = False,
     verify_callbacks: bool = False,
+    verify_concurrency: bool = False,
+    concurrency_burst: int = 5,
     callback_url: str | None = None,
     callback_poll_url: str | None = None,
     advertised_host: str | None = None,
@@ -469,20 +535,42 @@ def run_dynamic_target(
         if effective_schema and effective_schema.startswith(("http://", "https://")):
             settings["allow_remote_schema"] = True
         elif effective_schema:
-            schema_file = Path(effective_schema).resolve()
-            if not schema_file.is_file():
+            schema_file = Path(effective_schema)
+            candidates = [
+                schema_file,
+                schema_file.resolve(),
+                (PROJECT_ROOT / effective_schema).resolve(),
+                (PROJECT_ROOT / "targets" / "schemas" / Path(effective_schema).name).resolve(),
+                (PROJECT_ROOT / "targets" / "schemas" / "realworld" / Path(effective_schema).name).resolve(),
+            ]
+            found_path = None
+            for cand in candidates:
+                if cand.is_file():
+                    found_path = cand
+                    break
+
+            if not found_path:
                 raise FileNotFoundError(f"Schema file not found: {effective_schema}")
-            resolved_schema = str(schema_file)
+            resolved_schema = str(found_path)
     elif protocol == "graphql":
         ep = endpoint if endpoint.startswith("/") else f"/{endpoint}"
         settings["endpoint"] = ep
 
     resolved_payloads = payloads
     if payloads:
-        payload_file = Path(payloads).resolve()
-        if not payload_file.is_file():
+        cand_payloads = [
+            Path(payloads),
+            Path(payloads).resolve(),
+            (PROJECT_ROOT / payloads).resolve(),
+        ]
+        found_payload = None
+        for cand in cand_payloads:
+            if cand.is_file():
+                found_payload = cand
+                break
+        if not found_payload:
             raise FileNotFoundError(f"Payload file not found: {payloads}")
-        resolved_payloads = str(payload_file)
+        resolved_payloads = str(found_payload)
         settings["payload_source"] = resolved_payloads
 
     auth: dict[str, Any] = {}
@@ -565,6 +653,21 @@ def run_dynamic_target(
                 RESULTS.append_findings(
                     callback_findings,
                     source="callback_verifier",
+                    fieldnames=list(Finding.model_fields.keys()),
+                )
+
+        if verify_concurrency:
+            race_findings = run_concurrency_audit(
+                base_url=url,
+                auth_token=auth_token,
+                burst_size=concurrency_burst,
+                proxy=proxy,
+                insecure=insecure,
+            )
+            if race_findings:
+                RESULTS.append_findings(
+                    race_findings,
+                    source="concurrency_fuzzer",
                     fieldnames=list(Finding.model_fields.keys()),
                 )
 
@@ -734,11 +837,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification")
     parser.add_argument("--verify-tokens", action="store_true", help="Audit protected endpoints for RFC 7519 Broken Authentication")
     parser.add_argument("--verify-callbacks", action="store_true", help="Audit endpoints for loopback/SSRF callback vulnerabilities")
+    parser.add_argument("--verify-concurrency", action="store_true", help="Audit state-changing endpoints for Race Condition (OWASP API4:2023)")
+    parser.add_argument("--concurrency-burst", type=int, default=5, help="Number of synchronized burst requests (default: 5)")
     parser.add_argument("--callback-url", default=None, help="External canary callback URL for OOB SSRF detection")
     parser.add_argument("--poll-url", default=None, help="External Canary API polling endpoint URL (use {token} placeholder)")
     parser.add_argument("--advertised-host", default=None, help="Host/IP advertised to targets for loopback callback (e.g. host.docker.internal)")
 
-    args = parser.parse_args(argv)
+    args, unknown = parser.parse_known_args(argv)
 
     if args.workflow:
         return run_workflow(
@@ -773,6 +878,8 @@ def main(argv: list[str] | None = None) -> int:
             insecure=args.insecure,
             verify_tokens=args.verify_tokens,
             verify_callbacks=args.verify_callbacks,
+            verify_concurrency=args.verify_concurrency,
+            concurrency_burst=args.concurrency_burst,
             callback_url=args.callback_url,
             callback_poll_url=args.poll_url,
             advertised_host=args.advertised_host,

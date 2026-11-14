@@ -14,12 +14,20 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
+class CircuitBreakerTrippedError(RuntimeError):
+    """Raised when the target API encounters excessive consecutive 5xx server errors or timeouts."""
+    pass
+
+
 class RequestScheduler:
-    """Shared concurrency and pacing guard for REST and GraphQL requests."""
+    """Shared concurrency, pacing, and circuit breaker guard for REST and GraphQL requests."""
 
     def __init__(self, concurrency: int = 10, global_rps: float = 0,
                  per_target_rps: Optional[dict[str, float]] = None,
-                 max_retries: int = 2):
+                 max_retries: int = 2,
+                 pause_threshold: int = 5,
+                 abort_threshold: int = 15,
+                 pause_duration: float = 15.0):
         self.sem = asyncio.Semaphore(max(1, concurrency))
         self.global_interval = 1 / global_rps if global_rps > 0 else 0
         self.target_intervals = {
@@ -30,6 +38,11 @@ class RequestScheduler:
         self._last_target: dict[str, float] = {}
         self._lock = asyncio.Lock()
         self.max_retries = max(0, max_retries)
+        self.consecutive_server_errors: dict[str, int] = {}
+        self.circuit_tripped: dict[str, bool] = {}
+        self.pause_threshold = pause_threshold
+        self.abort_threshold = abort_threshold
+        self.pause_duration = pause_duration
 
     async def _pace(self, target: str) -> None:
         async with self._lock:
@@ -45,15 +58,57 @@ class RequestScheduler:
             self._last_target[target_key] = timestamp
 
     async def request(self, target: str, operation):
+        target_key = target.lower()
+        if self.circuit_tripped.get(target_key, False):
+            raise CircuitBreakerTrippedError(
+                f"Target '{target}' is currently HALTED: Circuit Breaker was tripped due to target instability."
+            )
+
         async with self.sem:
+            response = None
+            last_exc = None
             for attempt in range(self.max_retries + 1):
                 await self._pace(target)
-                response = await operation()
-                # Check for rate limiting or temporary WAF backoff (429, 503, or temporary 403 rate limit)
+                try:
+                    response = await operation()
+                    last_exc = None
+                except Exception as exc:
+                    last_exc = exc
+                    response = None
+
                 status = getattr(response, "status_code", None)
+                is_server_error = (status in (500, 502, 503, 504)) or (last_exc is not None)
+
+                # Track consecutive failures for Circuit Breaker
+                async with self._lock:
+                    if is_server_error:
+                        err_count = self.consecutive_server_errors.get(target_key, 0) + 1
+                        self.consecutive_server_errors[target_key] = err_count
+                        if err_count >= self.abort_threshold:
+                            self.circuit_tripped[target_key] = True
+                            raise CircuitBreakerTrippedError(
+                                f"Target '{target}' failed with {err_count} consecutive 5xx/timeout errors. "
+                                f"Circuit Breaker TRIPPED to prevent cascading downtime on the target service."
+                            )
+                        elif err_count % self.pause_threshold == 0:
+                            import sys
+                            print(
+                                f"\n[!] CIRCUIT BREAKER: Target '{target}' encountered {err_count} consecutive 5xx errors. "
+                                f"Pausing scan for {self.pause_duration}s to protect target availability...",
+                                file=sys.stderr,
+                            )
+                            await asyncio.sleep(self.pause_duration)
+                    else:
+                        # Successful request or normal client error (2xx, 3xx, 4xx except 5xx) resets error streak
+                        self.consecutive_server_errors[target_key] = 0
+
+                if last_exc is not None and attempt >= self.max_retries:
+                    raise last_exc
+
                 is_throttled = status in (429, 503)
                 if not is_throttled or attempt >= self.max_retries:
                     return response
+
                 retry_after = getattr(response, "headers", {}).get("Retry-After")
                 try:
                     delay = float(retry_after) if retry_after else (2 ** attempt) + random.uniform(0.2, 0.7)
@@ -61,7 +116,6 @@ class RequestScheduler:
                     delay = (2 ** attempt) + random.uniform(0.2, 0.7)
                 # Adaptive pacing: slow down future requests for this target
                 async with self._lock:
-                    target_key = target.lower()
                     current_int = self.target_intervals.get(target_key, 0.1)
                     self.target_intervals[target_key] = max(current_int, min(current_int * 1.5, 3.0))
                 await asyncio.sleep(delay)
@@ -94,6 +148,27 @@ def redact_headers(headers: Optional[dict[str, Any]]) -> dict[str, Any]:
         else:
             redacted[key] = value
     return redacted
+
+
+def sanitize_body(body: Any) -> Any:
+    """Sanitize sensitive secrets (passwords, tokens, keys, card numbers) from response body/payload."""
+    if not body:
+        return body
+    try:
+        from .pii_detector import PiiDetector
+        if isinstance(body, str):
+            return PiiDetector.mask_text(body)
+        elif isinstance(body, dict):
+            raw = json.dumps(body, ensure_ascii=False)
+            masked = PiiDetector.mask_text(raw)
+            return json.loads(masked)
+        elif isinstance(body, list):
+            raw = json.dumps(body, ensure_ascii=False)
+            masked = PiiDetector.mask_text(raw)
+            return json.loads(masked)
+    except Exception:
+        pass
+    return body
 
 
 class Evidence(BaseModel):

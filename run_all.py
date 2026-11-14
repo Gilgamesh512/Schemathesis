@@ -81,6 +81,9 @@ def _parser() -> argparse.ArgumentParser:
     scan_parser.add_argument("--verify-tokens", action="store_true", help="Audit protected endpoints for RFC 7519 Broken Authentication")
     scan_parser.add_argument("--verify-callbacks", action="store_true", help="Audit endpoints for loopback/SSRF callback vulnerabilities")
     scan_parser.add_argument("--verify-concurrency", action="store_true", help="Audit state-changing endpoints for Race Condition (OWASP API4:2023)")
+    scan_parser.add_argument("--verify-pii", action="store_true", help="Audit response bodies for PII and cryptographic secret leakage (OWASP API3:2023)")
+    scan_parser.add_argument("--verify-headers", action="store_true", help="Audit reverse proxy routing integrity and cache poisoning (OWASP API8:2023)")
+    scan_parser.add_argument("--verify-resources", action="store_true", help="Audit endpoints for ReDoS and payload size inflation (OWASP API4:2023)")
     scan_parser.add_argument("--concurrency-burst", type=int, default=5, help="Number of synchronized burst requests (default: 5)")
     scan_parser.add_argument("--callback-url", default=None, help="External canary callback URL for OOB SSRF detection")
     scan_parser.add_argument("--poll-url", default=None, help="External canary polling API endpoint (use {token} placeholder)")
@@ -278,6 +281,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             scan_args.append("--verify-callbacks")
         if args.verify_concurrency:
             scan_args.append("--verify-concurrency")
+        if args.verify_pii:
+            scan_args.append("--verify-pii")
+        if args.verify_headers:
+            scan_args.append("--verify-headers")
+        if args.verify_resources:
+            scan_args.append("--verify-resources")
         if args.concurrency_burst:
             scan_args.extend(["--concurrency-burst", str(args.concurrency_burst)])
         if args.callback_url:

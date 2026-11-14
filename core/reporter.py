@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import hmac
 import html
 import json
 import os
@@ -17,6 +19,12 @@ from typing import Any, Optional
 from .path_manager import ProjectPaths
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def compute_tamper_signature(content: str, secret_key: Optional[str] = None) -> str:
+    """Compute HMAC-SHA256 signature for tamper-evident reporting."""
+    key = (secret_key or os.environ.get("REPORT_SIGNING_KEY", "Schemathesis-Default-Audit-Key-2026")).encode("utf-8")
+    return hmac.new(key, content.encode("utf-8"), hashlib.sha256).hexdigest()
 
 # Reconfigure stdout to utf-8 if supported to prevent Windows charmap encoding errors
 try:
@@ -816,6 +824,18 @@ class SecurityReporter:
 </body>
 </html>
 """
+        # Compute HMAC tamper-evident signature for integrity verification
+        sig = compute_tamper_signature(html_content)
+        footer_badge = f"""
+        <footer style="margin-top: 40px; padding: 20px; border-top: 1px solid #334155; text-align: center; font-size: 13px; color: #94a3b8;">
+            <div>🛡️ <strong>Tamper-Evident Security Audit Seal</strong></div>
+            <div style="font-family: monospace; margin-top: 6px; word-break: break-all;">
+                HMAC-SHA256: {sig}
+            </div>
+        </footer>
+        <!-- INTEGRITY_SIGNATURE: alg=HMAC-SHA256, signature={sig} -->
+        """
+        html_content = html_content.replace("</body>", f"{footer_badge}\n</body>")
         report_path.write_text(html_content, encoding="utf-8")
 
         # Also maintain a symlink / copy as 'latest_report.html' for instant access
@@ -907,6 +927,14 @@ class SecurityReporter:
                 },
                 "results": sarif_results,
             }]
+        }
+
+        raw_sarif_str = json.dumps(sarif_doc, indent=2, ensure_ascii=False)
+        sarif_sig = compute_tamper_signature(raw_sarif_str)
+        sarif_doc["runs"][0]["properties"] = {
+            "tamper_evident_hmac": sarif_sig,
+            "signature_algorithm": "HMAC-SHA256",
+            "signed_at": datetime.now(timezone.utc).isoformat(),
         }
 
         sarif_path.write_text(json.dumps(sarif_doc, indent=2, ensure_ascii=False), encoding="utf-8")

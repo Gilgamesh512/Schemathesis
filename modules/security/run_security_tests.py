@@ -31,6 +31,9 @@ from core import (
     WorkflowDefinition,
     WorkflowRunner,
     discover_api,
+    PiiDetector,
+    HeaderTamperFuzzer,
+    ResourceExhaustionFuzzer,
 )
 
 try:
@@ -457,6 +460,180 @@ def run_concurrency_audit(
     return all_findings
 
 
+def run_pii_audit(
+    base_url: str,
+    endpoints: list[tuple[str, str]] | None = None,
+    auth_token: str | None = None,
+    proxy: str | None = None,
+    insecure: bool = False,
+) -> list[Finding]:
+    """Audit response bodies across target endpoints for PII and cryptographic secret leakage (API3:2023)."""
+    banner("PII & SENSITIVE DATA EXPOSURE AUDIT (OWASP API3:2023)")
+    target_eps = endpoints or [
+        ("GET", "/"),
+        ("GET", "/api/v1/user"),
+        ("GET", "/api/v1/profile"),
+        ("GET", "/users/v1/_me"),
+        ("GET", "/identity/api/auth/profile"),
+        ("GET", "/community/api/v2/user"),
+    ]
+    all_findings: list[Finding] = []
+    run_id = f"pii-audit-{uuid.uuid4().hex[:8]}"
+    headers = {"Authorization": auth_token} if auth_token else {}
+
+    async def _run():
+        transport = httpx.AsyncHTTPTransport(proxy=proxy, verify=not insecure)
+        async with httpx.AsyncClient(transport=transport, timeout=10.0) as client:
+            for method, ep in target_eps:
+                full_url = f"{base_url.rstrip('/')}/{ep.lstrip('/')}"
+                try:
+                    t0 = time.perf_counter()
+                    resp = await client.request(method=method, url=full_url, headers=headers)
+                    elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+                    finding = PiiDetector.audit_response(
+                        status_code=resp.status_code,
+                        response_text=resp.text or "",
+                        endpoint=ep,
+                        method=method,
+                        run_id=run_id,
+                        target_app="dynamic_target",
+                        elapsed_ms=elapsed_ms,
+                    )
+                    if finding:
+                        all_findings.append(finding)
+                        print(f"[!] CONFIRMED PII/SECRET LEAK on {method} {ep}: {finding.evidence.response_signal[0]}")
+                except Exception:
+                    continue
+
+    try:
+        asyncio.run(_run())
+    except Exception as exc:
+        print(f"[!] PII audit error: {exc}")
+
+    if all_findings:
+        print(f"[!] Detected {len(all_findings)} confirmed PII/Secret Data Exposure vulnerabilities!")
+    else:
+        print("[+] PII audit completed: No sensitive credentials or PII patterns leaked in response bodies.")
+    return all_findings
+
+
+def run_header_tamper_audit(
+    base_url: str,
+    endpoints: list[tuple[str, str]] | None = None,
+    auth_token: str | None = None,
+    proxy: str | None = None,
+    insecure: bool = False,
+) -> list[Finding]:
+    """Audit endpoints for Reverse Proxy, Routing Integrity, and Cache Poisoning (API8:2023)."""
+    banner("REVERSE PROXY & HEADER TAMPERING AUDIT (OWASP API8:2023)")
+    fuzzer = HeaderTamperFuzzer()
+    target_eps = endpoints or [
+        ("GET", "/"),
+        ("GET", "/api/v1/ping"),
+        ("GET", "/users"),
+        ("GET", "/identity/api/auth"),
+    ]
+    all_findings: list[Finding] = []
+    run_id = f"header-tamper-audit-{uuid.uuid4().hex[:8]}"
+    headers = {"Authorization": auth_token} if auth_token else {}
+
+    async def _run():
+        transport = httpx.AsyncHTTPTransport(proxy=proxy, verify=not insecure)
+        async with httpx.AsyncClient(transport=transport, timeout=10.0) as client:
+            for method, ep in target_eps:
+                findings = await fuzzer.test_endpoint(
+                    client=client,
+                    base_url=base_url,
+                    endpoint=ep,
+                    method=method,
+                    base_headers=headers,
+                    run_id=run_id,
+                    target_app="dynamic_target",
+                )
+                if findings:
+                    all_findings.extend(findings)
+                    for f in findings:
+                        print(f"[!] CONFIRMED HEADER TAMPERING on {method} {ep}: {f.evidence.response_signal[0]}")
+
+    try:
+        asyncio.run(_run())
+    except Exception as exc:
+        print(f"[!] Header tampering audit error: {exc}")
+
+    if all_findings:
+        print(f"[!] Detected {len(all_findings)} confirmed Routing Integrity / Header Tampering issues!")
+    else:
+        print("[+] Header tampering audit completed: No unvalidated host reflections or route overrides.")
+    return all_findings
+
+
+def run_resource_exhaustion_audit(
+    base_url: str,
+    candidate_endpoints: list[tuple[str, str, str]] | None = None,
+    auth_token: str | None = None,
+    proxy: str | None = None,
+    insecure: bool = False,
+) -> list[Finding]:
+    """Audit endpoints for ReDoS and Unrestricted Resource Consumption (API4:2023)."""
+    banner("RESOURCE EXHAUSTION & REDOS AUDIT (OWASP API4:2023)")
+    fuzzer = ResourceExhaustionFuzzer()
+    candidates = candidate_endpoints or [
+        ("GET", "/api/v1/search", "q"),
+        ("GET", "/users/v1/search", "query"),
+        ("POST", "/identity/api/auth/login", "email"),
+        ("POST", "/users/v1/register", "email"),
+    ]
+    all_findings: list[Finding] = []
+    run_id = f"resource-audit-{uuid.uuid4().hex[:8]}"
+    headers = {"Authorization": auth_token} if auth_token else {}
+
+    async def _run():
+        transport = httpx.AsyncHTTPTransport(proxy=proxy, verify=not insecure)
+        async with httpx.AsyncClient(transport=transport, timeout=10.0) as client:
+            for method, ep, param in candidates:
+                findings = await fuzzer.test_redos(
+                    client=client,
+                    base_url=base_url,
+                    endpoint=ep,
+                    param_name=param,
+                    param_location="query" if method == "GET" else "body",
+                    method=method,
+                    headers=headers,
+                    run_id=run_id,
+                    target_app="dynamic_target",
+                )
+                if findings:
+                    all_findings.extend(findings)
+                    for f in findings:
+                        print(f"[!] CONFIRMED REDOS on {method} {ep}: {f.evidence.response_signal[0]}")
+
+            for method, ep, _ in candidates:
+                if method.upper() in ("POST", "PUT"):
+                    finding = await fuzzer.test_body_inflation(
+                        client=client,
+                        base_url=base_url,
+                        endpoint=ep,
+                        method=method,
+                        headers=headers,
+                        run_id=run_id,
+                        target_app="dynamic_target",
+                    )
+                    if finding:
+                        all_findings.append(finding)
+                        print(f"[!] CONFIRMED JSON BOMB RESOURCE EXHAUSTION on {method} {ep}: {finding.evidence.response_signal[0]}")
+
+    try:
+        asyncio.run(_run())
+    except Exception as exc:
+        print(f"[!] Resource exhaustion audit error: {exc}")
+
+    if all_findings:
+        print(f"[!] Detected {len(all_findings)} confirmed Resource Consumption / DoS vulnerabilities!")
+    else:
+        print("[+] Resource exhaustion audit completed: Target properly limits regex execution and body sizes.")
+    return all_findings
+
+
 def run_dynamic_target(
     *,
     url: str,
@@ -475,6 +652,9 @@ def run_dynamic_target(
     verify_tokens: bool = False,
     verify_callbacks: bool = False,
     verify_concurrency: bool = False,
+    verify_pii: bool = False,
+    verify_headers: bool = False,
+    verify_resources: bool = False,
     concurrency_burst: int = 5,
     callback_url: str | None = None,
     callback_poll_url: str | None = None,
@@ -671,6 +851,48 @@ def run_dynamic_target(
                     fieldnames=list(Finding.model_fields.keys()),
                 )
 
+        if verify_pii:
+            pii_findings = run_pii_audit(
+                base_url=url,
+                auth_token=auth_token,
+                proxy=proxy,
+                insecure=insecure,
+            )
+            if pii_findings:
+                RESULTS.append_findings(
+                    pii_findings,
+                    source="pii_detector",
+                    fieldnames=list(Finding.model_fields.keys()),
+                )
+
+        if verify_headers:
+            header_findings = run_header_tamper_audit(
+                base_url=url,
+                auth_token=auth_token,
+                proxy=proxy,
+                insecure=insecure,
+            )
+            if header_findings:
+                RESULTS.append_findings(
+                    header_findings,
+                    source="header_tamper_fuzzer",
+                    fieldnames=list(Finding.model_fields.keys()),
+                )
+
+        if verify_resources:
+            res_findings = run_resource_exhaustion_audit(
+                base_url=url,
+                auth_token=auth_token,
+                proxy=proxy,
+                insecure=insecure,
+            )
+            if res_findings:
+                RESULTS.append_findings(
+                    res_findings,
+                    source="resource_exhaustion_fuzzer",
+                    fieldnames=list(Finding.model_fields.keys()),
+                )
+
         banner("FUZZING COMPLETE")
 
         # Render terminal dashboard and generate HTML report
@@ -838,6 +1060,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verify-tokens", action="store_true", help="Audit protected endpoints for RFC 7519 Broken Authentication")
     parser.add_argument("--verify-callbacks", action="store_true", help="Audit endpoints for loopback/SSRF callback vulnerabilities")
     parser.add_argument("--verify-concurrency", action="store_true", help="Audit state-changing endpoints for Race Condition (OWASP API4:2023)")
+    parser.add_argument("--verify-pii", action="store_true", help="Audit response bodies for PII, tokens, and secret leakage (OWASP API3:2023)")
+    parser.add_argument("--verify-headers", action="store_true", help="Audit reverse proxy routing integrity and cache poisoning (OWASP API8:2023)")
+    parser.add_argument("--verify-resources", action="store_true", help="Audit endpoints for ReDoS and payload size inflation (OWASP API4:2023)")
     parser.add_argument("--concurrency-burst", type=int, default=5, help="Number of synchronized burst requests (default: 5)")
     parser.add_argument("--callback-url", default=None, help="External canary callback URL for OOB SSRF detection")
     parser.add_argument("--poll-url", default=None, help="External Canary API polling endpoint URL (use {token} placeholder)")
@@ -879,6 +1104,9 @@ def main(argv: list[str] | None = None) -> int:
             verify_tokens=args.verify_tokens,
             verify_callbacks=args.verify_callbacks,
             verify_concurrency=args.verify_concurrency,
+            verify_pii=args.verify_pii,
+            verify_headers=args.verify_headers,
+            verify_resources=args.verify_resources,
             concurrency_burst=args.concurrency_burst,
             callback_url=args.callback_url,
             callback_poll_url=args.poll_url,

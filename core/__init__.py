@@ -27,6 +27,7 @@ from .dependency_graph import (
 )
 from .discovery import ApiDiscoveryEngine, DiscoveryResult, discover_api
 from .evidence import (
+    CircuitBreakerTrippedError,
     ConfirmationEngine,
     ConfirmationResult,
     Evidence,
@@ -38,6 +39,7 @@ from .evidence import (
     confirmation_result,
     content_hash,
     redact_headers,
+    sanitize_body,
     snapshot_response,
     stable_finding_id,
 )
@@ -46,8 +48,23 @@ from .feedback_engine import (
     FeedbackAnalyzer,
     FieldValidationFailure,
 )
+from .header_tamper_fuzzer import (
+    HeaderTamperFuzzer,
+    HeaderTamperProbe,
+    HeaderTamperResult,
+)
 from .path_manager import ProjectPaths, resolve_project_root, safe_project_path
-from .reporter import OWASP_METADATA, SecurityReporter
+from .pii_detector import (
+    PiiDetector,
+    PiiMatch,
+    PiiScanResult,
+    luhn_checksum_valid,
+)
+from .reporter import OWASP_METADATA, SecurityReporter, compute_tamper_signature
+from .resource_exhaustion_fuzzer import (
+    ResourceExhaustionFuzzer,
+    ResourceProbeResult,
+)
 from .result_manager import ResultManager, make_run_id
 from .schema_converter import (
     convert_any_to_openapi,
@@ -81,6 +98,7 @@ __all__ = [
     "AuthManager",
     "CallbackEvent",
     "CallbackVerifier",
+    "CircuitBreakerTrippedError",
     "ConcurrencyBurstResult",
     "ConcurrencyFuzzer",
     "ConfirmationEngine",
@@ -92,10 +110,18 @@ __all__ = [
     "FeedbackAnalyzer",
     "FieldValidationFailure",
     "Finding",
+    "HeaderTamperFuzzer",
+    "HeaderTamperProbe",
+    "HeaderTamperResult",
     "LocalCallbackListener",
     "OWASP_METADATA",
     "ParamSchema",
+    "PiiDetector",
+    "PiiMatch",
+    "PiiScanResult",
     "ProducerCandidate",
+    "ResourceExhaustionFuzzer",
+    "ResourceProbeResult",
     "SecurityReporter",
     "RequestScheduler",
     "ResponseObservation",
@@ -116,6 +142,7 @@ __all__ = [
     "WorkflowRunner",
     "WorkflowStep",
     "compare_responses",
+    "compute_tamper_signature",
     "confirmation_result",
     "content_hash",
     "convert_any_to_openapi",
@@ -125,12 +152,14 @@ __all__ = [
     "har_to_openapi",
     "interpolate_template",
     "load_schema",
+    "luhn_checksum_valid",
     "make_run_id",
     "postman_to_openapi",
     "redact_headers",
     "resolve_project_root",
     "resolve_selector",
     "safe_project_path",
+    "sanitize_body",
     "snapshot_response",
     "stable_finding_id",
     "target_config",

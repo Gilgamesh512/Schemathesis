@@ -114,6 +114,7 @@ class WorkflowDefinition(BaseModel):
     base_url: Optional[str] = None
     initial_context: dict[str, Any] = Field(default_factory=dict)
     steps: list[WorkflowStep] = Field(default_factory=list)
+    teardown_steps: list[WorkflowStep] = Field(default_factory=list)
     on_failure: str = "abort"  # "abort" | "continue"
 
     @classmethod
@@ -158,6 +159,7 @@ class WorkflowExecutionReport(BaseModel):
     passed_steps: int
     failed_steps: int
     results: list[StepExecutionResult] = Field(default_factory=list)
+    teardown_results: list[StepExecutionResult] = Field(default_factory=list)
     final_context: dict[str, Any] = Field(default_factory=dict)
     findings: list[Finding] = Field(default_factory=list)
     success: bool = True
@@ -349,21 +351,39 @@ class WorkflowRunner:
             client_kwargs["verify"] = False
 
         results: list[StepExecutionResult] = []
+        teardown_results: list[StepExecutionResult] = []
         findings: list[Finding] = []
         overall_success = True
 
         async with httpx.AsyncClient(**client_kwargs) as client:
-            for step in workflow.steps:
-                res = await self.execute_step(client, step, context, effective_base_url, actual_run_id)
-                results.append(res)
+            try:
+                for step in workflow.steps:
+                    res = await self.execute_step(client, step, context, effective_base_url, actual_run_id)
+                    results.append(res)
 
-                if res.finding:
-                    findings.append(res.finding)
+                    if res.finding:
+                        findings.append(res.finding)
 
-                if not res.success:
-                    overall_success = False
-                    if workflow.on_failure == "abort":
-                        break
+                    if not res.success:
+                        overall_success = False
+                        if workflow.on_failure == "abort":
+                            break
+            finally:
+                # Teardown hook: automatically clean up created resources to prevent data pollution
+                if workflow.teardown_steps:
+                    for td_step in workflow.teardown_steps:
+                        try:
+                            td_res = await self.execute_step(client, td_step, context, effective_base_url, actual_run_id)
+                            teardown_results.append(td_res)
+                        except Exception as td_exc:
+                            teardown_results.append(StepExecutionResult(
+                                step_name=td_step.name,
+                                method=td_step.method.upper(),
+                                url=td_step.endpoint,
+                                status_code=None,
+                                success=False,
+                                error_message=f"Teardown error: {td_exc}",
+                            ))
 
         total_duration = round((time.perf_counter() - start_time) * 1000, 1)
         passed = sum(1 for r in results if r.success)
@@ -378,6 +398,7 @@ class WorkflowRunner:
             passed_steps=passed,
             failed_steps=failed,
             results=results,
+            teardown_results=teardown_results,
             final_context=context,
             findings=findings,
             success=overall_success,

@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import sys
+import urllib.parse
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
@@ -894,13 +895,15 @@ class SecurityReporter:
                 f"Confirmed: {f.get('confirmed', False)}. {f.get('evidence', '')}"
             )
 
+            endpoint_raw = str(f.get("endpoint", "/"))
+            endpoint_uri = urllib.parse.quote(endpoint_raw, safe="/:@?&=#%+")
             sarif_results.append({
                 "ruleId": rule_id,
                 "level": level,
                 "message": {"text": msg_text},
                 "locations": [{
                     "physicalLocation": {
-                        "artifactLocation": {"uri": f.get("endpoint", "/")},
+                        "artifactLocation": {"uri": endpoint_uri},
                         "region": {"startLine": 1}
                     }
                 }],

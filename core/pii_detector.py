@@ -15,11 +15,29 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import math
+import os
+from pathlib import Path
 import re
 from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 from .evidence import Evidence, Finding, content_hash, stable_finding_id
+
+
+def calculate_shannon_entropy(data: str) -> float:
+    """Calculate the Shannon entropy of a string (bits per symbol)."""
+    if not data:
+        return 0.0
+    entropy = 0.0
+    length = len(data)
+    counts: dict[str, int] = {}
+    for char in data:
+        counts[char] = counts.get(char, 0) + 1
+    for count in counts.values():
+        p = count / length
+        entropy -= p * math.log2(p)
+    return round(entropy, 3)
 
 
 def luhn_checksum_valid(card_number: str) -> bool:
@@ -128,24 +146,57 @@ class PiiDetector:
     # Credit card regex with digit grouping or unspaced
     CARD_REGEX = re.compile(r"\b(?:\d{4}[- ]?){3}\d{4}\b|\b\d{13,19}\b")
 
+    # High-entropy generic secret pattern (base64/hex/alphanumeric tokens)
+    HIGH_ENTROPY_TOKEN_REGEX = re.compile(r"\b[A-Za-z0-9_\-]{24,80}\b")
+
+    # Maximum response body size scanned in bytes (2MB) to prevent ReDoS / memory exhaustion
+    MAX_BODY_SCAN_BYTES = 2 * 1024 * 1024
+
+    @classmethod
+    def _load_custom_patterns(cls) -> list[dict[str, Any]]:
+        """Dynamically load user-configured custom patterns from config/pii_rules.json."""
+        custom_list: list[dict[str, Any]] = []
+        root_dir = Path(__file__).resolve().parents[1]
+        rules_path = root_dir / "config" / "pii_rules.json"
+        if rules_path.is_file():
+            try:
+                data = json.loads(rules_path.read_text(encoding="utf-8"))
+                for entry in data.get("custom_patterns", []):
+                    reg_str = entry.get("regex")
+                    if reg_str:
+                        replacement = entry.get("mask_replacement", "[REDACTED_CUSTOM]")
+                        custom_list.append({
+                            "name": entry.get("name", "Custom Enterprise Secret"),
+                            "category": entry.get("category", "CUSTOM_PII"),
+                            "regex": re.compile(reg_str),
+                            "confidence": float(entry.get("confidence", 0.90)),
+                            "mask_func": lambda m, rep=replacement: rep,
+                        })
+            except Exception:
+                pass
+        return custom_list
+
     @classmethod
     def scan(cls, text: str) -> PiiScanResult:
         """Scan string content and report detected sensitive elements."""
         if not text or not isinstance(text, str):
             return PiiScanResult()
 
+        # Guard against oversized bodies
+        inspection_text = text[:cls.MAX_BODY_SCAN_BYTES]
+
         matches: list[PiiMatch] = []
         counts: dict[str, int] = {}
-        sanitized = text
 
-        # 1. Regex based detections
-        for pattern in cls.PATTERNS:
+        # 1. Standard Built-in & Custom File Patterns
+        all_patterns = list(cls.PATTERNS) + cls._load_custom_patterns()
+        for pattern in all_patterns:
             regex = pattern["regex"]
             p_name = pattern["name"]
             cat = pattern["category"]
             conf = pattern["confidence"]
 
-            for m in regex.finditer(text):
+            for m in regex.finditer(inspection_text):
                 matched_str = m.group(0)
                 # Keep preview concise
                 preview = matched_str[:40] + ("..." if len(matched_str) > 40 else "")
@@ -160,7 +211,7 @@ class PiiDetector:
                 counts[p_name] = counts.get(p_name, 0) + 1
 
         # 2. Credit Card Numbers (Strict Luhn algorithm filter to prevent false positives)
-        for m in cls.CARD_REGEX.finditer(text):
+        for m in cls.CARD_REGEX.finditer(inspection_text):
             raw_cand = m.group(0)
             clean_digits = re.sub(r"\D", "", raw_cand)
             if luhn_checksum_valid(clean_digits):
@@ -174,6 +225,31 @@ class PiiDetector:
                     end_pos=m.end(),
                 ))
                 counts["Valid Credit Card (Luhn Verified)"] = counts.get("Valid Credit Card (Luhn Verified)", 0) + 1
+
+        # 3. High-Entropy Secret Detection (> 4.5 bits entropy for random secrets)
+        # Exclude already matched regions to prevent double-counting
+        matched_spans = {(m.start_pos, m.end_pos) for m in matches}
+        for m in cls.HIGH_ENTROPY_TOKEN_REGEX.finditer(inspection_text):
+            span = (m.start(), m.end())
+            # Skip if overlapping with existing match
+            if any(s[0] <= span[0] and span[1] <= s[1] for s in matched_spans):
+                continue
+            cand_token = m.group(0)
+            # Ignore standard UUIDs, lowercase hex hashes, or repetitive patterns
+            if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", cand_token, re.IGNORECASE):
+                continue
+            entropy = calculate_shannon_entropy(cand_token)
+            if entropy >= 4.5:
+                preview = cand_token[:4] + "..." + cand_token[-4:] + f" (entropy: {entropy})"
+                matches.append(PiiMatch(
+                    category="HIGH_ENTROPY_SECRET",
+                    pattern_name="High-Entropy Random Secret Key",
+                    preview=preview,
+                    confidence=0.88,
+                    start_pos=m.start(),
+                    end_pos=m.end(),
+                ))
+                counts["High-Entropy Random Secret Key"] = counts.get("High-Entropy Random Secret Key", 0) + 1
 
         # Generate sanitized copy
         sanitized = cls.mask_text(text)
@@ -193,8 +269,9 @@ class PiiDetector:
 
         result = text
 
-        # Mask regex patterns
-        for pattern in cls.PATTERNS:
+        # Mask regex patterns (built-in + custom)
+        all_patterns = list(cls.PATTERNS) + cls._load_custom_patterns()
+        for pattern in all_patterns:
             mask_func = pattern.get("mask_func")
             if mask_func:
                 result = pattern["regex"].sub(mask_func, result)

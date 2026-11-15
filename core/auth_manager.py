@@ -30,6 +30,17 @@ class AuthConfig:
     refresh_headers: dict[str, str] = field(default_factory=dict)
     token_response_path: str = "access_token"  # or "token"
 
+    # Mutual TLS (mTLS) client certificate configuration
+    client_cert: Optional[str] = None
+    client_key: Optional[str] = None
+
+    # OAuth2 RFC 6749 Client Credentials flow configuration
+    oauth2_endpoint: Optional[str] = None
+    oauth2_client_id: Optional[str] = None
+    oauth2_client_secret: Optional[str] = None
+    oauth2_scope: Optional[str] = None
+    oauth2_grant_type: str = "client_credentials"
+
 
 class AuthManager:
     """Thread-safe / Coroutine-safe authentication manager with automatic refresh."""
@@ -38,6 +49,46 @@ class AuthManager:
         self.config = config or AuthConfig()
         self._lock = asyncio.Lock()
         self._last_refresh_time: float = 0.0
+
+    def get_httpx_cert(self) -> Optional[tuple[str, Optional[str]] | str]:
+        """Return certificate tuple or path suitable for httpx.AsyncClient(cert=...)."""
+        if self.config.client_cert:
+            if self.config.client_key:
+                return (self.config.client_cert, self.config.client_key)
+            return self.config.client_cert
+        return None
+
+    async def fetch_oauth2_token(self, client: httpx.AsyncClient) -> bool:
+        """Authenticate via OAuth2 RFC 6749 Client Credentials flow."""
+        if not self.config.oauth2_endpoint or not self.config.oauth2_client_id:
+            return False
+
+        payload = {
+            "grant_type": self.config.oauth2_grant_type,
+            "client_id": self.config.oauth2_client_id,
+        }
+        if self.config.oauth2_client_secret:
+            payload["client_secret"] = self.config.oauth2_client_secret
+        if self.config.oauth2_scope:
+            payload["scope"] = self.config.oauth2_scope
+
+        try:
+            resp = await client.post(
+                self.config.oauth2_endpoint,
+                data=payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=12.0,
+            )
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                new_token = data.get("access_token") or data.get("token")
+                if new_token and isinstance(new_token, str):
+                    self.config.token = new_token
+                    self._last_refresh_time = time.monotonic()
+                    return True
+        except Exception:
+            pass
+        return False
 
     @classmethod
     def from_header_string(cls, raw_header: str) -> "AuthManager":
@@ -108,13 +159,17 @@ class AuthManager:
 
         Returns True if token was successfully refreshed, False otherwise.
         """
-        if not self.config.refresh_url:
+        if not self.config.refresh_url and not self.config.oauth2_endpoint:
             return False
 
         async with self._lock:
             # If another coroutine already refreshed token after trigger_time, skip duplicate refresh
             if self._last_refresh_time > trigger_time:
                 return True
+
+            # If configured for OAuth2 client credentials, use dedicated flow
+            if self.config.oauth2_endpoint and not self.config.refresh_url:
+                return await self.fetch_oauth2_token(client)
 
             try:
                 headers = dict(self.config.refresh_headers)

@@ -5,10 +5,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import ssl
 import subprocess
 import sys
 from typing import Sequence
+import urllib.error
+import urllib.request
+
+try:
+    from core.alerting import send_webhook_alert
+except ImportError:
+    send_webhook_alert = None  # type: ignore
 
 
 ROOT = Path(__file__).resolve().parent
@@ -45,6 +54,30 @@ TOKENS_FILE = ROOT / "tokens.env"
 DVGA_SCHEMA = ROOT / "targets" / "schemas" / "dvga" / "dvga_schema.json"
 
 
+def preflight_check(url: str, proxy: str | None = None, insecure: bool = False, timeout: float = 6.0) -> tuple[bool, str]:
+    """Perform a non-invasive pre-flight reachability probe on the target API."""
+    try:
+        ctx = ssl.create_default_context()
+        if insecure:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+
+        handlers = []
+        if proxy:
+            handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+        opener = urllib.request.build_opener(*handlers)
+
+        req = urllib.request.Request(url, headers={"User-Agent": "Schemathesis-Preflight/2.0"}, method="GET")
+        with opener.open(req, timeout=timeout) as resp:
+            return True, f"HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        # Target answered with HTTP error code (e.g. 401, 403, 404) -> Target is alive and reachable!
+        return True, f"HTTP {exc.code} (Reachable)"
+    except Exception as exc:
+        return False, str(exc)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Manage the local API lab or scan targets dynamically with auto-discovery."
@@ -70,6 +103,12 @@ def _parser() -> argparse.ArgumentParser:
     scan_parser.add_argument("--har", default=None, help="HTTP Archive (.har) log file path")
     scan_parser.add_argument("--workflow", default=None, help="Stateful workflow YAML file path")
     scan_parser.add_argument("--auth-token", "--token", dest="auth_token", default=None, help="Bearer token, JWT, or 'Header: Value'")
+    scan_parser.add_argument("--auth-token-file", default=None, help="Path to file containing auth token securely (prevents CLI leaking)")
+    scan_parser.add_argument("--auth-token-stdin", action="store_true", help="Read auth token securely from standard input (stdin)")
+    scan_parser.add_argument("--client-cert", default=None, help="Path to client certificate file for mTLS")
+    scan_parser.add_argument("--client-key", default=None, help="Path to client private key file for mTLS")
+    scan_parser.add_argument("--webhook-url", default=None, help="Alert webhook URL (Slack, MS Teams, Discord, or Generic Webhook)")
+    scan_parser.add_argument("--no-preflight", action="store_true", help="Skip pre-flight connectivity reachability check")
     scan_parser.add_argument("--protocol", choices=["rest", "graphql"], default="rest", help="Protocol (default: rest)")
     scan_parser.add_argument("--endpoint", default="/graphql", help="GraphQL endpoint (if protocol=graphql)")
     scan_parser.add_argument("--payloads", default=None, help="Path to custom payload corpus JSON")
@@ -118,6 +157,8 @@ def _parser() -> argparse.ArgumentParser:
     gate_parser.add_argument("--max-critical", type=int, default=0, help="Maximum allowed Critical findings (default: 0)")
     gate_parser.add_argument("--max-high", type=int, default=0, help="Maximum allowed High findings (default: 0)")
     gate_parser.add_argument("--allow-confirmed", action="store_true", help="Do not fail on confirmed exploit findings (default: fails on confirmed)")
+    gate_parser.add_argument("--summary-markdown", default=None, help="Output Markdown table summary path (e.g. for $GITHUB_STEP_SUMMARY)")
+    gate_parser.add_argument("--webhook-url", default=None, help="Alert webhook URL for Quality Gate status")
 
     return parser
 
@@ -247,6 +288,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
 
     if args.command == "scan":
+        # Resolve auth token securely if provided via file or stdin
+        effective_token = args.auth_token
+        if not effective_token and args.auth_token_file:
+            token_p = Path(args.auth_token_file)
+            if token_p.is_file():
+                effective_token = token_p.read_text(encoding="utf-8").strip()
+                print(f"[i] Secure Auth: Loaded token from {token_p}")
+            else:
+                print(f"[X] Auth token file not found: {token_p}", file=sys.stderr)
+                return 1
+        elif not effective_token and args.auth_token_stdin:
+            print("[i] Secure Auth: Reading auth token from standard input (stdin)...")
+            effective_token = sys.stdin.read().strip()
+
+        # Non-invasive pre-flight reachability check
+        if not args.no_preflight:
+            print(f"[i] Pre-flight: Probing target reachability at {args.url} ...")
+            is_alive, msg = preflight_check(args.url, proxy=args.proxy, insecure=args.insecure)
+            if is_alive:
+                print(f"[+] Pre-flight PASS: Target is reachable ({msg})")
+            else:
+                print(f"[CANH BAO] Target pre-flight check failed: {msg}")
+                print(f"[i] If testing an offline/local container, verify it is running or pass --no-preflight.")
+
         scan_args = [
             "--url", args.url,
             "--protocol", args.protocol,
@@ -259,8 +324,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             scan_args.extend(["--har", args.har])
         if args.workflow:
             scan_args.extend(["--workflow", args.workflow])
-        if args.auth_token:
-            scan_args.extend(["--auth-token", args.auth_token])
+        if effective_token:
+            scan_args.extend(["--auth-token", effective_token])
         if args.protocol == "graphql" and args.endpoint:
             scan_args.extend(["--endpoint", args.endpoint])
         if args.payloads:
@@ -324,8 +389,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         confirmed_count = 0
         for r in results:
             lvl = r.get("level", "note").lower()
-            msg = r.get("message", {}).get("text", "")
-            if "CONFIRMED" in msg or "Verified" in msg or "BOLA" in msg:
+            props = r.get("properties") or {}
+            
+            # Precise structured verification: use boolean confirmed property
+            is_confirmed = bool(props.get("confirmed", False))
+            if not is_confirmed:
+                msg = r.get("message", {}).get("text", "")
+                if "Confirmed: True" in msg or "CONFIRMED: TRUE" in msg:
+                    is_confirmed = True
+
+            if is_confirmed:
                 confirmed_count += 1
             if lvl == "error":
                 crit_count += 1
@@ -338,17 +411,74 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"    - Confirmed Exploits: {confirmed_count} (Policy: {'Allow' if args.allow_confirmed else 'Reject any'})")
 
         gate_failed = False
+        reasons = []
         if crit_count > args.max_critical:
-            print(f"[✗] QUALITY GATE VIOLATION: Critical findings ({crit_count}) exceed threshold ({args.max_critical})!")
+            reasons.append(f"Critical findings ({crit_count}) exceed threshold ({args.max_critical})")
             gate_failed = True
         if high_count > args.max_high:
-            print(f"[✗] QUALITY GATE VIOLATION: High findings ({high_count}) exceed threshold ({args.max_high})!")
+            reasons.append(f"High findings ({high_count}) exceed threshold ({args.max_high})")
             gate_failed = True
         if not args.allow_confirmed and confirmed_count > 0:
-            print(f"[✗] QUALITY GATE VIOLATION: Confirmed vulnerability detected ({confirmed_count})!")
+            reasons.append(f"Confirmed exploit vulnerability detected ({confirmed_count})")
             gate_failed = True
 
+        status_str = "FAILED" if gate_failed else "PASSED"
+
+        # Generate Markdown Summary table
+        md_summary = [
+            "### 🛡️ DevSecOps Security Quality Gate Summary",
+            "",
+            f"**Evaluation Status**: {'🚨 **BLOCKED / FAILED**' if gate_failed else '✅ **PASSED / APPROVED**'}",
+            "",
+            "| Security Metric | Count | Allowed Limit | Gate Policy Result |",
+            "| :--- | :---: | :---: | :---: |",
+            f"| 🔴 Critical Severity / Errors | **{crit_count}** | Max {args.max_critical} | {'❌ VIOLATION' if crit_count > args.max_critical else '✅ PASSED'} |",
+            f"| 🟠 High Severity / Warnings | **{high_count}** | Max {args.max_high} | {'❌ VIOLATION' if high_count > args.max_high else '✅ PASSED'} |",
+            f"| 🎯 Confirmed Active Exploits | **{confirmed_count}** | {'Allowed' if args.allow_confirmed else '0 (Zero Tolerance)'} | {'❌ VIOLATION' if not args.allow_confirmed and confirmed_count > 0 else '✅ PASSED'} |",
+            f"| 📊 Total Assessed Findings | **{len(results)}** | N/A | Evaluated |",
+            "",
+        ]
         if gate_failed:
+            md_summary.append("#### 🚨 Policy Violation Reasons:")
+            for r_reason in reasons:
+                md_summary.append(f"- ❌ {r_reason}")
+            md_summary.append("")
+
+        md_output_text = "\n".join(md_summary)
+
+        # Write Markdown summary to specified path (e.g. GITHUB_STEP_SUMMARY)
+        summary_path = args.summary_markdown or os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary_path:
+            try:
+                out_p = Path(summary_path)
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                with open(out_p, "a", encoding="utf-8") as f_md:
+                    f_md.write("\n" + md_output_text + "\n")
+                print(f"[+] Security summary written to: {out_p}")
+            except Exception as exc:
+                print(f"[!] Warning: Could not write summary markdown: {exc}")
+
+        # Send Webhook Alert if configured
+        webhook_target = args.webhook_url or os.environ.get("SECURITY_GATE_WEBHOOK_URL")
+        if webhook_target and send_webhook_alert:
+            alert_sent = send_webhook_alert(
+                webhook_url=webhook_target,
+                title=f"API Security Gate: {status_str}",
+                summary=f"Gate evaluation completed with {status_str}. Total findings: {len(results)}.",
+                status=status_str,
+                metrics={
+                    "critical": crit_count,
+                    "high": high_count,
+                    "confirmed": confirmed_count,
+                    "total": len(results),
+                },
+            )
+            if alert_sent:
+                print(f"[+] Webhook alert delivered to: {webhook_target[:35]}...")
+
+        if gate_failed:
+            for r_reason in reasons:
+                print(f"[✗] QUALITY GATE VIOLATION: {r_reason}!")
             print("\n[🚨] RESULT: PIPELINE FAILED. DEPLOYMENT BLOCKED BY SECURITY POLICY.\n")
             return 1
         else:

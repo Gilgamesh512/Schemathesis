@@ -50,9 +50,10 @@ class ConcurrencyBurstResult(BaseModel):
 class ConcurrencyFuzzer:
     """Synchronized burst request runner for detecting Race Condition vulnerabilities."""
 
-    def __init__(self, burst_size: int = 5, timeout: float = 5.0):
+    def __init__(self, burst_size: int = 5, timeout: float = 5.0, http2: bool = True):
         self.burst_size = max(2, burst_size)
         self.timeout = timeout
+        self.http2 = http2
 
     @staticmethod
     def is_candidate_endpoint(endpoint: str, method: str) -> bool:
@@ -72,8 +73,12 @@ class ConcurrencyFuzzer:
         json_data: Any,
         data: Any,
         req_id: int,
+        barrier: Optional[asyncio.Event] = None,
     ) -> tuple[int, int, float, str, dict[str, str]]:
-        """Send a single request with precise latency tracking."""
+        """Send a single request with synchronized barrier trigger and precise latency tracking."""
+        if barrier is not None:
+            await barrier.wait()
+
         t_start = time.perf_counter()
         try:
             resp = await client.request(
@@ -105,7 +110,18 @@ class ConcurrencyFuzzer:
         full_url = f"{base_url.rstrip('/')}{clean_ep}"
         req_headers = dict(headers or {})
 
-        async with httpx.AsyncClient(verify=False) as client:
+        # Attempt HTTP/2 for multiplexed single-connection delivery, fallback to HTTP/1.1
+        client_kwargs: dict[str, Any] = {"verify": False}
+        if self.http2:
+            try:
+                import h2  # noqa: F401
+                client_kwargs["http2"] = True
+            except ImportError:
+                client_kwargs["http2"] = False
+
+        barrier = asyncio.Event()
+
+        async with httpx.AsyncClient(**client_kwargs) as client:
             tasks = [
                 self._send_synchronized_request(
                     client=client,
@@ -115,9 +131,13 @@ class ConcurrencyFuzzer:
                     json_data=json_data,
                     data=data,
                     req_id=i,
+                    barrier=barrier,
                 )
                 for i in range(self.burst_size)
             ]
+            # Yield briefly to event loop so all coroutines are primed at the barrier
+            await asyncio.sleep(0.002)
+            barrier.set()
             responses = await asyncio.gather(*tasks)
 
         status_codes = [r[1] for r in responses]

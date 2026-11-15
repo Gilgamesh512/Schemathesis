@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "schemathesis-api-security"
+version = "2.0.0"
+description = "Enterprise Automated API Security Testing, Fuzzing & DevSecOps Quality Gate Framework"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Schemathesis Security Team" }
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Topic :: Security",
+    "Topic :: Software Development :: Testing",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "schemathesis==4.24.3",
+    "pyyaml>=6.0.2",
+    "pydantic>=2.9.2",
+    "httpx>=0.28.1",
+    "requests>=2.32.3",
+    "rich>=13.9.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "hypothesis>=6.100.0",
+]
+
+[project.scripts]
+schemathesis-sec = "cli.main:main"
+api-gate = "run_all:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "auth*", "cli*", "modules*", "lab*"]

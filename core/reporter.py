@@ -868,14 +868,30 @@ class SecurityReporter:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             sarif_path = self.results_dir / f"report_{timestamp}.sarif"
 
+        # Determine reference schema file for accurate physicalLocation mapping
+        schema_file_ref = ""
+        if target_info:
+            raw_spec = target_info.get("schema") or target_info.get("schema_file") or target_info.get("schema_path") or ""
+            if raw_spec and not str(raw_spec).startswith(("http://", "https://")):
+                try:
+                    rel_p = Path(raw_spec).resolve()
+                    if PROJECT_ROOT in rel_p.parents or rel_p == PROJECT_ROOT:
+                        schema_file_ref = rel_p.relative_to(PROJECT_ROOT).as_posix()
+                    else:
+                        schema_file_ref = Path(raw_spec).as_posix()
+                except Exception:
+                    schema_file_ref = str(raw_spec)
+
         rules_map: dict[str, dict[str, Any]] = {}
         sarif_results: list[dict[str, Any]] = []
+
+        owasp_keys = list(OWASP_METADATA.keys())
 
         for f in findings:
             rule_id = f.get("owasp_category") or "API-SECURITY"
             if rule_id not in rules_map:
                 meta = OWASP_METADATA.get(rule_id, {})
-                rules_map[rule_id] = {
+                rule_entry: dict[str, Any] = {
                     "id": rule_id,
                     "name": meta.get("name", rule_id),
                     "shortDescription": {"text": meta.get("name", rule_id)},
@@ -887,6 +903,16 @@ class SecurityReporter:
                         "level": "error" if f.get("severity") in ("critical", "high") else "warning"
                     },
                 }
+                if rule_id in owasp_keys:
+                    rule_entry["relationships"] = [{
+                        "target": {
+                            "id": rule_id,
+                            "index": owasp_keys.index(rule_id),
+                            "toolComponent": {"name": "OWASP API Security Top 10 2023"}
+                        },
+                        "kinds": ["superset"]
+                    }]
+                rules_map[rule_id] = rule_entry
 
             level = "error" if f.get("severity") in ("critical", "high") else ("warning" if f.get("severity") == "medium" else "note")
             msg_text = (
@@ -895,26 +921,62 @@ class SecurityReporter:
                 f"Confirmed: {f.get('confirmed', False)}. {f.get('evidence', '')}"
             )
 
-            endpoint_raw = str(f.get("endpoint", "/"))
-            endpoint_uri = urllib.parse.quote(endpoint_raw, safe="/:@?&=#%+")
-            sarif_results.append({
+            # Physical location: Prefer relative schema/spec file if available, else standard endpoint URI
+            if schema_file_ref:
+                artifact_uri = schema_file_ref
+            else:
+                endpoint_raw = str(f.get("endpoint", "/"))
+                artifact_uri = urllib.parse.quote(endpoint_raw, safe="/:@?&=#%+")
+
+            finding_props = {
+                "finding_id": f.get("finding_id", ""),
+                "target_app": f.get("target_app", ""),
+                "confirmed": bool(f.get("confirmed", False)),
+                "severity": f.get("severity", "info"),
+                "owasp_category": rule_id,
+                "attack_type": f.get("attack_type", ""),
+                "matched_cve": f.get("matched_cve", []),
+                "cwe_id": f.get("cwe_id") or "CWE-20",
+            }
+
+            res_entry: dict[str, Any] = {
                 "ruleId": rule_id,
                 "level": level,
                 "message": {"text": msg_text},
                 "locations": [{
                     "physicalLocation": {
-                        "artifactLocation": {"uri": endpoint_uri},
-                        "region": {"startLine": 1}
+                        "artifactLocation": {
+                            "uri": artifact_uri,
+                            "uriBaseId": "%SRCROOT%" if schema_file_ref else None,
+                        },
+                        "region": {"startLine": int(f.get("line_number") or 1)}
                     }
                 }],
-                "properties": {
-                    "finding_id": f.get("finding_id", ""),
-                    "target_app": f.get("target_app", ""),
-                    "confirmed": f.get("confirmed", False),
-                    "severity": f.get("severity", "info"),
-                    "matched_cve": f.get("matched_cve", []),
+                "properties": finding_props,
+            }
+            if rule_id in owasp_keys:
+                res_entry["taxa"] = [{
+                    "id": rule_id,
+                    "index": owasp_keys.index(rule_id),
+                    "toolComponent": {"name": "OWASP API Security Top 10 2023"}
+                }]
+            sarif_results.append(res_entry)
+
+        taxonomies = [{
+            "name": "OWASP API Security Top 10 2023",
+            "version": "2023",
+            "organization": "OWASP",
+            "shortDescription": {"text": "OWASP API Security Top 10 Standard (2023)"},
+            "taxa": [
+                {
+                    "id": cid,
+                    "name": c_meta.get("name", cid),
+                    "shortDescription": {"text": c_meta.get("name", cid)},
+                    "helpUri": f"https://owasp.org/API-Security/editions/2023/en/0xa{idx+1}-{cid.lower().replace(':', '-')}/"
                 }
-            })
+                for idx, (cid, c_meta) in enumerate(OWASP_METADATA.items())
+            ]
+        }]
 
         sarif_doc = {
             "version": "2.1.0",
@@ -924,10 +986,12 @@ class SecurityReporter:
                     "driver": {
                         "name": "Schemathesis API Security Fuzzer",
                         "informationUri": "https://github.com/Gilgamesh512/Schemathesis",
-                        "version": "1.0.0",
+                        "version": "2.0.0",
                         "rules": list(rules_map.values()),
+                        "supportedTaxonomies": [{"name": "OWASP API Security Top 10 2023"}],
                     }
                 },
+                "taxonomies": taxonomies,
                 "results": sarif_results,
             }]
         }

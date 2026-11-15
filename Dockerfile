@@ -43,6 +43,10 @@ RUN mkdir -p /app/results /app/targets /app/config && \
 
 USER scanner
 
+# Container Healthcheck probe to verify Python runtime responsiveness
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD python -c "import sys; sys.exit(0)" || exit 1
+
 # Default volume mount points for scan results and targets
 VOLUME ["/app/results", "/app/targets"]
 

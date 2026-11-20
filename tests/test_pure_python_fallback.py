@@ -60,7 +60,9 @@ def test_jsonschema_rs_shim_installation_and_attributes():
     assert cloned is not test_dict
 
     serialized = shim.canonical.json.to_string(test_dict)
-    assert '"a": 1' in serialized
+    assert ('"a":1' in serialized) or ('"a": 1' in serialized)
+    import json
+    assert json.loads(serialized) == test_dict
 
     # Check registry resolver
     reg = shim.Registry([("urn:test", {})])

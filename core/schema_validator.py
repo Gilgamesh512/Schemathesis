@@ -137,7 +137,7 @@ def install_jsonschema_rs_shim_if_needed() -> bool:
     class CanonicalJson:
         @staticmethod
         def to_string(value: Any) -> str:
-            return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+            return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'), default=str)
 
     class CanonicalModule:
         class CanonicalizationError(Exception):

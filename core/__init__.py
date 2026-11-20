@@ -65,6 +65,28 @@ from .header_tamper_fuzzer import (
     HeaderTamperResult,
 )
 from .path_manager import ProjectPaths, resolve_project_root, safe_project_path
+from .schema_validator import (
+    PurePythonSchemaValidator,
+    install_jsonschema_rs_shim_if_needed,
+)
+from .session_keeper import (
+    AuthAutomationConfig,
+    SessionKeeper,
+    decode_jwt_unverified,
+    is_jwt_expired_or_expiring,
+)
+from .graphql_advanced_auditor import (
+    GraphQLAdvancedAuditor,
+    GraphQLAuditResult,
+)
+from .proxy_rotator import (
+    ProxyRotator,
+    ProxyState,
+)
+from .remediation_engine import (
+    RemediationEngine,
+    RemediationSnippet,
+)
 from .pii_detector import (
     PiiDetector,
     PiiMatch,
@@ -185,4 +207,16 @@ __all__ = [
     "CreatedResource",
     "get_audit_headers",
     "verify_deep_state_persistence",
+    "PurePythonSchemaValidator",
+    "install_jsonschema_rs_shim_if_needed",
+    "AuthAutomationConfig",
+    "SessionKeeper",
+    "decode_jwt_unverified",
+    "is_jwt_expired_or_expiring",
+    "GraphQLAdvancedAuditor",
+    "GraphQLAuditResult",
+    "ProxyRotator",
+    "ProxyState",
+    "RemediationEngine",
+    "RemediationSnippet",
 ]

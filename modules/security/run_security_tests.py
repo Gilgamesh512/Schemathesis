@@ -36,6 +36,11 @@ from core import (
     ResourceExhaustionFuzzer,
     get_audit_headers,
     CleanupTracker,
+    GraphQLAdvancedAuditor,
+    GraphQLAuditResult,
+    ProxyRotator,
+    SessionKeeper,
+    AuthAutomationConfig,
 )
 
 try:
@@ -640,6 +645,46 @@ def run_resource_exhaustion_audit(
     return all_findings
 
 
+def run_graphql_advanced_audit(
+    base_url: str,
+    endpoint: str = "/graphql",
+    headers: dict[str, str] | None = None,
+    proxy: str | None = None,
+    insecure: bool = False,
+    batch_size: int = 20,
+    alias_count: int = 100,
+) -> list[Finding]:
+    """Audit GraphQL endpoint for Query Batching, Alias Overload DoS, and Introspection Exposure (OWASP API4:2023)."""
+    banner("GRAPHQL ADVANCED SECURITY AUDIT (QUERY BATCHING & ALIAS DoS)")
+    auditor = GraphQLAdvancedAuditor()
+    print(f"[i] Testing endpoint: {endpoint} on {base_url}")
+    print(f"[i] Probing Query Batching ({batch_size} queries) & Alias Overload ({alias_count} aliases)...")
+
+    run_id = f"gql-adv-audit-{uuid.uuid4().hex[:8]}"
+    try:
+        res = asyncio.run(
+            auditor.audit_endpoint(
+                base_url=base_url,
+                endpoint=endpoint,
+                headers=headers,
+                proxy=proxy,
+                insecure=insecure,
+                run_id=run_id,
+                batch_size=batch_size,
+                alias_count=alias_count,
+            )
+        )
+        for f in res.findings:
+            sig = f.evidence.response_signal[0] if f.evidence.response_signal else "Vulnerability detected"
+            print(f"[!] CONFIRMED GRAPHQL VULNERABILITY: {f.attack_type} -> {sig}")
+        if not res.findings:
+            print("[+] GraphQL advanced audit completed: Query batching is disabled or restricted, and complexity limits are enforced.")
+        return res.findings
+    except Exception as exc:
+        print(f"[!] GraphQL advanced audit error: {exc}")
+        return []
+
+
 def run_dynamic_target(
     *,
     url: str,
@@ -661,6 +706,9 @@ def run_dynamic_target(
     verify_pii: bool = False,
     verify_headers: bool = False,
     verify_resources: bool = False,
+    verify_graphql_advanced: bool = False,
+    proxy_pool: str | None = None,
+    auth_automation: dict[str, Any] | None = None,
     concurrency_burst: int = 5,
     callback_url: str | None = None,
     callback_poll_url: str | None = None,
@@ -769,6 +817,29 @@ def run_dynamic_target(
         if "headers" not in auth:
             auth["headers"] = {}
         auth["headers"].update(get_audit_headers())
+
+    session_keeper: SessionKeeper | None = None
+    if auth_automation:
+        session_keeper = SessionKeeper(auth_automation, base_url=url)
+        if not auth_token:
+            try:
+                tok = asyncio.run(session_keeper.ensure_valid_token(proxy=proxy, insecure=insecure))
+                hdr = session_keeper.get_auth_header()
+                if hdr:
+                    auth_token = hdr
+                    auth["header"] = normalize_auth_header(hdr)
+                    print("[+] Auth Automation: Successfully initialized session token.")
+            except Exception as exc:
+                print(f"[!] Auth Automation initial login warning: {exc}")
+
+    rotator: ProxyRotator | None = None
+    effective_proxy = proxy
+    if proxy_pool:
+        rotator = ProxyRotator.from_source(proxy_pool)
+        first_proxy = asyncio.run(rotator.get_next_proxy())
+        if first_proxy:
+            effective_proxy = first_proxy
+        print(f"[+] Smart Proxy Pool activated ({rotator.count} proxies). Active: {effective_proxy}")
 
     mgr = targets or TargetManager(PROJECT_ROOT)
     # If target_id collides in manager, give it a unique suffix
@@ -901,6 +972,21 @@ def run_dynamic_target(
                 RESULTS.append_findings(
                     res_findings,
                     source="resource_exhaustion_fuzzer",
+                    fieldnames=list(Finding.model_fields.keys()),
+                )
+
+        if verify_graphql_advanced or (protocol == "graphql"):
+            gql_findings = run_graphql_advanced_audit(
+                base_url=url,
+                endpoint=settings.get("endpoint", "/graphql"),
+                headers={"Authorization": auth_token} if auth_token else {},
+                proxy=proxy,
+                insecure=insecure,
+            )
+            if gql_findings:
+                RESULTS.append_findings(
+                    gql_findings,
+                    source="graphql_advanced_auditor",
                     fieldnames=list(Finding.model_fields.keys()),
                 )
 
@@ -1096,6 +1182,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verify-pii", action="store_true", help="Audit response bodies for PII, tokens, and secret leakage (OWASP API3:2023)")
     parser.add_argument("--verify-headers", action="store_true", help="Audit reverse proxy routing integrity and cache poisoning (OWASP API8:2023)")
     parser.add_argument("--verify-resources", action="store_true", help="Audit endpoints for ReDoS and payload size inflation (OWASP API4:2023)")
+    parser.add_argument("--verify-graphql-advanced", action="store_true", help="Audit GraphQL for Query Batching and Field Alias Overload DoS (OWASP API4:2023)")
+    parser.add_argument("--proxy-pool", default=None, help="Path to proxy list file or comma-separated proxy URLs")
+    parser.add_argument("--login-url", default=None, help="Automated login URL for generic token refreshing")
+    parser.add_argument("--login-body", default=None, help="JSON body for automated login request")
+    parser.add_argument("--token-extract", default="json:access_token", help="Extraction rule for session token")
     parser.add_argument("--concurrency-burst", type=int, default=5, help="Number of synchronized burst requests (default: 5)")
     parser.add_argument("--callback-url", default=None, help="External canary callback URL for OOB SSRF detection")
     parser.add_argument("--poll-url", default=None, help="External Canary API polling endpoint URL (use {token} placeholder)")
@@ -1121,6 +1212,20 @@ def main(argv: list[str] | None = None) -> int:
 
     # Dynamic target scan mode:
     if args.url:
+        auth_auto_dict = None
+        if args.login_url:
+            payload_data: dict[str, Any] = {}
+            if args.login_body:
+                try:
+                    payload_data = json.loads(args.login_body)
+                except Exception:
+                    payload_data = {"data": args.login_body}
+            auth_auto_dict = {
+                "login_url": args.login_url,
+                "payload": payload_data,
+                "token_extraction": args.token_extract or "json:access_token",
+            }
+
         return run_dynamic_target(
             url=args.url,
             schema=args.schema,
@@ -1140,6 +1245,9 @@ def main(argv: list[str] | None = None) -> int:
             verify_pii=args.verify_pii,
             verify_headers=args.verify_headers,
             verify_resources=args.verify_resources,
+            verify_graphql_advanced=args.verify_graphql_advanced,
+            proxy_pool=args.proxy_pool,
+            auth_automation=auth_auto_dict,
             concurrency_burst=args.concurrency_burst,
             callback_url=args.callback_url,
             callback_poll_url=args.poll_url,

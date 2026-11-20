@@ -161,6 +161,7 @@ def _menu_quick_scan() -> None:
         endpoint=endpoint,
         proxy=proxy,
         insecure=insecure,
+        verify_graphql_advanced=(protocol == "graphql"),
         name=custom_name,
         save_profile=save_profile,
         targets=TARGETS,

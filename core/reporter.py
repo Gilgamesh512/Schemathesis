@@ -19,6 +19,7 @@ from typing import Any, Optional
 
 from .path_manager import ProjectPaths
 from .curl_builder import build_curl_command, build_curl_from_finding, build_curl_dual_from_finding
+from .remediation_engine import RemediationEngine
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -401,6 +402,21 @@ class SecurityReporter:
                 "Ensure inputs are validated against schema, enforce authentication/authorization checks, and sanitize responses.",
             )
 
+            # Framework-Specific Remediation Snippet
+            snippet = RemediationEngine.get_snippet(owasp_cat)
+            snippet_html = ""
+            if snippet:
+                snippet_html = f"""
+                <div class="code-patch-box" style="margin-top: 10px; background: #0b1329; border: 1px solid #1e293b; border-radius: 6px; padding: 12px;">
+                    <div style="font-weight: 600; color: #38bdf8; margin-bottom: 4px; font-size: 13px;">
+                        🛠️ Idiomatic Fix Pattern ({html.escape(snippet.framework)}): {html.escape(snippet.title)}
+                    </div>
+                    <p style="font-size: 12px; color: #94a3b8; margin: 4px 0 8px 0;">{html.escape(snippet.explanation)}</p>
+                    <div style="font-size: 11px; font-weight: 600; color: #4ade80; margin-bottom: 4px;">✓ Secure Implementation:</div>
+                    <pre class="code-box" style="background: #020617; color: #4ade80; margin: 0; padding: 8px; border-radius: 4px; font-size: 12px; white-space: pre-wrap;"><code>{html.escape(snippet.secure_example)}</code></pre>
+                </div>
+                """
+
             cve_badges = "".join(
                 f'<span class="cve-tag">{html.escape(c)}</span>'
                 for c in (f.get("matched_cve") or [])
@@ -455,6 +471,7 @@ class SecurityReporter:
                     <div class="remediation-box">
                         <strong>🛡️ Recommended Remediation:</strong>
                         <p>{html.escape(remediation)}</p>
+                        {snippet_html}
                     </div>
                 </div>
             </div>
@@ -908,13 +925,20 @@ class SecurityReporter:
             rule_id = f.get("owasp_category") or "API-SECURITY"
             if rule_id not in rules_map:
                 meta = OWASP_METADATA.get(rule_id, {})
+                help_text = meta.get("remediation", "Apply strict authorization, input validation, and access controls.")
+                sarif_snippet = RemediationEngine.get_snippet(rule_id)
+                help_md = help_text
+                if sarif_snippet:
+                    help_md += f"\n\n### Recommended Fix ({sarif_snippet.framework})\n\n```\n{sarif_snippet.secure_example}\n```"
+
                 rule_entry: dict[str, Any] = {
                     "id": rule_id,
                     "name": meta.get("name", rule_id),
                     "shortDescription": {"text": meta.get("name", rule_id)},
                     "fullDescription": {"text": f"OWASP API Security Top 10 category {rule_id}"},
                     "help": {
-                        "text": meta.get("remediation", "Apply strict authorization, input validation, and access controls.")
+                        "text": help_text,
+                        "markdown": help_md,
                     },
                     "defaultConfiguration": {
                         "level": "error" if f.get("severity") in ("critical", "high") else "warning"

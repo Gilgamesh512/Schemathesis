@@ -27,7 +27,9 @@ class RequestScheduler:
                  max_retries: int = 2,
                  pause_threshold: int = 5,
                  abort_threshold: int = 15,
-                 pause_duration: float = 15.0):
+                 pause_duration: float = 15.0,
+                 proxy_rotator: Optional[Any] = None,
+                 session_keeper: Optional[Any] = None):
         self.sem = asyncio.Semaphore(max(1, concurrency))
         self.global_interval = 1 / global_rps if global_rps > 0 else 0
         self.target_intervals = {
@@ -43,6 +45,8 @@ class RequestScheduler:
         self.pause_threshold = pause_threshold
         self.abort_threshold = abort_threshold
         self.pause_duration = pause_duration
+        self.proxy_rotator = proxy_rotator
+        self.session_keeper = session_keeper
 
     async def _pace(self, target: str) -> None:
         async with self._lock:
@@ -57,7 +61,7 @@ class RequestScheduler:
             self._last_global = timestamp
             self._last_target[target_key] = timestamp
 
-    async def request(self, target: str, operation):
+    async def request(self, target: str, operation, role: str = "default", proxy_url: Optional[str] = None):
         target_key = target.lower()
         if self.circuit_tripped.get(target_key, False):
             raise CircuitBreakerTrippedError(
@@ -101,6 +105,16 @@ class RequestScheduler:
                     else:
                         # Successful request or normal client error (2xx, 3xx, 4xx except 5xx) resets error streak
                         self.consecutive_server_errors[target_key] = 0
+
+                # Reactive Session Refresh on 401/403
+                if status in (401, 403) and self.session_keeper is not None and attempt < self.max_retries:
+                    refreshed, _ = await self.session_keeper.handle_response(status, role=role)
+                    if refreshed:
+                        continue
+
+                # Proxy Rotator notification on Throttled / Blocked
+                if status in (429, 403, 503) and self.proxy_rotator is not None:
+                    await self.proxy_rotator.report_response(proxy_url, status)
 
                 if last_exc is not None and attempt >= self.max_retries:
                     raise last_exc

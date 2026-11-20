@@ -40,9 +40,14 @@ from modules.security import rules_engine
 from core import (ConfirmationEngine, Evidence, Finding, RequestScheduler,
                   ProjectPaths, ResultManager, SchemaManager, content_hash,
                   redact_headers, snapshot_response, stable_finding_id,
-                  FeedbackAnalyzer, SemanticMutationEngine, ParamSchema)
+                  FeedbackAnalyzer, SemanticMutationEngine, ParamSchema,
+                  CleanupTracker, get_audit_headers, verify_deep_state_persistence)
 
 PROJECT_PATHS = ProjectPaths.from_root(PROJECT_ROOT)
+GLOBAL_CLEANUP_TRACKER = CleanupTracker(
+    run_id="schemathesis-run",
+    out_dir=PROJECT_PATHS.results,
+)
 
 # --------------------------------------------------------------------------
 # 1. Payload Model
@@ -308,10 +313,21 @@ def load_targets(
     return targets
 
 
-def schema_payloads(targets: dict[str, tuple]) -> list[Payload]:
+def schema_payloads(targets: dict[str, tuple], seed_corpus: Any = None) -> list[Payload]:
     """Create built-in schema-conforming security mutation payloads from OpenAPI operations."""
     generated: list[Payload] = []
     import re
+
+    # Auto-load Live Seed Corpus if HAR traffic source is provided
+    if seed_corpus is None:
+        har_env = os.environ.get("SCHEMATHESIS_SEED_CORPUS")
+        if har_env and Path(har_env).is_file():
+            try:
+                from core import parse_har_file
+                seed_corpus = parse_har_file(har_env)
+            except Exception:
+                pass
+
     for target_name, (schema, _) in sorted(targets.items()):
         for result in schema.get_all_operations():
             if not result.ok():
@@ -342,7 +358,7 @@ def schema_payloads(targets: dict[str, tuple]) -> list[Payload]:
                     p_def = getattr(p, "definition", {})
 
                     param_schema = SemanticMutationEngine.inspect_param(p_name, loc_str, p_def)
-                    probes = SemanticMutationEngine.generate_probes(param_schema)
+                    probes = SemanticMutationEngine.generate_probes(param_schema, seed_corpus=seed_corpus)
 
                     for probe in probes:
                         generated.append(Payload(
@@ -367,7 +383,7 @@ def schema_payloads(targets: dict[str, tuple]) -> list[Payload]:
                     continue
                 parameters_seen.add(p_name)
                 param_schema = SemanticMutationEngine.inspect_param(p_name, "path", {})
-                probes = SemanticMutationEngine.generate_probes(param_schema)
+                probes = SemanticMutationEngine.generate_probes(param_schema, seed_corpus=seed_corpus)
                 for probe in probes:
                     generated.append(Payload(
                         endpoint=operation.path,
@@ -879,6 +895,66 @@ async def process_fingerprint_group(
                     confirmed = False
                     severity = "info"
                     evidence = f"HTTP {status_code}; Access denied as expected for User 2 (Authorization properly enforced)"
+
+            # Deep State Loopback Verification for Mass Assignment (API3:2023)
+            if pc.payload.attack_type.upper() == "MASS_ASSIGNMENT" and status_code in (200, 201) and resp is not None:
+                loopback_url = None
+                resp_headers = dict(resp.headers)
+                loc_header = resp_headers.get("location") or resp_headers.get("Location")
+                if loc_header:
+                    loopback_url = str(loc_header)
+                elif pc.payload.method.upper() in ("PUT", "PATCH"):
+                    loopback_url = pc.payload.endpoint
+                else:
+                    try:
+                        resp_json = resp.json()
+                        if isinstance(resp_json, dict):
+                            for id_k in ("id", "user_id", "userId", "uuid"):
+                                if id_k in resp_json and resp_json[id_k] is not None:
+                                    loopback_url = f"{pc.payload.endpoint.rstrip('/')}/{resp_json[id_k]}"
+                                    break
+                    except Exception:
+                        pass
+
+                if loopback_url:
+                    full_get_url = loopback_url if loopback_url.startswith(("http://", "https://")) else f"{pc.base_url.rstrip('/')}/{loopback_url.lstrip('/')}"
+                    try:
+                        is_persisted, verify_msg = verify_deep_state_persistence(
+                            get_url=full_get_url,
+                            expected_field=pc.payload.target_param,
+                            expected_value="admin" if pc.payload.target_param in ("role", "is_admin") else payload_value,
+                            headers=headers,
+                        )
+                        if is_persisted:
+                            confirmed = True
+                            confidence = 0.98
+                            severity = "critical" if pc.payload.target_param in ("role", "is_admin", "admin") else "high"
+                            evidence = f"HTTP {status_code}; {verify_msg}"
+                        else:
+                            confirmed = False
+                            severity = "info"
+                            evidence = f"HTTP {status_code}; Loopback verification unpersisted: {verify_msg}"
+                    except Exception as verify_err:
+                        evidence += f" (Loopback check: {verify_err})"
+
+            # Staging Safety: Record successful mutations in CleanupTracker
+            if pc.payload.method.upper() in ("POST", "PUT", "PATCH") and status_code in (200, 201, 202, 204) and resp is not None:
+                try:
+                    resp_data = None
+                    try:
+                        resp_data = resp.json()
+                    except Exception:
+                        resp_data = resp.text
+                    GLOBAL_CLEANUP_TRACKER.record_mutation(
+                        method=pc.payload.method,
+                        target_url=pc.base_url,
+                        endpoint=pc.payload.endpoint,
+                        status_code=status_code,
+                        response_data=resp_data,
+                        response_headers=dict(resp.headers),
+                    )
+                except Exception:
+                    pass
         elapsed_ms = result.attack.response_time_ms if result and result.attack else 0
 
         payload_value = pc.payload.payload_value
@@ -948,6 +1024,9 @@ async def run_all(prepared: list[PreparedCase], headers: dict,
     for pc in prepared:
         groups.setdefault(pc.fingerprint, []).append(pc)
 
+    merged_headers = dict(headers or {})
+    merged_headers.update(get_audit_headers(STATE_RUN_ID.get() or "schemathesis-run"))
+
     scheduler = RequestScheduler(concurrency=concurrency, global_rps=global_rps)
     client_kwargs: dict[str, Any] = {"timeout": 20.0}
     proxy_url = proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("ALL_PROXY")
@@ -959,7 +1038,7 @@ async def run_all(prepared: list[PreparedCase], headers: dict,
     async with httpx.AsyncClient(**client_kwargs) as client:
         tasks = [
             process_fingerprint_group(
-                client, scheduler, fp, group, headers,
+                client, scheduler, fp, group, merged_headers,
                 rules, state, rate_limit_ms / 1000,
                 user2_headers=user2_headers,
             )
@@ -1152,6 +1231,14 @@ def main():
             "payload_mode": "custom" if args.payloads else "openapi",
         },
     )
+
+    try:
+        GLOBAL_CLEANUP_TRACKER.run_id = run_id
+        manifest_path = GLOBAL_CLEANUP_TRACKER.write_manifest()
+        if GLOBAL_CLEANUP_TRACKER.created_resources:
+            print(f"[🛡️] Staging Safety: Ghi nhan {len(GLOBAL_CLEANUP_TRACKER.created_resources)} tai nguyen vao {manifest_file.name}")
+    except Exception:
+        pass
 
     print(f"[XONG] run_id={run_id} | chuan_bi={total_prepared}/{total_payloads} "
           f"| ban={total_fired} | bo_qua(dedup)={total_skipped} "

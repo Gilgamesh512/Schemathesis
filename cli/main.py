@@ -30,6 +30,9 @@ from core import (
     TargetConfig,
     TargetManager,
     discover_api,
+    parse_har_file,
+    CleanupTracker,
+    CreatedResource,
 )
 from modules.security.run_security_tests import (
     normalize_auth_header,
@@ -74,6 +77,7 @@ def _render_menu_banner() -> None:
     print("  \033[1;32m[7]\033[0m 🔄 \033[1mRun Stateful Workflow YAML\033[0m (Multi-step business logic & BOLA testing)")
     print("  \033[1;32m[8]\033[0m 🤖 \033[1mAuto-Synthesize BOLA Workflows\033[0m (Zero-YAML Autonomous API Dependency Graph)")
     print("  \033[1;33m[9]\033[0m 🧪 \033[1mDemo Labs & Docker\033[0m (crAPI, VAmPI, DVGA container operations)")
+    print("  \033[1;32m[10]\033[0m 🌐 \033[1mTraffic Ingestion Scan\033[0m (Ingest Chrome/Burp .HAR file for live seeds & token)")
     print("  \033[1;31m[q]\033[0m 🚪 \033[1mExit\033[0m")
     print("\033[90m" + "─" * 97 + "\033[0m")
 
@@ -448,11 +452,99 @@ def _menu_auto_workflow() -> None:
     _safe_input("\nPress Enter to return to main menu...")
 
 
+def _menu_scan_har() -> None:
+    print("\n\033[1;36m🌐 Traffic-Driven HAR Ingestion Scan\033[0m")
+    har_path = _safe_input("Enter path to .har file (e.g. session.har): ")
+    if not har_path or not Path(har_path).exists():
+        print(f"[!] File not found: {har_path}")
+        _safe_input("\nPress Enter to return...")
+        return
+
+    # Parse HAR to discover hosts and tokens dynamically
+    try:
+        corpus = parse_har_file(har_path)
+    except Exception as e:
+        print(f"[!] Error parsing HAR file: {e}")
+        _safe_input("\nPress Enter to return...")
+        return
+
+    hosts = sorted(list(corpus.discovered_hosts))
+    if hosts:
+        print("\n[+] Discovered Target Host(s) in HAR traffic:")
+        for idx, h in enumerate(hosts, start=1):
+            print(f"    \033[1;32m[{idx}]\033[0m {h}")
+        def_host = hosts[0]
+        def_url = f"https://{def_host}" if not def_host.startswith("http") else def_host
+        url_input = _safe_input(f"\nEnter Target API Base URL or select [1-{len(hosts)}, default {def_url}]: ")
+        if not url_input:
+            url = def_url
+        elif url_input.isdigit() and 1 <= int(url_input) <= len(hosts):
+            sel_host = hosts[int(url_input) - 1]
+            url = f"https://{sel_host}" if not sel_host.startswith("http") else sel_host
+        else:
+            url = url_input
+    else:
+        url = _safe_input("Enter Target API Base URL (e.g. https://api.enterprise.com): ")
+        if not url:
+            return
+
+    # Suggest token from HAR
+    suggested_token = corpus.suggest_auth_token()
+    if suggested_token:
+        print(f"[+] Found Auth Header/Token in HAR traffic: {suggested_token[:35]}...")
+        token_input = _safe_input("Enter Auth Token (leave blank to use auto-detected): ")
+        token = token_input if token_input else suggested_token
+    else:
+        token = _safe_input("Enter Auth Token (optional, Bearer token, JWT, or 'Header: Value'): ")
+
+    try:
+        exit_code = run_dynamic_target(
+            url=url,
+            har=har_path,
+            auth_token=token if token else None,
+            safe_staging=True,
+        )
+        if exit_code == 0:
+            # Check if rollback cleanup is needed
+            manifest_path = RESULTS.results_dir / "cleanup_manifest.json"
+            if manifest_path.exists():
+                try:
+                    import json
+                    m_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    tot = m_data.get("total_created_resources", 0)
+                    if tot > 0:
+                        rollback_ans = _safe_input(f"\n🧹 Staging Safety: {tot} created resource(s) tracked. Execute auto-rollback DELETE now? [y/N]: ").lower()
+                        if rollback_ans in ("y", "yes"):
+                            tracker = CleanupTracker(m_data.get("run_id", "rollback"), out_dir=RESULTS.results_dir)
+                            for r_dict in m_data.get("resources", []):
+                                tracker.created_resources.append(CreatedResource(
+                                    run_id=m_data.get("run_id", ""),
+                                    target_url=url,
+                                    endpoint=r_dict.get("endpoint", ""),
+                                    method=r_dict.get("method", "POST"),
+                                    created_id=r_dict.get("created_id"),
+                                    rollback_method=r_dict.get("rollback_method", "DELETE"),
+                                    rollback_url=r_dict.get("rollback_url", ""),
+                                    status_code=r_dict.get("status_code", 200),
+                                    timestamp=r_dict.get("timestamp", ""),
+                                ))
+                            res = tracker.execute_auto_cleanup(base_url=url, headers={"Authorization": token} if token else None)
+                            print(f"[+] Rollback complete: {res['deleted']} deleted, {res['skipped']} skipped, {res['failed']} failed.")
+                except Exception as exc:
+                    print(f"[!] Rollback check note: {exc}")
+
+            latest = RESULTS.results_dir / "latest_report.html"
+            _prompt_open_browser(latest)
+    except Exception as exc:
+        print(f"\n[X] Scan failed: {exc}", file=sys.stderr)
+    _safe_input("\nPress Enter to return to main menu...")
+
+
 def interactive_terminal_ui() -> int:
     """Run full interactive terminal website / console."""
     while True:
         _render_menu_banner()
-        choice = _safe_input("Enter choice [1-9, q]: ").strip().lower()
+        choice = _safe_input("Enter choice [1-10, q]: ").strip().lower()
 
         if choice in {"q", "quit", "exit"}:
             print("\nGoodbye! Happy security testing.")
@@ -475,8 +567,10 @@ def interactive_terminal_ui() -> int:
             _menu_auto_workflow()
         elif choice == "9":
             _menu_demo_labs()
+        elif choice == "10":
+            _menu_scan_har()
         else:
-            print("\n[!] Invalid choice. Please enter 1-9 or q.")
+            print("\n[!] Invalid choice. Please enter 1-10 or q.")
         print()
 
 

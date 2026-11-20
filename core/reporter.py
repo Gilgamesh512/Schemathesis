@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .path_manager import ProjectPaths
+from .curl_builder import build_curl_command, build_curl_from_finding, build_curl_dual_from_finding
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -388,6 +389,11 @@ class SecurityReporter:
             else:
                 payload_str = str(raw_payload or "")
 
+            # 1-Click cURL reproduction command (Cross-Platform: Bash/PowerShell & Windows CMD)
+            curl_dual = build_curl_dual_from_finding(f, base_url=target_url)
+            curl_bash = f.get("curl_command") or curl_dual["bash"]
+            curl_win_cmd = curl_dual["cmd"]
+
             # Remediation
             owasp_cat = f.get("owasp_category") or ""
             remediation = OWASP_METADATA.get(owasp_cat, {}).get(
@@ -433,6 +439,17 @@ class SecurityReporter:
                     <div class="detail-box full-width">
                         <h4>Fuzzing Payload</h4>
                         <pre class="code-box"><code>{html.escape(payload_str)}</code></pre>
+                    </div>
+
+                    <div class="detail-box full-width" style="margin-top: 10px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                            <h4 style="margin: 0;">1-Click Reproduction (cURL)</h4>
+                            <div style="display: flex; gap: 6px;">
+                                <button onclick="navigator.clipboard.writeText(this.getAttribute('data-curl')); this.innerText='✓ Copied!';" data-curl="{html.escape(curl_bash)}" style="background: #38bdf8; color: #04101d; border: none; padding: 4px 10px; border-radius: 4px; font-weight: 600; cursor: pointer; font-size: 11px;">📋 Bash / PowerShell</button>
+                                <button onclick="navigator.clipboard.writeText(this.getAttribute('data-curl')); this.innerText='✓ Copied!';" data-curl="{html.escape(curl_win_cmd)}" style="background: #0284c7; color: #ffffff; border: none; padding: 4px 10px; border-radius: 4px; font-weight: 600; cursor: pointer; font-size: 11px;">📋 Windows CMD</button>
+                            </div>
+                        </div>
+                        <pre class="code-box" style="background: #020617; color: #38bdf8;"><code>{html.escape(curl_bash)}</code></pre>
                     </div>
 
                     <div class="remediation-box">
@@ -938,6 +955,8 @@ class SecurityReporter:
                 "matched_cve": f.get("matched_cve", []),
                 "cwe_id": f.get("cwe_id") or "CWE-20",
             }
+            if f.get("curl_command"):
+                finding_props["curl_command"] = f.get("curl_command")
 
             res_entry: dict[str, Any] = {
                 "ruleId": rule_id,

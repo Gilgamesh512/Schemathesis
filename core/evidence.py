@@ -334,3 +334,49 @@ class Finding(BaseModel):
     cve_matches: list[str] = Field(default_factory=list)
     cve_match_type: str = ""
     cve_confidence: float = 0.0
+    curl_command: Optional[str] = None
+
+
+def verify_deep_state_persistence(
+    get_url: str,
+    expected_field: str,
+    expected_value: Any,
+    headers: Optional[dict[str, Any]] = None,
+    timeout: float = 5.0,
+    verify_ssl: bool = True,
+) -> tuple[bool, str]:
+    """Deep State Loopback Verification: Gọi GET đối ứng để xác minh dữ liệu thực sự có bị biến đổi trong DB hay không.
+    
+    Giúp triệt tiêu False Positive (khi server trả về 200/201 nhưng thực chất bỏ qua trường độc hoặc chỉ là echo DTO).
+    Trả về (is_persisted, details_message).
+    """
+    import requests
+    try:
+        resp = requests.get(get_url, headers=headers or {}, timeout=timeout, verify=verify_ssl)
+        if resp.status_code != 200:
+            return False, f"Loopback GET returned HTTP {resp.status_code}"
+        
+        try:
+            data = resp.json()
+        except Exception:
+            return False, "Loopback GET response is not valid JSON"
+
+        # Đệ quy kiểm tra trường và giá trị trong JSON
+        def _check_in_dict(obj: Any) -> bool:
+            if isinstance(obj, dict):
+                if expected_field in obj:
+                    val = obj[expected_field]
+                    if expected_value is None or str(val).lower() == str(expected_value).lower():
+                        return True
+                return any(_check_in_dict(v) for v in obj.values())
+            elif isinstance(obj, list):
+                return any(_check_in_dict(item) for item in obj)
+            return False
+
+        if _check_in_dict(data):
+            return True, f"Verified: Field '{expected_field}' with value '{expected_value}' actively persisted in DB state."
+        else:
+            return False, f"Unpersisted: Field '{expected_field}' was NOT found or did not match in DB state (Echo DTO / Ignored)."
+    except Exception as exc:
+        return False, f"Loopback verification failed with exception: {exc}"
+

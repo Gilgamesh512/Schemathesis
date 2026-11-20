@@ -95,9 +95,78 @@ class SemanticMutationEngine:
         )
 
     @classmethod
-    def generate_probes(cls, schema: ParamSchema) -> list[SemanticProbe]:
-        """Generate schema-conforming security mutation probes tailored to the parameter schema."""
+    def generate_probes(
+        cls,
+        schema: ParamSchema,
+        seed_value: Any = None,
+        seed_corpus: Any = None,
+    ) -> list[SemanticProbe]:
+        """Generate schema-conforming security mutation probes tailored to the parameter schema.
+        
+        If a real-world seed value or SeedCorpus (from HAR or traffic) is provided, intelligently
+        anchors mutation probes to actual live data (Neighbor ID BOLA, seed-embedded SQL canary)
+        bypassing strict validation gates without hardcoding.
+        """
         probes: list[SemanticProbe] = []
+
+        # -------------------------------------------------------------
+        # 0. Live Seed Corpus Anchored Probes (Enterprise Cross-Pollination)
+        # -------------------------------------------------------------
+        resolved_seed = seed_value
+        if resolved_seed is None and seed_corpus is not None:
+            resolved_seed = getattr(seed_corpus, "get_seed_for_param", lambda _: None)(schema.name)
+
+        if resolved_seed is not None:
+            # 0a. Integer / Digit Seed Mutation (Neighbor ID BOLA)
+            if isinstance(resolved_seed, int) or (isinstance(resolved_seed, str) and resolved_seed.isdigit()):
+                int_seed = int(resolved_seed)
+                probes.append(SemanticProbe(
+                    attack_type="BOLA",
+                    payload_value=int_seed + 1,
+                    owasp_category="API1:2023",
+                    expected_signal=["admin", "user", "id", "created_at"],
+                    description=f"Live seed successor BOLA probe (seed={int_seed} -> {int_seed + 1})",
+                ))
+                if int_seed > 0:
+                    probes.append(SemanticProbe(
+                        attack_type="BOLA",
+                        payload_value=int_seed - 1,
+                        owasp_category="API1:2023",
+                        expected_signal=["admin", "user", "id", "created_at"],
+                        description=f"Live seed predecessor BOLA probe (seed={int_seed} -> {int_seed - 1})",
+                    ))
+            elif isinstance(resolved_seed, str) and len(resolved_seed) > 0:
+                # 0b. String / UUID / Code Seed Mutation
+                if schema.format == "uuid" or ("-" in resolved_seed and len(resolved_seed) == 36):
+                    last_c = resolved_seed[-1]
+                    repl = "0" if last_c != "0" else "1"
+                    mutated_uuid = resolved_seed[:-1] + repl
+                    probes.append(SemanticProbe(
+                        attack_type="BOLA",
+                        payload_value=mutated_uuid,
+                        owasp_category="API1:2023",
+                        expected_signal=["admin", "user", "id", "created_at"],
+                        description=f"Live UUID seed mutation BOLA probe ({mutated_uuid})",
+                    ))
+                else:
+                    last_c = resolved_seed[-1]
+                    repl = chr(ord(last_c) + 1) if last_c.isalnum() else "1"
+                    mutated_str = resolved_seed[:-1] + repl
+                    probes.append(SemanticProbe(
+                        attack_type="BOLA",
+                        payload_value=mutated_str,
+                        owasp_category="API1:2023",
+                        expected_signal=["admin", "user", "id"],
+                        description=f"Live alphanumeric seed mutation BOLA probe ({mutated_str})",
+                    ))
+                # 0c. Live Seed-Anchored SQL Canary
+                probes.append(SemanticProbe(
+                    attack_type="SQL_INJECTION",
+                    payload_value=f"{resolved_seed}' OR '1'='1",
+                    owasp_category="API8:2023",
+                    expected_signal=["sql", "syntax", "postgres", "sqlite", "traceback"],
+                    description=f"Live seed-anchored SQL injection probe ({resolved_seed})",
+                ))
 
         # -------------------------------------------------------------
         # 1. UUID Type / Format

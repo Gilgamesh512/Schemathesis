@@ -6,6 +6,17 @@ from .callback_verifier import (
     CallbackVerifier,
     LocalCallbackListener,
 )
+from .curl_builder import (
+    build_curl_command,
+    build_curl_from_finding,
+    build_curl_dual,
+    build_curl_dual_from_finding,
+)
+from .har_parser import HARSeed, SeedCorpus, parse_har_file
+from .safety_cleanup import CleanupTracker, CreatedResource, get_audit_headers
+from .evidence import (
+    verify_deep_state_persistence,
+)
 try:
     from .concurrency_fuzzer import (
         ConcurrencyBurstResult,
@@ -163,4 +174,15 @@ __all__ = [
     "snapshot_response",
     "stable_finding_id",
     "target_config",
+    "build_curl_command",
+    "build_curl_from_finding",
+    "build_curl_dual",
+    "build_curl_dual_from_finding",
+    "HARSeed",
+    "SeedCorpus",
+    "parse_har_file",
+    "CleanupTracker",
+    "CreatedResource",
+    "get_audit_headers",
+    "verify_deep_state_persistence",
 ]

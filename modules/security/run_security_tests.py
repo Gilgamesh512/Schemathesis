@@ -34,6 +34,8 @@ from core import (
     PiiDetector,
     HeaderTamperFuzzer,
     ResourceExhaustionFuzzer,
+    get_audit_headers,
+    CleanupTracker,
 )
 
 try:
@@ -274,6 +276,10 @@ def run_target(
         extra_env["HTTPS_PROXY"] = str(proxy_val)
     if insecure or targets.get_target(target_id).settings.get("insecure"):
         extra_env["PYTHONHTTPSVERIFY"] = "0"
+
+    schema_source = targets.get_target(target_id).schema_source
+    if schema_source and str(schema_source).lower().endswith(".har"):
+        extra_env["SCHEMATHESIS_SEED_CORPUS"] = str(schema_source)
 
     run_command(
         f"FUZZING - {label}",
@@ -661,6 +667,7 @@ def run_dynamic_target(
     advertised_host: str | None = None,
     targets: TargetManager | None = None,
     save_profile: bool = False,
+    safe_staging: bool = False,
 ) -> int:
     """Dynamically register and run security fuzzing on an ad-hoc target URL."""
     parsed_url = urlparse(url)
@@ -757,7 +764,11 @@ def run_dynamic_target(
     if auth_token:
         auth["header"] = normalize_auth_header(auth_token)
     if custom_headers:
-        auth["headers"] = custom_headers
+        auth["headers"] = dict(custom_headers)
+    if safe_staging:
+        if "headers" not in auth:
+            auth["headers"] = {}
+        auth["headers"].update(get_audit_headers())
 
     mgr = targets or TargetManager(PROJECT_ROOT)
     # If target_id collides in manager, give it a unique suffix
@@ -902,6 +913,17 @@ def run_dynamic_target(
         html_report = reporter.generate_html_report(findings, target_info={"name": target_name, "url": url})
         print(f"[+] Standalone HTML Report: {html_report}")
         print(f"[+] Latest Report Link:     {RESULTS.results_dir / 'latest_report.html'}")
+
+        manifest_file = RESULTS.results_dir / "cleanup_manifest.json"
+        if manifest_file.exists():
+            try:
+                import json
+                m_data = json.loads(manifest_file.read_text(encoding="utf-8"))
+                tot = m_data.get("total_created_resources", 0)
+                if tot > 0:
+                    print(f"[🛡️] Staging Safety: Tracked {tot} created resources in {manifest_file.name}")
+            except Exception:
+                pass
         return 0
     except (FileNotFoundError, KeyError, OSError, RuntimeError, ValueError) as exc:
         print(f"\n[X] Dynamic scan failed: {exc}", file=sys.stderr)
@@ -985,6 +1007,17 @@ def run_workflow(
         html_report = reporter.generate_html_report(findings, target_info={"name": workflow.name, "url": str(path)})
         print(f"[+] Standalone HTML Report: {html_report}")
         print(f"[+] Latest Report Link:     {RESULTS.results_dir / 'latest_report.html'}")
+
+        manifest_file = RESULTS.results_dir / "cleanup_manifest.json"
+        if manifest_file.exists():
+            try:
+                import json
+                m_data = json.loads(manifest_file.read_text(encoding="utf-8"))
+                tot = m_data.get("total_created_resources", 0)
+                if tot > 0:
+                    print(f"[🛡️] Staging Safety: Tracked {tot} created resources in {manifest_file.name}")
+            except Exception:
+                pass
 
     return 0 if report.success else 1
 
@@ -1169,6 +1202,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"[+] Standalone HTML Report: {html_report}")
         print(f"[+] Latest Report Link:     {RESULTS.results_dir / 'latest_report.html'}")
+
+        manifest_file = RESULTS.results_dir / "cleanup_manifest.json"
+        if manifest_file.exists():
+            try:
+                import json
+                m_data = json.loads(manifest_file.read_text(encoding="utf-8"))
+                tot = m_data.get("total_created_resources", 0)
+                if tot > 0:
+                    print(f"[🛡️] Staging Safety: Tracked {tot} created resources in {manifest_file.name}")
+            except Exception:
+                pass
 
     return 0
 

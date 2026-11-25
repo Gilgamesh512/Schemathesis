@@ -26,7 +26,7 @@ def test_auth_env_for_direct_header():
         "direct_auth_test",
         name="Direct Auth Test",
         base_url="http://127.0.0.1:8000",
-        schema_source="targets/schemas/vampi/vampi_spec.yaml",
+        schema_source="tests/fixtures/sample_openapi.yaml",
         auth={"header": "Bearer my_secret_token"},
         settings={"protocol": "rest"},
     )
@@ -90,7 +90,7 @@ def test_run_all_scan_command_dispatches_to_security_tests():
         exit_code = run_all.main([
             "scan",
             "--url", "http://127.0.0.1:5000",
-            "--schema", "targets/schemas/vampi/vampi_spec.yaml",
+            "--schema", "tests/fixtures/sample_openapi.yaml",
             "--token", "Bearer testtoken",
         ])
         assert exit_code == 0

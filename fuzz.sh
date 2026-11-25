@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Schemathesis Pro - Universal API Security Scanner One-Click Launcher (Linux/macOS)
+# Schemathesis Pro - Universal API DAST Launcher (Linux/macOS)
 # ==============================================================================
 set -e
 
@@ -28,13 +28,18 @@ fi
 # Argument Dispatcher
 # ------------------------------------------------------------------------------
 if [ "$1" = "auto" ]; then
+    if [ -z "$2" ]; then
+        echo "[!] Please specify an OpenAPI schema, e.g.: ./fuzz.sh auto ./openapi.json --url http://127.0.0.1:8000"
+        exit 1
+    fi
+    shift
     echo "[*] Running Autonomous BOLA Workflow..."
-    exec "$PYTHON" run_all.py auto-workflow
+    exec "$PYTHON" run_all.py auto-workflow "$@"
 fi
 
-if [ "$1" = "all" ] || [ "$1" = "run" ]; then
-    echo "[*] Running Full Security Testing Pipeline..."
-    exec "$PYTHON" run_all.py run
+if [ "$1" = "profiles" ]; then
+    echo "[*] Running Saved Target Profiles..."
+    exec "$PYTHON" run_all.py profiles
 fi
 
 if [ "$1" = "report" ]; then
@@ -75,12 +80,12 @@ fi
 # ------------------------------------------------------------------------------
 clear
 echo "=================================================================================="
-echo "            SCHEMATHESIS PRO - UNIVERSAL API SECURITY SCANNER"
+echo "            SCHEMATHESIS PRO - AUTOMATED API DAST SCANNER"
 echo "=================================================================================="
 echo ""
-echo "  [1] Auto-Run BOLA Workflows (Zero-YAML, Auto-Infer CRUD)  [DEFAULT - Press Enter]"
-echo "  [2] Run Full Security Pipeline (Auto-auth + VAmPI + crAPI + DVGA)"
-echo "  [3] Quick Scan Custom API URL (Auto-Discovery)"
+echo "  [1] Quick Scan Custom API URL (Auto-Discovery)            [DEFAULT - Press Enter]"
+echo "  [2] Auto-Synthesize BOLA Workflows (OpenAPI -> Zero-YAML)"
+echo "  [3] Run Saved Target Profiles"
 echo "  [4] Open Interactive Terminal Dashboard (TUI)"
 echo "  [5] Open Latest Interactive HTML Report in Browser"
 echo "  [q] Exit"
@@ -92,22 +97,6 @@ CHOICE="${CHOICE:-1}"
 case "$CHOICE" in
     1)
         echo ""
-        echo "[*] Launching Autonomous BOLA Workflow Engine..."
-        "$PYTHON" run_all.py auto-workflow
-        echo ""
-        read -r -p "Open interactive HTML report in browser now? [Y/n]: " OPEN_REP
-        OPEN_REP="${OPEN_REP:-y}"
-        if [[ "$OPEN_REP" =~ ^[Yy]$ ]]; then
-            "$PYTHON" -m cli --report || true
-        fi
-        ;;
-    2)
-        echo ""
-        echo "[*] Running full multi-target pipeline..."
-        "$PYTHON" run_all.py run
-        ;;
-    3)
-        echo ""
         read -r -p "Enter API Target Base URL: " SCAN_URL
         if [ -n "$SCAN_URL" ]; then
             "$PYTHON" run_all.py scan --url "$SCAN_URL"
@@ -117,6 +106,23 @@ case "$CHOICE" in
                 "$PYTHON" -m cli --report || true
             fi
         fi
+        ;;
+    2)
+        echo ""
+        read -r -p "Enter OpenAPI Schema path: " SCHEMA_PATH
+        read -r -p "Enter Target Base URL (optional): " BASE_URL
+        if [ -n "$SCHEMA_PATH" ]; then
+            if [ -n "$BASE_URL" ]; then
+                "$PYTHON" run_all.py auto-workflow "$SCHEMA_PATH" --url "$BASE_URL"
+            else
+                "$PYTHON" run_all.py auto-workflow "$SCHEMA_PATH"
+            fi
+        fi
+        ;;
+    3)
+        echo ""
+        echo "[*] Running saved target profiles..."
+        "$PYTHON" run_all.py profiles
         ;;
     4)
         exec "$PYTHON" -m cli

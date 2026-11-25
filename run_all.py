@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit CLI for lab operations, dynamic target scanning, and universal API security fuzzing."""
+"""Explicit CLI for automated dynamic API security testing (DAST) and DevSecOps quality gates."""
 
 from __future__ import annotations
 
@@ -15,10 +15,8 @@ import urllib.error
 import urllib.request
 
 try:
-    from core import parse_tokens_env as _core_parse_tokens_env
     from core.alerting import send_webhook_alert
 except ImportError:
-    _core_parse_tokens_env = None  # type: ignore
     send_webhook_alert = None  # type: ignore
 
 
@@ -48,12 +46,7 @@ def _get_python_command() -> list[str]:
 
 
 PYTHON_CMD = _get_python_command()
-LAB_SCRIPT = ROOT / "lab" / "start_lab.py"
-RUN_AUTH = ROOT / "auth" / "run_auth.py"
-RUN_DVGA = ROOT / "auth" / "run_dvga.py"
 RUN_SECURITY_TESTS = ROOT / "modules" / "security" / "run_security_tests.py"
-TOKENS_FILE = ROOT / "tokens.env"
-DVGA_SCHEMA = ROOT / "targets" / "schemas" / "dvga" / "dvga_schema.json"
 
 
 def preflight_check(url: str, proxy: str | None = None, insecure: bool = False, timeout: float = 6.0) -> tuple[bool, str]:
@@ -82,17 +75,14 @@ def preflight_check(url: str, proxy: str | None = None, insecure: bool = False, 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Manage the local API lab or scan targets dynamically with auto-discovery."
+        description="Automated API DAST CLI for dynamic scanning, stateful workflows, and DevSecOps quality gates."
     )
     commands = parser.add_subparsers(dest="command")
-    for command, description in (
-        ("setup", "Fetch pinned vulnerable applications and create local configuration"),
-        ("start", "Start the lab and wait for HTTP health checks"),
-        ("check", "Check lab endpoints without starting or modifying services"),
-        ("stop", "Stop lab containers without deleting containers or volumes"),
-        ("run", "Authenticate, refresh DVGA schema, then run all fuzzers"),
-    ):
-        commands.add_parser(command, help=description, description=description)
+    commands.add_parser(
+        "profiles",
+        help="Run saved target profiles stored under targets/profiles/",
+        description="Execute security scans against all saved custom target profiles.",
+    )
 
     scan_parser = commands.add_parser(
         "scan",
@@ -150,8 +140,8 @@ def _parser() -> argparse.ArgumentParser:
         help="Auto-infer and synthesize stateful multi-step BOLA workflows directly from OpenAPI schema",
         description="Automatically inspect OpenAPI spec, pair Producers and Consumers, and execute synthesized workflows.",
     )
-    auto_wf_parser.add_argument("schema", nargs="?", default="targets/schemas/vampi/vampi_spec.yaml", help="Path to OpenAPI schema file (JSON/YAML) [default: targets/schemas/vampi/vampi_spec.yaml]")
-    auto_wf_parser.add_argument("--url", default="http://127.0.0.1:5002", help="Base URL override [default: http://127.0.0.1:5002]")
+    auto_wf_parser.add_argument("schema", help="Path to OpenAPI schema file (JSON/YAML)")
+    auto_wf_parser.add_argument("--url", default=None, help="Target base URL override")
     auto_wf_parser.add_argument("--proxy", default=None, help="Upstream HTTP/HTTPS proxy URL")
     auto_wf_parser.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification")
 
@@ -168,62 +158,6 @@ def _parser() -> argparse.ArgumentParser:
     gate_parser.add_argument("--webhook-url", default=None, help="Alert webhook URL for Quality Gate status")
 
     return parser
-
-
-def parse_tokens_env(path: Path = TOKENS_FILE) -> dict[str, str]:
-    if _core_parse_tokens_env is not None:
-        return _core_parse_tokens_env(path, auth_headers_only=True, warn_missing=False)
-    if not path.exists():
-        return {}
-    tokens: dict[str, str] = {}
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        if key.endswith("_AUTH_HEADER"):
-            tokens[key] = value
-    return tokens
-
-
-def validate_handoff() -> bool:
-    required_tokens = (
-        "VAMPI_AUTH_HEADER",
-        "CRAPI_AUTH_HEADER",
-        "DVGA_AUTH_HEADER",
-    )
-    tokens = parse_tokens_env()
-    valid = True
-    for key in required_tokens:
-        if tokens.get(key):
-            print(f"[+] {key}: READY")
-        else:
-            print(f"[X] {key}: MISSING")
-            valid = False
-
-    try:
-        data = json.loads(DVGA_SCHEMA.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        print(f"[X] DVGA schema is missing: {DVGA_SCHEMA}")
-        return False
-    except json.JSONDecodeError as exc:
-        print(f"[X] Cannot parse DVGA schema {DVGA_SCHEMA}: {exc}")
-        return False
-
-    if data.get("target") != "dvga" or data.get("protocol") != "graphql":
-        print("[X] DVGA schema metadata is invalid.")
-        valid = False
-    else:
-        print("[+] DVGA schema: READY")
-    return valid
 
 
 def run_script(script: Path, *arguments: str) -> None:
@@ -247,19 +181,6 @@ def run_script(script: Path, *arguments: str) -> None:
         )
 
 
-def run_pipeline() -> int:
-    print("[i] This explicit command runs authentication, schema discovery, and fuzzing.")
-    run_script(LAB_SCRIPT, "start")
-    run_script(RUN_AUTH)
-    run_script(RUN_DVGA)
-    print("\n[+] Validating authentication and schema handoff")
-    if not validate_handoff():
-        return 1
-    run_script(RUN_SECURITY_TESTS)
-    print("\n[+] Fuzzing complete. Results are in results/.")
-    return 0
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -267,13 +188,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_help()
         return 2
 
-    if args.command in {"setup", "start", "check", "stop"}:
+    if args.command == "profiles":
         try:
-            run_script(LAB_SCRIPT, args.command)
-        except (FileNotFoundError, OSError, RuntimeError) as exc:
-            print(f"[X] Lab command failed: {exc}", file=sys.stderr)
+            run_script(RUN_SECURITY_TESTS)
+            return 0
+        except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+            print(f"[X] Saved profiles run failed: {exc}", file=sys.stderr)
             return 1
-        return 0
 
     if args.command == "workflow":
         wf_args = ["--workflow", args.file]
@@ -291,9 +212,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
 
     if args.command == "auto-workflow":
-        schema_target = args.schema or "targets/schemas/vampi/vampi_spec.yaml"
-        url_target = args.url or "http://127.0.0.1:5002"
-        auto_args = ["--auto-workflow", schema_target, "--url", url_target]
+        auto_args = ["--auto-workflow", args.schema]
+        if args.url:
+            auto_args.extend(["--url", args.url])
         if args.proxy:
             auto_args.extend(["--proxy", args.proxy])
         if args.insecure:
@@ -517,14 +438,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("\n[✅] RESULT: SECURITY QUALITY GATE PASSED. CODE APPROVED FOR DEPLOYMENT.\n")
             return 0
 
-    try:
-        return run_pipeline()
-    except KeyboardInterrupt:
-        print("\n[!] Interrupted by user.", file=sys.stderr)
-        return 130
-    except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
-        print(f"\n[X] Pipeline failed: {exc}", file=sys.stderr)
-        return 1
+    parser.print_help()
+    return 2
 
 
 if __name__ == "__main__":

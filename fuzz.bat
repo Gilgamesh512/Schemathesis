@@ -1,6 +1,6 @@
 @echo off
 REM ==============================================================================
-REM Schemathesis Pro - Universal API Security Scanner One-Click Launcher (Windows)
+REM Schemathesis Pro - Universal API DAST Launcher (Windows)
 REM ==============================================================================
 setlocal EnableDelayedExpansion
 
@@ -60,20 +60,20 @@ REM ----------------------------------------------------------------------------
 REM Argument Dispatcher
 REM ------------------------------------------------------------------------------
 if "%~1"=="auto" (
+    if "%~2"=="" (
+        echo [!] Please specify an OpenAPI schema, e.g.: fuzz.bat auto .\openapi.json --url http://127.0.0.1:8000
+        pause
+        exit /b 1
+    )
+    shift
     echo [*] Running Autonomous BOLA Workflow...
-    "%PYTHON%" run_all.py auto-workflow
+    "%PYTHON%" run_all.py auto-workflow %*
     goto :end
 )
 
-if "%~1"=="all" (
-    echo [*] Running Full Security Testing Pipeline...
-    "%PYTHON%" run_all.py run
-    goto :end
-)
-
-if "%~1"=="run" (
-    echo [*] Running Full Security Testing Pipeline...
-    "%PYTHON%" run_all.py run
+if "%~1"=="profiles" (
+    echo [*] Running Saved Target Profiles...
+    "%PYTHON%" run_all.py profiles
     goto :end
 )
 
@@ -123,12 +123,12 @@ REM ----------------------------------------------------------------------------
 :menu
 cls
 echo ==================================================================================
-echo             SCHEMATHESIS PRO - UNIVERSAL API SECURITY SCANNER
+echo             SCHEMATHESIS PRO - AUTOMATED API DAST SCANNER
 echo ==================================================================================
 echo.
-echo   [1] Auto-Run BOLA Workflows (Zero-YAML, Auto-Infer CRUD)  [DEFAULT - Press Enter]
-echo   [2] Run Full Security Pipeline (Auto-auth + VAmPI + crAPI + DVGA)
-echo   [3] Quick Scan Custom API URL (Auto-Discovery)
+echo   [1] Quick Scan Custom API URL (Auto-Discovery)            [DEFAULT - Press Enter]
+echo   [2] Auto-Synthesize BOLA Workflows (OpenAPI -^> Zero-YAML)
+echo   [3] Run Saved Target Profiles
 echo   [4] Open Interactive Terminal Dashboard (TUI)
 echo   [5] Open Latest Interactive HTML Report in Browser
 echo   [q] Exit
@@ -141,25 +141,6 @@ if /i "%CHOICE%"=="q" exit /b 0
 
 if "%CHOICE%"=="1" (
     echo.
-    echo [*] Launching Autonomous BOLA Workflow Engine...
-    "%PYTHON%" run_all.py auto-workflow
-    echo.
-    set "OPEN_REP=y"
-    set /p "OPEN_REP=Open interactive HTML report in browser now? [Y/n]: "
-    if /i "!OPEN_REP!"=="y" "%PYTHON%" -m cli --report
-    if /i "!OPEN_REP!"=="" "%PYTHON%" -m cli --report
-    goto :end
-)
-
-if "%CHOICE%"=="2" (
-    echo.
-    echo [*] Running full multi-target pipeline...
-    "%PYTHON%" run_all.py run
-    goto :end
-)
-
-if "%CHOICE%"=="3" (
-    echo.
     set /p "SCAN_URL=Enter API Target Base URL: "
     if not "!SCAN_URL!"=="" (
         "%PYTHON%" run_all.py scan --url !SCAN_URL!
@@ -168,6 +149,27 @@ if "%CHOICE%"=="3" (
         if /i "!OPEN_REP!"=="y" "%PYTHON%" -m cli --report
         if /i "!OPEN_REP!"=="" "%PYTHON%" -m cli --report
     )
+    goto :end
+)
+
+if "%CHOICE%"=="2" (
+    echo.
+    set /p "SCHEMA_PATH=Enter OpenAPI Schema path: "
+    set /p "BASE_URL=Enter Target Base URL (optional): "
+    if not "!SCHEMA_PATH!"=="" (
+        if not "!BASE_URL!"=="" (
+            "%PYTHON%" run_all.py auto-workflow "!SCHEMA_PATH!" --url "!BASE_URL!"
+        ) else (
+            "%PYTHON%" run_all.py auto-workflow "!SCHEMA_PATH!"
+        )
+    )
+    goto :end
+)
+
+if "%CHOICE%"=="3" (
+    echo.
+    echo [*] Running saved target profiles...
+    "%PYTHON%" run_all.py profiles
     goto :end
 )
 

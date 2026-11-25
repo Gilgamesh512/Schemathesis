@@ -70,8 +70,8 @@ def test_sarif_report_generation(tmp_path: Path):
 
 
 def test_builtin_graphql_payload_generator():
-    dvga_schema = Path("targets/schemas/dvga/dvga_schema.json")
-    payloads = graphql.generate_builtin_graphql_payloads("dvga", dvga_schema)
+    gql_schema = Path("tests/fixtures/sample_graphql_schema.json")
+    payloads = graphql.generate_builtin_graphql_payloads("sample_graphql", gql_schema)
     assert len(payloads) >= 2
 
     attack_types = {p.attack_type for p in payloads}
@@ -79,8 +79,7 @@ def test_builtin_graphql_payload_generator():
     assert "GRAPHQL_BATCHING_DOS" in attack_types
 
     # Schema-driven queries check
-    if dvga_schema.exists():
-        assert any(p.attack_type in ("SQL_INJECTION", "COMMAND_INJECTION", "INFORMATION_DISCLOSURE") for p in payloads)
+    assert any(p.attack_type in ("SQL_INJECTION", "COMMAND_INJECTION", "INFORMATION_DISCLOSURE") for p in payloads)
 
 
 def test_builtin_rest_mutation_engine():

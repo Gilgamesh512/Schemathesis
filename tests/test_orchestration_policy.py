@@ -19,23 +19,28 @@ def test_orchestrator_continues_on_target_failure_and_returns_nonzero(capsys):
 
     def mock_run_target(target_id, tokens=None, targets=None):
         calls.append(target_id)
-        if target_id == "crapi":
+        if target_id == "api_one":
             raise RuntimeError("fuzzer process exited with code 1")
 
-    with patch.object(run_security_tests, "run_target", side_effect=mock_run_target), \
+    tm = TargetManager()
+    tm.add_target("api_one", base_url="http://127.0.0.1:8001", schema_source="tests/fixtures/sample_openapi.yaml", settings={"protocol": "rest"})
+    tm.add_target("api_two", base_url="http://127.0.0.1:8002", schema_source="tests/fixtures/sample_openapi.yaml", settings={"protocol": "rest"})
+
+    with patch.object(run_security_tests, "TARGETS", tm), \
+         patch.object(run_security_tests, "run_target", side_effect=mock_run_target), \
          patch.object(run_security_tests, "parse_tokens_env", return_value={}), \
-         patch.object(sys, "argv", ["run_security_tests.py", "--target", "crapi", "--target", "vampi"]):
+         patch.object(sys, "argv", ["run_security_tests.py", "--target", "api_one", "--target", "api_two"]):
         exit_code = run_security_tests.main()
 
     # The second target must still execute despite the first target failing
-    assert calls == ["crapi", "vampi"]
+    assert calls == ["api_one", "api_two"]
     # Overall pipeline must indicate failure
     assert exit_code == 1
 
     captured = capsys.readouterr().out
     assert "PARTIAL FAILURE" in captured
-    assert "[X] Failed: crapi (fuzzer process exited with code 1)" in captured
-    assert "[+] Succeeded: vampi" in captured
+    assert "[X] Failed: api_one (fuzzer process exited with code 1)" in captured
+    assert "[+] Succeeded: api_two" in captured
 
 
 def test_orchestrator_success_path_records_all_targets(capsys):
@@ -44,17 +49,22 @@ def test_orchestrator_success_path_records_all_targets(capsys):
     def mock_run_target(target_id, tokens=None, targets=None):
         calls.append(target_id)
 
-    with patch.object(run_security_tests, "run_target", side_effect=mock_run_target), \
+    tm = TargetManager()
+    tm.add_target("api_one", base_url="http://127.0.0.1:8001", schema_source="tests/fixtures/sample_openapi.yaml", settings={"protocol": "rest"})
+    tm.add_target("api_two", base_url="http://127.0.0.1:8002", schema_source="tests/fixtures/sample_openapi.yaml", settings={"protocol": "rest"})
+
+    with patch.object(run_security_tests, "TARGETS", tm), \
+         patch.object(run_security_tests, "run_target", side_effect=mock_run_target), \
          patch.object(run_security_tests, "parse_tokens_env", return_value={}), \
-         patch.object(sys, "argv", ["run_security_tests.py", "--target", "crapi", "--target", "vampi"]):
+         patch.object(sys, "argv", ["run_security_tests.py", "--target", "api_one", "--target", "api_two"]):
         exit_code = run_security_tests.main()
 
-    assert calls == ["crapi", "vampi"]
+    assert calls == ["api_one", "api_two"]
     assert exit_code == 0
 
     captured = capsys.readouterr().out
     assert "SECURITY TESTING COMPLETE" in captured
-    assert "[+] Succeeded: crapi, vampi" in captured
+    assert "[+] Succeeded: api_one, api_two" in captured
 
 
 def test_orchestrator_aborts_immediately_on_keyboard_interrupt():
@@ -64,26 +74,30 @@ def test_orchestrator_aborts_immediately_on_keyboard_interrupt():
         calls.append(target_id)
         raise KeyboardInterrupt()
 
-    with patch.object(run_security_tests, "run_target", side_effect=mock_run_target), \
+    tm = TargetManager()
+    tm.add_target("api_one", base_url="http://127.0.0.1:8001", schema_source="tests/fixtures/sample_openapi.yaml", settings={"protocol": "rest"})
+    tm.add_target("api_two", base_url="http://127.0.0.1:8002", schema_source="tests/fixtures/sample_openapi.yaml", settings={"protocol": "rest"})
+
+    with patch.object(run_security_tests, "TARGETS", tm), \
+         patch.object(run_security_tests, "run_target", side_effect=mock_run_target), \
          patch.object(run_security_tests, "parse_tokens_env", return_value={}), \
-         patch.object(sys, "argv", ["run_security_tests.py", "--target", "crapi", "--target", "vampi"]):
+         patch.object(sys, "argv", ["run_security_tests.py", "--target", "api_one", "--target", "api_two"]):
         exit_code = run_security_tests.main()
 
     # Aborts immediately without executing remaining targets
-    assert calls == ["crapi"]
+    assert calls == ["api_one"]
     assert exit_code == 130
 
 
 def test_run_all_propagates_orchestrator_failure():
     # Verify that run_all.py propagates orchestrator failure (exit code 1)
-    with patch.object(run_all, "run_script") as mock_run_script, \
-         patch.object(run_all, "validate_handoff", return_value=True):
+    with patch.object(run_all, "run_script") as mock_run_script:
         def side_effect(script, *args):
             if script == run_all.RUN_SECURITY_TESTS:
                 raise RuntimeError("modules/security/run_security_tests.py failed with exit code 1")
 
         mock_run_script.side_effect = side_effect
-        exit_code = run_all.main(["run"])
+        exit_code = run_all.main(["scan", "--url", "http://127.0.0.1:8000", "--no-preflight"])
         assert exit_code == 1
 
 
@@ -147,13 +161,17 @@ def test_target_selection_deduplicates_repeated_flags():
     def mock_run_target(target_id, tokens=None, targets=None):
         calls.append(target_id)
 
-    with patch.object(run_security_tests, "run_target", side_effect=mock_run_target), \
+    tm = TargetManager()
+    tm.add_target("api_one", base_url="http://127.0.0.1:8001", schema_source="tests/fixtures/sample_openapi.yaml", settings={"protocol": "rest"})
+
+    with patch.object(run_security_tests, "TARGETS", tm), \
+         patch.object(run_security_tests, "run_target", side_effect=mock_run_target), \
          patch.object(run_security_tests, "parse_tokens_env", return_value={}), \
-         patch.object(sys, "argv", ["run_security_tests.py", "--target", "vampi", "--target", "vampi"]):
+         patch.object(sys, "argv", ["run_security_tests.py", "--target", "api_one", "--target", "api_one"]):
         exit_code = run_security_tests.main()
 
-    # Repeated --target vampi flag must execute vampi only once
-    assert calls == ["vampi"]
+    # Repeated --target flag must execute target only once
+    assert calls == ["api_one"]
     assert exit_code == 0
 
 
@@ -163,14 +181,19 @@ def test_target_selection_distinct_targets_preserves_order():
     def mock_run_target(target_id, tokens=None, targets=None):
         calls.append(target_id)
 
-    # User specifies vampi then crapi
-    with patch.object(run_security_tests, "run_target", side_effect=mock_run_target), \
+    tm = TargetManager()
+    tm.add_target("api_two", base_url="http://127.0.0.1:8002", schema_source="tests/fixtures/sample_openapi.yaml", settings={"protocol": "rest"})
+    tm.add_target("api_one", base_url="http://127.0.0.1:8001", schema_source="tests/fixtures/sample_openapi.yaml", settings={"protocol": "rest"})
+
+    # User specifies api_two then api_one
+    with patch.object(run_security_tests, "TARGETS", tm), \
+         patch.object(run_security_tests, "run_target", side_effect=mock_run_target), \
          patch.object(run_security_tests, "parse_tokens_env", return_value={}), \
-         patch.object(sys, "argv", ["run_security_tests.py", "--target", "vampi", "--target", "crapi", "--target", "vampi"]):
+         patch.object(sys, "argv", ["run_security_tests.py", "--target", "api_two", "--target", "api_one", "--target", "api_two"]):
         exit_code = run_security_tests.main()
 
     # Preserves first occurrence order without duplicate
-    assert calls == ["vampi", "crapi"]
+    assert calls == ["api_two", "api_one"]
     assert exit_code == 0
 
 
@@ -180,14 +203,19 @@ def test_target_selection_omitted_runs_all_configured_targets():
     def mock_run_target(target_id, tokens=None, targets=None):
         calls.append(target_id)
 
+    tm = TargetManager()
+    tm.add_target("api_b", base_url="http://127.0.0.1:8002", schema_source="tests/fixtures/sample_openapi.yaml", settings={"protocol": "rest"})
+    tm.add_target("api_a", base_url="http://127.0.0.1:8001", schema_source="tests/fixtures/sample_openapi.yaml", settings={"protocol": "rest"})
+
     # No --target flags provided
-    with patch.object(run_security_tests, "run_target", side_effect=mock_run_target), \
+    with patch.object(run_security_tests, "TARGETS", tm), \
+         patch.object(run_security_tests, "run_target", side_effect=mock_run_target), \
          patch.object(run_security_tests, "parse_tokens_env", return_value={}), \
          patch.object(sys, "argv", ["run_security_tests.py"]):
         exit_code = run_security_tests.main()
 
     # Omitted target runs all configured targets in sorted order
-    assert calls == sorted(run_security_tests.TARGETS.targets)
+    assert calls == ["api_a", "api_b"]
     assert exit_code == 0
 
 

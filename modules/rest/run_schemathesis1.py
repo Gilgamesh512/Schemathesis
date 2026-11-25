@@ -187,8 +187,8 @@ def load_targets(
     allow_remote_schema: bool = False,
 ) -> dict[str, tuple]:
     """Load multiple OpenAPI specs for multi-target execution.
-    --targets 'vampi=vampi_spec.yaml,crapi=crapi_spec.json'
-    --base-urls 'vampi=http://localhost:5002,crapi=http://localhost:8888'
+    --targets 'api1=openapi1.yaml,api2=openapi2.json'
+    --base-urls 'api1=http://localhost:8000,api2=http://localhost:8001'
     Returns {target_name: (schema, base_url)}."""
     base_url_overrides: dict[str, str] = {}
     if base_urls_arg:
@@ -204,7 +204,7 @@ def load_targets(
         name, sep, spec_path = pair.partition("=")
         if not sep:
             print(f"[ERROR] Invalid --targets entry '{pair}'. Use 'name=path', "
-                  "e.g. 'vampi=vampi_spec.yaml'.", file=sys.stderr)
+                  "e.g. 'api1=openapi.yaml'.", file=sys.stderr)
             sys.exit(1)
         name = name.strip().lower()
         spec_path = spec_path.strip()
@@ -1103,7 +1103,7 @@ def main(argv: Optional[list[str]] = None):
                       help="Single-target mode: path/URL to one OpenAPI spec (.json/.yaml)")
     mode.add_argument("--targets", default=None,
                       help="Multi-target mode: comma-separated 'name=path' entries, "
-                           "e.g. 'vampi=vampi_spec.yaml,crapi=crapi_spec.json'")
+                           "e.g. 'api1=openapi1.yaml,api2=openapi2.json'")
     ap.add_argument(
         "--payloads",
         default=None,
@@ -1113,7 +1113,7 @@ def main(argv: Optional[list[str]] = None):
                     help="Override base_url for --spec mode")
     ap.add_argument("--base-urls", default=None,
                     help="Override per-target base_url for --targets mode, e.g. "
-                         "'vampi=http://localhost:5002,crapi=http://localhost:8888'")
+                         "'api1=http://localhost:8000,api2=http://localhost:8001'")
     ap.add_argument(
         "--allow-remote-schema",
         action="store_true",

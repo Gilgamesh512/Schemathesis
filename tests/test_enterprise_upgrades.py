@@ -127,7 +127,7 @@ def test_sarif_taxonomies_and_schema_mapping(tmp_path):
         "evidence": "Unauthorized access to victim resource",
     }]
     target_info = {
-        "schema": "targets/schemas/vampi/vampi_spec.yaml"
+        "schema": "tests/fixtures/sample_openapi.yaml"
     }
     out_file = tmp_path / "test.sarif"
     sarif_path = reporter.generate_sarif_report(findings, target_info=target_info, output_file=out_file)
@@ -144,7 +144,7 @@ def test_sarif_taxonomies_and_schema_mapping(tmp_path):
     # Check physicalLocation mapped to schema
     result_entry = run["results"][0]
     artifact_loc = result_entry["locations"][0]["physicalLocation"]["artifactLocation"]
-    assert "vampi_spec.yaml" in artifact_loc["uri"]
+    assert "sample_openapi.yaml" in artifact_loc["uri"]
     assert result_entry["properties"]["confirmed"] is True
     assert "taxa" in result_entry
 

@@ -294,7 +294,7 @@ def test_run_all_scan_passes_phase2_flags():
         exit_code = run_all.main([
             "scan",
             "--url", "http://127.0.0.1:8000",
-            "--schema", "targets/schemas/vampi/vampi_spec.yaml",
+            "--schema", "tests/fixtures/sample_openapi.yaml",
             "--verify-tokens",
             "--verify-callbacks",
             "--callback-url", "https://canary.example.com/hit",

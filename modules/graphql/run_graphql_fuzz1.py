@@ -1,29 +1,10 @@
 #!/usr/bin/env python3
 """
-run_graphql_fuzz.py
+run_graphql_fuzz1.py
 Generic GraphQL API fuzzer.
 
-Dispatches payloads against any GraphQL target registered in
-targets/registry.yaml with protocol: graphql.
-
-Expected payload format:
-{
-  "target_app": "<target_id>",
-  "query": "query { ... }",
-  "variables": {},
-  "operation_name": null,
-  "operation": "query",
-  "attack_type": "GraphQL Injection",
-  "payload_value": "...",
-  "owasp_category": "API...",
-  "context": "...",
-  "expected_signal": ["..."]
-}
-
-The target's base_url and endpoint are resolved from the registry or
-overridden via CLI:
-  --base-url http://<HOST>:<PORT>
-  --endpoint /graphql
+Dispatches GraphQL security payloads (custom JSON corpus or built-in probes)
+against any GraphQL endpoint via --base-url / --endpoint or a saved profile.
 """
 
 from __future__ import annotations
@@ -646,7 +627,7 @@ async def process_payload(
     rules: Optional[dict],
     state: RunState,
     rate_limit_s: float,
-    target_id: str = "dvga",
+    target_id: str = "graphql_target",
 ) -> Optional[Finding]:
     target_app = (payload.target_app or target_id).strip().lower()
 
@@ -816,7 +797,7 @@ async def run_all(
     concurrency: int,
     rate_limit_ms: int,
     global_rps: float = 0,
-    target_id: str = "dvga",
+    target_id: str = "graphql_target",
     proxy: Optional[str] = None,
     insecure: bool = False,
     session_keeper: Optional[Any] = None,
@@ -989,10 +970,11 @@ def write_results(
 
 def execute_graphql_scan(
     *,
-    target_id: str = "dvga",
+    target_id: str = "graphql_target",
     base_url: Optional[str] = None,
     endpoint: Optional[str] = None,
     payloads_path: Optional[str] = None,
+    schema_file: Optional[str | Path] = None,
     rules_path: Optional[str | Path] = None,
     results_dir: Optional[str | Path] = None,
     concurrency: int = 10,
@@ -1011,16 +993,17 @@ def execute_graphql_scan(
 
     tm = targets or TargetManager(PROJECT_ROOT)
     tid = target_id.strip().lower()
-    target = tm.get_target(tid)
-    if target.settings.get("protocol") != "graphql":
+    target = tm.targets.get(tid)
+    if target is not None and target.settings.get("protocol") != "graphql":
         raise ValueError(f"Target '{tid}' is not configured for GraphQL")
 
-    resolved_base_url = (
-        base_url
-        or (os.environ.get("DVGA_BASE_URL") if tid == "dvga" else None)
-        or target.base_url
-    )
-    configured_endpoint = target.settings.get("endpoint", "/graphql")
+    resolved_base_url = base_url or (target.base_url if target is not None else None)
+    if not resolved_base_url:
+        raise ValueError(
+            f"Target '{tid}' was not found in saved profiles and --base-url was not provided."
+        )
+
+    configured_endpoint = target.settings.get("endpoint", "/graphql") if target is not None else "/graphql"
     resolved_endpoint = "/" + (endpoint or str(configured_endpoint)).strip("/")
     print(f"[INFO] GraphQL target: {resolved_base_url.rstrip('/')}{resolved_endpoint}")
 
@@ -1052,8 +1035,8 @@ def execute_graphql_scan(
     if payloads_path:
         payloads = load_payloads(payloads_path)
     else:
-        schema_path = None
-        if target.schema_source:
+        schema_path: Optional[Path] = Path(schema_file) if schema_file else None
+        if schema_path is None and target is not None and target.schema_source:
             try:
                 schema_path = tm.resolve_source(target.schema_source)
             except Exception:
@@ -1149,14 +1132,16 @@ def execute_graphql_scan(
 def main(argv: Optional[list[str]] = None) -> None:
     ap = argparse.ArgumentParser(description="GraphQL API Security Fuzzer")
 
-    ap.add_argument("--target-id", default="dvga",
-                    help="Target identifier from targets/registry.yaml (default: dvga)")
+    ap.add_argument("--target-id", default="graphql_target",
+                    help="Target identifier (saved profile ID or ad-hoc identifier)")
     ap.add_argument("--payloads", default=None,
                     help="Optional JSON payload file; without it, generates built-in GraphQL probes")
+    ap.add_argument("--schema", default=None,
+                    help="Optional GraphQL introspection JSON schema file")
     ap.add_argument(
         "--base-url",
         default=None,
-        help="Override target base URL from registry (or DVGA_BASE_URL when target is dvga)",
+        help="Target GraphQL base URL (required unless using a saved profile)",
     )
     ap.add_argument("--endpoint", default=None)
     ap.add_argument("--results-dir", default=str(PROJECT_PATHS.results))
@@ -1173,9 +1158,11 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     args.target_id = args.target_id.strip().lower()
     tm = TargetManager(PROJECT_ROOT)
-    target = tm.get_target(args.target_id)
-    if target.settings.get("protocol") != "graphql":
+    target = tm.targets.get(args.target_id)
+    if target is not None and target.settings.get("protocol") != "graphql":
         ap.error(f"Target '{args.target_id}' is not configured for GraphQL")
+    if target is None and not args.base_url:
+        ap.error(f"Target '{args.target_id}' is not a saved profile; provide --base-url.")
 
     headers: dict[str, str] = {}
     auth_header = os.environ.get("FUZZ_AUTH_HEADER") or args.auth_header
@@ -1195,6 +1182,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             base_url=args.base_url,
             endpoint=args.endpoint,
             payloads_path=args.payloads,
+            schema_file=args.schema,
             rules_path=args.rules,
             results_dir=args.results_dir,
             concurrency=args.concurrency,

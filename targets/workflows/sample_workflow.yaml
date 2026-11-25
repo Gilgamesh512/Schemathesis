@@ -1,28 +1,27 @@
-name: "VAmPI User Lifecycle & BOLA Verification Flow"
+name: "Generic User Lifecycle & BOLA Verification Flow"
 description: "Demonstrates sequential variable extraction, dependent resource lookup, and cross-user authorization assertion"
-base_url: "http://localhost:5002"
+base_url: "http://127.0.0.1:8000"
 initial_context:
-  target_user: "pentester_auto"
+  target_user: "primary_user"
 steps:
   - name: "Health Check"
-    endpoint: "/users/v1"
+    endpoint: "/api/v1/users"
     method: "GET"
     expected_status: [200]
     extract:
       server_header: "headers.server"
 
   - name: "Lookup User Profile"
-    endpoint: "/users/v1/{{target_user}}"
+    endpoint: "/api/v1/users/{{target_user}}"
     method: "GET"
     expected_status: [200]
     extract:
       user_email: "email"
       extracted_username: "username"
 
-  - name: "Cross-User Access Verification (User 2)"
-    endpoint: "/users/v1/{{extracted_username}}"
+  - name: "Cross-User Access Verification (Secondary User)"
+    endpoint: "/api/v1/users/{{extracted_username}}"
     method: "GET"
     auth_user: "user2"
-    # If assert_denied is true, the engine asserts that User 2 must receive 401 or 403.
-    # If the vulnerable endpoint returns 200 OK to User 2, it confirms an API1:2023 BOLA vulnerability!
+    # When assert_denied is true, any 2xx response confirms an API1:2023 BOLA vulnerability.
     assert_denied: true

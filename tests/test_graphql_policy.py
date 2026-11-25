@@ -32,56 +32,23 @@ def test_graphql_fingerprint_nested_and_root_endpoints():
     assert h_root
 
 
-def test_graphql_cli_respects_dvga_base_url_fallback(monkeypatch):
-    monkeypatch.setenv("DVGA_BASE_URL", "http://custom-dvga:5013")
-    mock_target = TargetConfig(
-        target_id="dvga",
-        name="DVGA",
-        base_url="http://default-dvga:5013",
-        settings={"protocol": "graphql", "endpoint": "/graphql"},
-    )
+def test_graphql_cli_supports_adhoc_base_url_without_registry(tmp_path: Path):
+    """GraphQL fuzzer must run dynamically with --base-url without requiring a registry profile."""
+    from core import TargetManager
 
-    with patch("modules.graphql.run_graphql_fuzz1.TargetManager") as mock_tm, \
-         patch("modules.graphql.run_graphql_fuzz1.load_payloads", return_value=[]), \
-         patch.object(sys, "argv", ["run_graphql_fuzz1.py", "--payloads", "dummy.json"]):
-        mock_tm.return_value.get_target.return_value = mock_target
-        # Parse arguments and verify base_url resolution
-        ap = graphql.argparse.ArgumentParser()
-        ap.add_argument("--target-id", default="dvga")
-        ap.add_argument("--payloads", required=True)
-        ap.add_argument("--base-url", default=None)
-        args = ap.parse_args(["--payloads", "dummy.json"])
+    tm = TargetManager(tmp_path)
+    with patch.object(graphql, "TargetManager", return_value=tm), \
+         patch.object(graphql, "run_all", return_value=[]) as mock_run_all:
+        graphql.main([
+            "--base-url", "http://127.0.0.1:9999",
+            "--endpoint", "/api/graphql",
+            "--results-dir", str(tmp_path / "results"),
+        ])
 
-        base_url = (
-            args.base_url
-            or (os.environ.get("DVGA_BASE_URL") if args.target_id == "dvga" else None)
-            or mock_target.base_url
-        )
-        assert base_url == "http://custom-dvga:5013"
-
-
-def test_graphql_cli_non_dvga_ignores_dvga_base_url(monkeypatch):
-    monkeypatch.setenv("DVGA_BASE_URL", "http://custom-dvga:5013")
-    mock_target = TargetConfig(
-        target_id="custom_gql",
-        name="Custom GraphQL",
-        base_url="http://custom-gql:9999",
-        settings={"protocol": "graphql", "endpoint": "/graphql"},
-    )
-
-    ap = graphql.argparse.ArgumentParser()
-    ap.add_argument("--target-id", default="dvga")
-    ap.add_argument("--payloads", required=True)
-    ap.add_argument("--base-url", default=None)
-    args = ap.parse_args(["--target-id", "custom_gql", "--payloads", "dummy.json"])
-
-    base_url = (
-        args.base_url
-        or (os.environ.get("DVGA_BASE_URL") if args.target_id == "dvga" else None)
-        or mock_target.base_url
-    )
-    # DVGA_BASE_URL must NOT leak into non-dvga target
-    assert base_url == "http://custom-gql:9999"
+    mock_run_all.assert_called_once()
+    call_args = mock_run_all.call_args[0]
+    assert call_args[1] == "http://127.0.0.1:9999"
+    assert call_args[2] == "/api/graphql"
 
 # --------------------------------------------------------------------------
 # ISS-REL-1: GraphQL state and durable report consistency

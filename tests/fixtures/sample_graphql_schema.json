@@ -1,0 +1,35 @@
+{
+  "target": "sample_graphql",
+  "protocol": "graphql",
+  "schema": {
+    "data": {
+      "__schema": {
+        "queryType": {
+          "name": "Query",
+          "fields": [
+            {
+              "name": "user",
+              "args": [{"name": "id", "type": {"kind": "SCALAR", "name": "String"}}],
+              "type": {"kind": "OBJECT", "name": "User"}
+            },
+            {
+              "name": "runCommand",
+              "args": [{"name": "cmd", "type": {"kind": "SCALAR", "name": "String"}}],
+              "type": {"kind": "SCALAR", "name": "String"}
+            },
+            {
+              "name": "items",
+              "args": [{"name": "limit", "type": {"kind": "SCALAR", "name": "Int"}}],
+              "type": {"kind": "LIST", "name": null}
+            },
+            {
+              "name": "systemConfig",
+              "args": [],
+              "type": {"kind": "SCALAR", "name": "String"}
+            }
+          ]
+        }
+      }
+    }
+  }
+}

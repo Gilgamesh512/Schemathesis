@@ -1,0 +1,61 @@
+openapi: 3.0.0
+info:
+  title: Sample Target API
+  version: "1.0.0"
+  description: Generic OpenAPI 3.0 fixture for automated DAST unit and integration tests.
+servers:
+  - url: http://127.0.0.1:8000
+paths:
+  /api/v1/users:
+    get:
+      summary: List users
+      responses:
+        "200":
+          description: OK
+    post:
+      summary: Create user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username:
+                  type: string
+                email:
+                  type: string
+                  format: email
+      responses:
+        "201":
+          description: Created
+  /api/v1/users/{user_id}:
+    get:
+      summary: Get user by ID
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Unauthorized
+  /api/v1/webhooks:
+    post:
+      summary: Register webhook callback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                callback_url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: OK

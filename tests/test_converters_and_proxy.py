@@ -213,9 +213,19 @@ def test_schema_manager_loads_and_converts_postman_file(tmp_path: Path):
 # 4. Upstream Proxy & Insecure Option Tests
 # -----------------------------------------------------------------------------
 
-def test_build_target_command_with_proxy_and_insecure():
+def test_build_target_command_with_proxy_and_insecure(tmp_path: Path):
+    schema_file = tmp_path / "spec.yaml"
+    schema_file.write_text('{"openapi": "3.0.0", "paths": {}}', encoding="utf-8")
+    tm = run_security_tests.TargetManager(tmp_path)
+    tm.add_target(
+        "sample_api",
+        base_url="http://127.0.0.1:8000",
+        schema_source=str(schema_file),
+        settings={"protocol": "rest"},
+    )
     name, cmd = run_security_tests.build_target_command(
-        "vampi",
+        "sample_api",
+        targets=tm,
         proxy="http://127.0.0.1:8080",
         insecure=True,
     )
@@ -224,15 +234,25 @@ def test_build_target_command_with_proxy_and_insecure():
     assert "--insecure" in cmd
 
 
-def test_run_target_sets_proxy_environment(monkeypatch):
+def test_run_target_sets_proxy_environment(monkeypatch, tmp_path: Path):
     captured_env = {}
+    schema_file = tmp_path / "spec.yaml"
+    schema_file.write_text('{"openapi": "3.0.0", "paths": {}}', encoding="utf-8")
+    tm = run_security_tests.TargetManager(tmp_path)
+    tm.add_target(
+        "sample_api",
+        base_url="http://127.0.0.1:8000",
+        schema_source=str(schema_file),
+        settings={"protocol": "rest"},
+    )
 
     def mock_run_command(label, command, extra_env=None):
         captured_env.update(extra_env or {})
 
     monkeypatch.setattr(run_security_tests, "run_command", mock_run_command)
     run_security_tests.run_target(
-        "vampi",
+        "sample_api",
+        targets=tm,
         proxy="http://127.0.0.1:8080",
         insecure=True,
     )

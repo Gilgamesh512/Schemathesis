@@ -441,12 +441,7 @@ def run_token_audit(
     if inspection.is_expired:
         print("[!] Warning: Provided token is already expired.")
 
-    target_eps = endpoints or [
-        ("GET", "/"),
-        ("GET", "/api/v1/user"),
-        ("GET", "/api/v1/profile"),
-        ("GET", "/users/v1/_me"),
-    ]
+    target_eps = endpoints or [("GET", "/")]
 
     all_findings: list[Finding] = []
     run_id = f"token-audit-{uuid.uuid4().hex[:8]}"
@@ -502,11 +497,11 @@ def run_callback_audit(
         reported = advertised_host or "127.0.0.1"
         print(f"[i] Using dynamic in-memory loopback callback listener ({reported})")
 
-    candidates = candidate_params or [
-        ("POST", "/webhook", "url", "body"),
-        ("POST", "/api/v1/subscribe", "callback", "json"),
-        ("GET", "/redirect", "url", "query"),
-    ]
+    if not candidate_params:
+        print("[i] No URL/callback parameters detected in schema; skipping callback audit.")
+        return []
+
+    candidates = candidate_params
 
     all_findings: list[Finding] = []
     run_id = f"callback-audit-{uuid.uuid4().hex[:8]}"
@@ -559,13 +554,11 @@ def run_concurrency_audit(
     )
     print(f"[i] Testing state-changing actions with synchronized burst size: {burst_size} req/burst")
 
-    candidates = candidate_endpoints or [
-        ("POST", "/community/api/v2/coupon/apply-coupon"),
-        ("POST", "/workshop/api/shop/apply_coupon"),
-        ("POST", "/coupon/apply"),
-        ("POST", "/api/v1/coupon/redeem"),
-        ("POST", "/orders"),
-    ]
+    if not candidate_endpoints:
+        print("[i] No state-changing race-condition candidates found in schema; skipping concurrency audit.")
+        return []
+
+    candidates = candidate_endpoints
 
     all_findings: list[Finding] = []
     run_id = f"race-audit-{uuid.uuid4().hex[:8]}"
@@ -607,14 +600,7 @@ def run_pii_audit(
 ) -> list[Finding]:
     """Audit response bodies across target endpoints for PII and cryptographic secret leakage (API3:2023)."""
     banner("PII & SENSITIVE DATA EXPOSURE AUDIT (OWASP API3:2023)")
-    target_eps = endpoints or [
-        ("GET", "/"),
-        ("GET", "/api/v1/user"),
-        ("GET", "/api/v1/profile"),
-        ("GET", "/users/v1/_me"),
-        ("GET", "/identity/api/auth/profile"),
-        ("GET", "/community/api/v2/user"),
-    ]
+    target_eps = endpoints or [("GET", "/")]
     all_findings: list[Finding] = []
     run_id = f"pii-audit-{uuid.uuid4().hex[:8]}"
     headers = {"Authorization": auth_token} if auth_token else {}
@@ -665,12 +651,7 @@ def run_header_tamper_audit(
     """Audit endpoints for Reverse Proxy, Routing Integrity, and Cache Poisoning (API8:2023)."""
     banner("REVERSE PROXY & HEADER TAMPERING AUDIT (OWASP API8:2023)")
     fuzzer = HeaderTamperFuzzer()
-    target_eps = endpoints or [
-        ("GET", "/"),
-        ("GET", "/api/v1/ping"),
-        ("GET", "/users"),
-        ("GET", "/identity/api/auth"),
-    ]
+    target_eps = endpoints or [("GET", "/")]
     all_findings: list[Finding] = []
     run_id = f"header-tamper-audit-{uuid.uuid4().hex[:8]}"
     headers = {"Authorization": auth_token} if auth_token else {}
@@ -715,12 +696,11 @@ def run_resource_exhaustion_audit(
     """Audit endpoints for ReDoS and Unrestricted Resource Consumption (API4:2023)."""
     banner("RESOURCE EXHAUSTION & REDOS AUDIT (OWASP API4:2023)")
     fuzzer = ResourceExhaustionFuzzer()
-    candidates = candidate_endpoints or [
-        ("GET", "/api/v1/search", "q"),
-        ("GET", "/users/v1/search", "query"),
-        ("POST", "/identity/api/auth/login", "email"),
-        ("POST", "/users/v1/register", "email"),
-    ]
+    if not candidate_endpoints:
+        print("[i] No parameterized endpoints found in schema; skipping resource exhaustion audit.")
+        return []
+
+    candidates = candidate_endpoints
     all_findings: list[Finding] = []
     run_id = f"resource-audit-{uuid.uuid4().hex[:8]}"
     headers = {"Authorization": auth_token} if auth_token else {}
@@ -1435,6 +1415,9 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     selected = list(dict.fromkeys(args.target)) if args.target else sorted(TARGETS.targets)
+    if not selected:
+        print("[i] No saved target profiles found. Run with --url <TARGET_URL> to scan any API dynamically.")
+        return 0
 
     banner("API SECURITY TESTING")
     print(f"[i] Results: {RESULTS.results_dir}")
@@ -1482,11 +1465,11 @@ def main(argv: list[str] | None = None) -> int:
     if findings:
         reporter.render_terminal_dashboard(
             findings,
-            target_info={"name": "API Security Lab Suite", "url": ", ".join(selected)},
+            target_info={"name": "API Security Target Suite", "url": ", ".join(selected)},
         )
         html_report = reporter.generate_html_report(
             findings,
-            target_info={"name": "API Security Lab Suite", "url": ", ".join(selected)},
+            target_info={"name": "API Security Target Suite", "url": ", ".join(selected)},
         )
         print(f"[+] Standalone HTML Report: {html_report}")
         print(f"[+] Latest Report Link:     {RESULTS.results_dir / 'latest_report.html'}")

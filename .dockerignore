@@ -12,5 +12,4 @@ results/*.csv
 results/*.ndjson
 results/*.sarif
 results/*.html
-.lab/dependencies
 tokens.env

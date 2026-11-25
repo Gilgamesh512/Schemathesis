@@ -47,7 +47,7 @@ api-gate = "run_all:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["core*", "auth*", "cli*", "modules*", "lab*"]
+include = ["core*", "cli*", "modules*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -46,7 +46,6 @@ from modules.security.run_security_tests import (
 RESULTS = ResultManager(PROJECT_ROOT)
 TARGETS = TargetManager(PROJECT_ROOT)
 PYTHON = sys.executable
-LAB_SCRIPT = PROJECT_ROOT / "lab" / "start_lab.py"
 
 
 def _safe_input(prompt: str) -> str:
@@ -76,8 +75,7 @@ def _render_menu_banner() -> None:
     print("  \033[1;32m[6]\033[0m 📑 \033[1mExport Fresh Reports\033[0m (Standalone HTML & OASIS SARIF v2.1 for CI/CD)")
     print("  \033[1;32m[7]\033[0m 🔄 \033[1mRun Stateful Workflow YAML\033[0m (Multi-step business logic & BOLA testing)")
     print("  \033[1;32m[8]\033[0m 🤖 \033[1mAuto-Synthesize BOLA Workflows\033[0m (Zero-YAML Autonomous API Dependency Graph)")
-    print("  \033[1;33m[9]\033[0m 🧪 \033[1mDemo Labs & Docker\033[0m (crAPI, VAmPI, DVGA container operations)")
-    print("  \033[1;32m[10]\033[0m 🌐 \033[1mTraffic Ingestion Scan\033[0m (Ingest Chrome/Burp .HAR file for live seeds & token)")
+    print("  \033[1;32m[9]\033[0m 🌐 \033[1mTraffic Ingestion Scan\033[0m (Ingest Chrome/Burp .HAR file for live seeds & token)")
     print("  \033[1;31m[q]\033[0m 🚪 \033[1mExit\033[0m")
     print("\033[90m" + "─" * 97 + "\033[0m")
 
@@ -174,23 +172,20 @@ def _menu_quick_scan() -> None:
 
 def _menu_run_saved_target() -> None:
     TARGETS.refresh()
-    custom_profiles = TARGETS.list_custom_profiles()
-    lab_profiles = TARGETS.list_lab_profiles()
+    all_profiles = list(TARGETS.targets.values())
 
     print("\n\033[1;36m🎯 SELECT SAVED TARGET TO RUN\033[0m\n")
-    if not custom_profiles and not lab_profiles:
-        print("  [!] No targets found. Use [1] Quick Scan or [3] Manage Saved Targets to add one.")
+    if not all_profiles:
+        print("  [!] No saved target profiles found. Use [1] Quick Scan or [3] Manage Saved Targets to add one.")
         _safe_input("\nPress Enter to continue...")
         return
 
-    all_profiles = custom_profiles + lab_profiles
     for idx, t in enumerate(all_profiles, start=1):
         proto = t.settings.get("protocol", "rest").upper()
-        tag = "\033[1;32m[Custom]\033[0m" if t in custom_profiles else "\033[1;33m[Lab]\033[0m"
         auth_status = "Auth: Configured" if t.auth else "Auth: None"
-        print(f"  [{idx}] {tag:<17} \033[1m{t.name:<22}\033[0m ({proto:<7} | {auth_status:<16} | {t.base_url})")
+        print(f"  [{idx}] \033[1;32m[Saved]\033[0m \033[1m{t.name:<22}\033[0m ({proto:<7} | {auth_status:<16} | {t.base_url})")
 
-    print(f"  [a] Run All Saved Custom Targets ({len(custom_profiles)} targets)")
+    print(f"  [a] Run All Saved Targets ({len(all_profiles)} targets)")
     print("  [b] Back to Main Menu")
 
     choice = _safe_input("\nSelect target number to run: ").lower()
@@ -199,7 +194,7 @@ def _menu_run_saved_target() -> None:
 
     selected: list[TargetConfig] = []
     if choice == "a":
-        selected = custom_profiles if custom_profiles else all_profiles
+        selected = all_profiles
     elif choice.isdigit() and 1 <= int(choice) <= len(all_profiles):
         selected = [all_profiles[int(choice) - 1]]
     else:
@@ -379,39 +374,13 @@ def _menu_generate_html() -> None:
     _prompt_open_browser(report_path)
 
 
-def _menu_demo_labs() -> None:
-    print("\n\033[1;33m🧪 DEMO LABS & DOCKER MANAGEMENT\033[0m")
-    print("These are pre-configured vulnerable testing applications (crAPI, VAmPI, DVGA).\n")
-    print("  [1] 🎯 Run Lab Fuzzing (crAPI, VAmPI, DVGA)")
-    print("  [2] 🐳 Start Lab Docker Containers")
-    print("  [3] 🔍 Check Lab Containers Health")
-    print("  [4] 🛑 Stop Lab Containers")
-    print("  [b] ⬅️  Back to Main Menu")
-
-    choice = _safe_input("\nSelect action: ").lower()
-    if choice == "1":
-        tokens = parse_tokens_env()
-        lab_tids = [t.target_id for t in TARGETS.list_lab_profiles()]
-        for tid in lab_tids:
-            try:
-                run_target(tid, tokens=tokens, targets=TARGETS)
-            except Exception as exc:
-                print(f"[X] Lab target {tid} failed: {exc}", file=sys.stderr)
-    elif choice == "2":
-        subprocess.run([PYTHON, str(LAB_SCRIPT), "start"], cwd=PROJECT_ROOT)
-    elif choice == "3":
-        subprocess.run([PYTHON, str(LAB_SCRIPT), "check"], cwd=PROJECT_ROOT)
-    elif choice == "4":
-        subprocess.run([PYTHON, str(LAB_SCRIPT), "stop"], cwd=PROJECT_ROOT)
-
-
 def _menu_run_workflow() -> None:
     print("\n\033[1;36m🔄 STATEFUL WORKFLOW EXECUTION\033[0m")
     print("Execute multi-step API workflows with dynamic variable extraction and BOLA validation.\n")
 
     default_wf = "targets/workflows/sample_workflow.yaml"
     wf_path = _safe_input(f"Path to workflow YAML file [{default_wf}]: ") or default_wf
-    base_url = _safe_input("Base URL override (optional, e.g. http://localhost:5002): ") or None
+    base_url = _safe_input("Base URL override (optional, e.g. http://127.0.0.1:8000): ") or None
     proxy = _safe_input("Upstream Proxy URL (optional, e.g. http://127.0.0.1:8080): ") or None
     insecure_ans = _safe_input("Disable SSL verification? [y/N]: ").lower()
     insecure = insecure_ans in {"y", "yes"}
@@ -434,9 +403,12 @@ def _menu_auto_workflow() -> None:
     print("Zero-YAML configuration: Automatically analyzes OpenAPI spec, pairs resource producers")
     print("and consumers, extracts IDs, and synthesizes cross-user BOLA/IDOR assertions.\n")
 
-    default_schema = "targets/schemas/vampi/vampi_spec.yaml"
-    schema_path = _safe_input(f"Path to OpenAPI Schema JSON/YAML [{default_schema}]: ") or default_schema
-    base_url = _safe_input("Base URL override (optional, e.g. http://localhost:5002): ") or None
+    schema_path = _safe_input("Path to OpenAPI Schema JSON/YAML: ")
+    if not schema_path:
+        print("[!] OpenAPI schema path is required.")
+        _safe_input("\nPress Enter to return to main menu...")
+        return
+    base_url = _safe_input("Target Base URL (e.g. http://127.0.0.1:8000): ") or None
     proxy = _safe_input("Upstream Proxy URL (optional, e.g. http://127.0.0.1:8080): ") or None
     insecure = _safe_input("Disable SSL verification? [y/N]: ").lower() in {"y", "yes"}
 
@@ -545,7 +517,7 @@ def interactive_terminal_ui() -> int:
     """Run full interactive terminal website / console."""
     while True:
         _render_menu_banner()
-        choice = _safe_input("Enter choice [1-10, q]: ").strip().lower()
+        choice = _safe_input("Enter choice [1-9, q]: ").strip().lower()
 
         if choice in {"q", "quit", "exit"}:
             print("\nGoodbye! Happy security testing.")
@@ -567,11 +539,9 @@ def interactive_terminal_ui() -> int:
         elif choice == "8":
             _menu_auto_workflow()
         elif choice == "9":
-            _menu_demo_labs()
-        elif choice == "10":
             _menu_scan_har()
         else:
-            print("\n[!] Invalid choice. Please enter 1-10 or q.")
+            print("\n[!] Invalid choice. Please enter 1-9 or q.")
         print()
 
 

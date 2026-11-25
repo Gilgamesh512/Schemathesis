@@ -1,9 +1,9 @@
-"""core/har_parser.py — Traffic-Driven HAR Ingestion & Live Seed Corpus Harvester cho Schemathesis.
+"""core/har_parser.py — Traffic-Driven HAR Ingestion & Live Seed Corpus Harvester.
 
-Phục vụ giải quyết điểm mù đặc tả tĩnh (Spec-Only Blindness) và hàng rào DTO validation:
-- Nạp các file .har (HTTP Archive) xuất từ Chrome DevTools, Burp Suite, Charles Proxy, Postman, hoặc API Gateway.
-- Trích xuất tự động các giá trị tham số thực tế (Live Seeds: ID thật, CCCD, Token, Header x-*, Payload DTO hợp lệ).
-- Cung cấp dữ liệu mồi (Seed Corpus) cho Schemathesis Semantic Mutator để vượt qua tầng schema validation 400/422.
+Addresses static spec-only blindness and strict DTO validation barriers:
+- Ingests .har (HTTP Archive) captures from Chrome DevTools, Burp Suite, Charles Proxy, Postman, or API Gateways.
+- Extracts live parameter values (real IDs, tokens, custom x-* headers, valid DTO bodies).
+- Supplies a live SeedCorpus to SemanticMutationEngine to pass HTTP 400/422 validation layers.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import re
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 BROWSER_IGNORE_HEADERS = {
     "host",
@@ -47,7 +47,7 @@ class HARSeed:
 
 
 class SeedCorpus:
-    """Kho lưu trữ hạt giống dữ liệu sống (Live Seed Corpus) được trích xuất từ lưu lượng thực tế."""
+    """Repository of live seed values extracted from captured HTTP traffic."""
 
     def __init__(self) -> None:
         self.param_seeds: dict[str, list[Any]] = {}
@@ -66,7 +66,7 @@ class SeedCorpus:
             self.param_seeds[clean_name].append(value)
 
     def get_seed_for_param(self, param_name: str) -> Any | None:
-        """Lấy giá trị hạt giống thực tế cho một tham số (tìm theo tên chính xác hoặc không phân biệt hoa thường)."""
+        """Return a live seed value for a parameter (exact or case-insensitive match)."""
         if param_name in self.param_seeds and self.param_seeds[param_name]:
             return self.param_seeds[param_name][0]
         p_lower = param_name.lower()
@@ -76,13 +76,13 @@ class SeedCorpus:
         return None
 
     def get_body_seed(self, method: str, path: str) -> dict[str, Any] | None:
-        """Lấy JSON request body thực tế đã được ghi nhận cho cặp method và path."""
+        """Return a recorded JSON request body for the given HTTP method and path."""
         key = (method.upper(), path)
         if key in self.request_seeds:
             for seed in self.request_seeds[key]:
                 if seed.body_json:
                     return dict(seed.body_json)
-        # Tìm path tương đương (bỏ qua trailing slash)
+        # Match equivalent paths ignoring trailing slashes
         for (m, p), seeds in self.request_seeds.items():
             if m == method.upper() and (p.rstrip("/") == path.rstrip("/") or path.startswith(p)):
                 for seed in seeds:
@@ -96,7 +96,7 @@ class SeedCorpus:
         return seeds[0] if seeds else None
 
     def suggest_auth_token(self) -> str | None:
-        """Đề xuất token xác thực tìm thấy trong HAR traffic."""
+        """Suggest an authentication token discovered in HAR traffic."""
         for name, val in self.auth_headers.items():
             if name.lower() == "authorization":
                 return val
@@ -116,7 +116,7 @@ class SeedCorpus:
 
 
 def _extract_params_from_object(obj: Any, corpus: SeedCorpus, prefix: str = "") -> None:
-    """Đệ quy trích xuất tên trường và giá trị từ JSON object lồng nhau."""
+    """Recursively extract field names and values from nested JSON objects."""
     if isinstance(obj, dict):
         for k, v in obj.items():
             full_key = f"{prefix}.{k}" if prefix else k
@@ -132,10 +132,10 @@ def _extract_params_from_object(obj: Any, corpus: SeedCorpus, prefix: str = "") 
 
 
 def parse_har_file(har_path: str | Path, target_host: str | None = None) -> SeedCorpus:
-    """Phân tích file HAR (HTTP Archive) và trả về kho hạt giống SeedCorpus."""
+    """Parse an HTTP Archive (.har) file and return a populated SeedCorpus."""
     p = Path(har_path)
     if not p.is_file():
-        raise FileNotFoundError(f"Không tìm thấy file HAR tại: {har_path}")
+        raise FileNotFoundError(f"HAR file not found: {har_path}")
 
     with p.open("r", encoding="utf-8", errors="replace") as f:
         har_data = json.load(f)
@@ -163,7 +163,7 @@ def parse_har_file(har_path: str | Path, target_host: str | None = None) -> Seed
         if host:
             corpus.discovered_hosts.add(host)
 
-        # Lọc host mục tiêu nếu có
+        # Filter by target host when specified
         if target_host_clean:
             if host != target_host_clean and not host.startswith(target_host_clean.split(":")[0]):
                 continue
@@ -171,7 +171,7 @@ def parse_har_file(har_path: str | Path, target_host: str | None = None) -> Seed
         method = (req.get("method") or "GET").upper()
         path = parsed_url.path or "/"
 
-        # 1. Trích xuất Query Params
+        # 1. Extract query parameters
         query_params: dict[str, Any] = {}
         for qp in (req.get("queryString") or []):
             if not isinstance(qp, dict):
@@ -182,7 +182,6 @@ def parse_har_file(har_path: str | Path, target_host: str | None = None) -> Seed
                 query_params[name] = val
                 corpus.add_param_seed(name, val)
 
-        # Trích xuất thêm query params từ raw URL
         if parsed_url.query:
             raw_qs = urllib.parse.parse_qs(parsed_url.query, keep_blank_values=True)
             for k, vs in raw_qs.items():
@@ -191,7 +190,7 @@ def parse_har_file(har_path: str | Path, target_host: str | None = None) -> Seed
                     if k not in query_params:
                         query_params[k] = vs[0]
 
-        # 2. Trích xuất Headers
+        # 2. Extract headers
         headers: dict[str, str] = {}
         for h in (req.get("headers") or []):
             if not isinstance(h, dict):
@@ -207,7 +206,6 @@ def parse_har_file(har_path: str | Path, target_host: str | None = None) -> Seed
             headers[h_name] = h_val
             corpus.add_param_seed(h_name, h_val)
 
-            # Nhận diện Auth Headers
             if h_name_lower in ("authorization", "proxy-authorization", "x-auth-token"):
                 corpus.auth_headers[h_name] = h_val
             elif h_name_lower.startswith("x-") or any(
@@ -215,7 +213,7 @@ def parse_har_file(har_path: str | Path, target_host: str | None = None) -> Seed
             ):
                 corpus.common_headers[h_name] = h_val
 
-        # 3. Trích xuất Cookies
+        # 3. Extract cookies
         cookies: dict[str, str] = {}
         for c in (req.get("cookies") or []):
             if not isinstance(c, dict):
@@ -226,7 +224,7 @@ def parse_har_file(har_path: str | Path, target_host: str | None = None) -> Seed
                 cookies[c_name] = c_val
                 corpus.add_param_seed(c_name, c_val)
 
-        # 4. Trích xuất Post Data / Request Body
+        # 4. Extract request body / form parameters
         body_raw = None
         body_json = None
         post_data = req.get("postData") or {}
@@ -251,7 +249,7 @@ def parse_har_file(har_path: str | Path, target_host: str | None = None) -> Seed
                 except Exception:
                     pass
 
-        # 5. Lưu lại request seed
+        # 5. Record request seed
         seed_obj = HARSeed(
             method=method,
             url=url,

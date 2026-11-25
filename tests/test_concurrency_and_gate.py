@@ -43,7 +43,7 @@ def test_concurrency_burst_result_evaluation():
     assert finding is not None
     assert finding.attack_type == "RACE_CONDITION"
     assert finding.owasp_category == "API4:2023"
-    assert finding.severity == "HIGH"
+    assert finding.severity == "high"
     assert finding.confirmed is True
 
 

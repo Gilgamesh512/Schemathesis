@@ -1,35 +1,39 @@
-"""Security reporting module: Terminal dashboard and interactive HTML report generator."""
+"""Security reporting module: Terminal dashboard, HTML report, and SARIF exporter."""
 
 from __future__ import annotations
 
 import csv
 import hashlib
 import hmac
-import html
 import json
+import logging
 import os
 import re
 import shutil
 import sys
-import urllib.parse
-import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from .path_manager import ProjectPaths
-from .curl_builder import build_curl_command, build_curl_from_finding, build_curl_dual_from_finding
-from .remediation_engine import RemediationEngine
+from .report_templates import render_html_document
+from .sarif_exporter import build_sarif_document
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+logger = logging.getLogger(__name__)
+_DEFAULT_SIGNING_KEY = "Schemathesis-Default-Audit-Key-2026"
 
 
 def compute_tamper_signature(content: str, secret_key: Optional[str] = None) -> str:
     """Compute HMAC-SHA256 signature for tamper-evident reporting."""
-    key = (secret_key or os.environ.get("REPORT_SIGNING_KEY", "Schemathesis-Default-Audit-Key-2026")).encode("utf-8")
+    env_key = os.environ.get("REPORT_SIGNING_KEY")
+    if secret_key is None and not env_key:
+        logger.debug("REPORT_SIGNING_KEY is unset; signing with default development audit key.")
+    key = (secret_key or env_key or _DEFAULT_SIGNING_KEY).encode("utf-8")
     return hmac.new(key, content.encode("utf-8"), hashlib.sha256).hexdigest()
 
-# Reconfigure stdout to utf-8 if supported to prevent Windows charmap encoding errors
+
+# Reconfigure stdout to UTF-8 if supported to prevent Windows charmap encoding errors
 try:
     if sys.stdout and hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -81,26 +85,24 @@ OWASP_METADATA = {
 }
 
 SEVERITY_COLORS = {
-    "critical": ("\033[91m\033[1m", "#ef4444"),  # Red bold
-    "high": ("\033[31m", "#f97316"),            # Red/Orange
-    "medium": ("\033[33m", "#eab308"),          # Yellow
-    "low": ("\033[34m", "#3b82f6"),             # Blue
-    "info": ("\033[90m", "#64748b"),            # Gray
+    "critical": ("\033[91m\033[1m", "#ef4444"),
+    "high": ("\033[31m", "#f97316"),
+    "medium": ("\033[33m", "#eab308"),
+    "low": ("\033[34m", "#3b82f6"),
+    "info": ("\033[90m", "#64748b"),
 }
-RESET_COLOR = "\033[0m"
 
 
 def _safe_print(text: str) -> None:
     try:
         print(text)
     except UnicodeEncodeError:
-        # Fallback to ascii replacement if terminal does not support unicode
         clean = text.encode("ascii", errors="replace").decode("ascii")
         print(clean)
 
 
 class SecurityReporter:
-    """Consolidates findings and produces executive terminal dashboards and interactive HTML reports."""
+    """Consolidates findings and produces executive terminal dashboards, HTML reports, and SARIF."""
 
     def __init__(self, results_dir: str | Path | None = None):
         self.paths = ProjectPaths.from_root(PROJECT_ROOT)
@@ -159,7 +161,6 @@ class SecurityReporter:
         if not all_findings:
             return []
 
-        # Find the latest run_id from findings
         latest_run_id = all_findings[-1].get("run_id")
         if latest_run_id:
             latest = [f for f in all_findings if f.get("run_id") == latest_run_id]
@@ -195,10 +196,7 @@ class SecurityReporter:
         owasp = raw.get("owasp_category")
         if owasp:
             match = re.search(r"API\d+:2023", str(owasp))
-            if match:
-                owasp = match.group(0)
-            else:
-                owasp = str(owasp).strip()
+            owasp = match.group(0) if match else str(owasp).strip()
         else:
             owasp = "Unassigned"
 
@@ -254,8 +252,7 @@ class SecurityReporter:
 
         valid_times = [f["response_time_ms"] for f in findings if f.get("response_time_ms") is not None]
         avg_latency = round(sum(valid_times) / len(valid_times), 1) if valid_times else 0.0
-
-        endpoints = len(set((f.get("method"), f.get("endpoint")) for f in findings))
+        endpoints = len({(f.get("method"), f.get("endpoint")) for f in findings})
 
         return {
             "total": total,
@@ -284,7 +281,6 @@ class SecurityReporter:
         _safe_print(f" \033[1mReport Generated:\033[0m {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         _safe_print("")
 
-        # Key Metrics KPI Cards
         sev = metrics["severity_counts"]
         confirmed_color = "\033[1;91m" if metrics["confirmed"] > 0 else "\033[1;32m"
         _safe_print(" \033[1mEXECUTIVE SUMMARY\033[0m")
@@ -297,7 +293,6 @@ class SecurityReporter:
         _safe_print(" └" + "─" * 16 + "┴" + "─" * 18 + "┴" + "─" * 18 + "┴" + "─" * 18 + "┘")
         _safe_print("")
 
-        # Severity Breakdown Pills
         _safe_print(" \033[1mSEVERITY DISTRIBUTION\033[0m")
         pills = [
             f"\033[1;91m[CRITICAL: {sev['critical']}]\033[0m",
@@ -309,7 +304,6 @@ class SecurityReporter:
         _safe_print("   " + "   ".join(pills))
         _safe_print("")
 
-        # OWASP Top 10 Breakdown Table
         if metrics["owasp_counts"]:
             _safe_print(" \033[1mOWASP API SECURITY TOP 10 (2023) BREAKDOWN\033[0m")
             _safe_print(" ┌" + "─" * 12 + "┬" + "─" * 44 + "┬" + "─" * 8 + "┬" + "─" * 11 + "┐")
@@ -326,7 +320,6 @@ class SecurityReporter:
             _safe_print(" └" + "─" * 12 + "┴" + "─" * 44 + "┴" + "─" * 8 + "┴" + "─" * 11 + "┘")
             _safe_print("")
 
-        # Highlight Confirmed Vulnerabilities
         confirmed_findings = [f for f in findings if f.get("confirmed")]
         if confirmed_findings:
             _safe_print(" \033[1;91m🚨 VERIFIED / CONFIRMED VULNERABILITIES (PROOF OF EXPLOIT)\033[0m")
@@ -356,13 +349,12 @@ class SecurityReporter:
         target_info: dict[str, Any] | None = None,
         output_file: str | Path | None = None,
     ) -> Path:
-        """Generate a modern, interactive single-file HTML report with zero external dependencies."""
+        """Generate a standalone interactive HTML report with zero external dependencies."""
         metrics = self.compute_metrics(findings)
         target_name = (target_info or {}).get("name") or "API Security Fuzzing"
         target_url = (target_info or {}).get("url") or "Target Endpoint"
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        # Determine output file path
         self.results_dir.mkdir(parents=True, exist_ok=True)
         if output_file is not None:
             report_path = Path(output_file).resolve()
@@ -370,496 +362,16 @@ class SecurityReporter:
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             report_path = self.results_dir / f"report_{ts}.html"
 
-        # Generate findings rows
-        findings_html = []
-        for index, f in enumerate(findings, start=1):
-            sev = f["severity"].lower()
-            _, hex_color = SEVERITY_COLORS.get(sev, ("", "#64748b"))
-            is_confirmed = f["confirmed"]
-            confirmed_badge = (
-                '<span class="badge badge-confirmed">CONFIRMED VULNERABILITY</span>'
-                if is_confirmed
-                else '<span class="badge badge-unconfirmed">PROBE / UNCONFIRMED</span>'
-            )
-            sev_badge = f'<span class="badge" style="background-color: {hex_color}22; color: {hex_color}; border: 1px solid {hex_color}55;">{sev.upper()}</span>'
+        html_content = render_html_document(
+            findings,
+            metrics,
+            target_name=target_name,
+            target_url=target_url,
+            now_str=now_str,
+            owasp_metadata=OWASP_METADATA,
+            severity_colors=SEVERITY_COLORS,
+        )
 
-            # Payload format
-            raw_payload = f.get("payload")
-            if isinstance(raw_payload, (dict, list)):
-                payload_str = json.dumps(raw_payload, indent=2, ensure_ascii=False)
-            else:
-                payload_str = str(raw_payload or "")
-
-            # 1-Click cURL reproduction command (Cross-Platform: Bash/PowerShell & Windows CMD)
-            curl_dual = build_curl_dual_from_finding(f, base_url=target_url)
-            curl_bash = f.get("curl_command") or curl_dual["bash"]
-            curl_win_cmd = curl_dual["cmd"]
-
-            # Remediation
-            owasp_cat = f.get("owasp_category") or ""
-            remediation = OWASP_METADATA.get(owasp_cat, {}).get(
-                "remediation",
-                "Ensure inputs are validated against schema, enforce authentication/authorization checks, and sanitize responses.",
-            )
-
-            # Framework-Specific Remediation Snippet
-            snippet = RemediationEngine.get_snippet(owasp_cat)
-            snippet_html = ""
-            if snippet:
-                snippet_html = f"""
-                <div class="code-patch-box" style="margin-top: 10px; background: #0b1329; border: 1px solid #1e293b; border-radius: 6px; padding: 12px;">
-                    <div style="font-weight: 600; color: #38bdf8; margin-bottom: 4px; font-size: 13px;">
-                        🛠️ Idiomatic Fix Pattern ({html.escape(snippet.framework)}): {html.escape(snippet.title)}
-                    </div>
-                    <p style="font-size: 12px; color: #94a3b8; margin: 4px 0 8px 0;">{html.escape(snippet.explanation)}</p>
-                    <div style="font-size: 11px; font-weight: 600; color: #4ade80; margin-bottom: 4px;">✓ Secure Implementation:</div>
-                    <pre class="code-box" style="background: #020617; color: #4ade80; margin: 0; padding: 8px; border-radius: 4px; font-size: 12px; white-space: pre-wrap;"><code>{html.escape(snippet.secure_example)}</code></pre>
-                </div>
-                """
-
-            cve_badges = "".join(
-                f'<span class="cve-tag">{html.escape(c)}</span>'
-                for c in (f.get("matched_cve") or [])
-            ) or '<span style="color: #64748b;">None</span>'
-
-            findings_html.append(f"""
-            <div class="finding-card severity-{sev} {'is-confirmed' if is_confirmed else ''}" data-severity="{sev}" data-confirmed="{str(is_confirmed).lower()}">
-                <div class="finding-header" onclick="toggleDetails('{index}')">
-                    <div class="finding-title">
-                        <span class="method-tag method-{html.escape(f['method'])}">{html.escape(f['method'])}</span>
-                        <span class="endpoint-name">{html.escape(f['endpoint'])}</span>
-                        {sev_badge}
-                        {confirmed_badge}
-                    </div>
-                    <div class="finding-meta">
-                        <span class="status-code">HTTP {f.get('status_code') or '---'}</span>
-                        <span class="latency">{f.get('response_time_ms') or 0} ms</span>
-                        <span class="expand-icon" id="icon-{index}">▼</span>
-                    </div>
-                </div>
-                <div class="finding-details" id="details-{index}" style="display: none;">
-                    <div class="detail-grid">
-                        <div class="detail-box">
-                            <h4>Attack Details</h4>
-                            <p><strong>Attack Type:</strong> {html.escape(f['attack_type'])}</p>
-                            <p><strong>OWASP Category:</strong> {html.escape(owasp_cat)} - {html.escape(OWASP_METADATA.get(owasp_cat, {}).get('name', 'N/A'))}</p>
-                            <p><strong>Matched CVEs:</strong> {cve_badges}</p>
-                            <p><strong>Fingerprint:</strong> <code>{html.escape(f.get('fingerprint', ''))}</code></p>
-                        </div>
-                        <div class="detail-box">
-                            <h4>Evidence / Signal</h4>
-                            <pre class="evidence-box">{html.escape(f.get('evidence') or 'No signal detected')}</pre>
-                        </div>
-                    </div>
-
-                    <div class="detail-box full-width">
-                        <h4>Fuzzing Payload</h4>
-                        <pre class="code-box"><code>{html.escape(payload_str)}</code></pre>
-                    </div>
-
-                    <div class="detail-box full-width" style="margin-top: 10px;">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                            <h4 style="margin: 0;">1-Click Reproduction (cURL)</h4>
-                            <div style="display: flex; gap: 6px;">
-                                <button onclick="navigator.clipboard.writeText(this.getAttribute('data-curl')); this.innerText='✓ Copied!';" data-curl="{html.escape(curl_bash)}" style="background: #38bdf8; color: #04101d; border: none; padding: 4px 10px; border-radius: 4px; font-weight: 600; cursor: pointer; font-size: 11px;">📋 Bash / PowerShell</button>
-                                <button onclick="navigator.clipboard.writeText(this.getAttribute('data-curl')); this.innerText='✓ Copied!';" data-curl="{html.escape(curl_win_cmd)}" style="background: #0284c7; color: #ffffff; border: none; padding: 4px 10px; border-radius: 4px; font-weight: 600; cursor: pointer; font-size: 11px;">📋 Windows CMD</button>
-                            </div>
-                        </div>
-                        <pre class="code-box" style="background: #020617; color: #38bdf8;"><code>{html.escape(curl_bash)}</code></pre>
-                    </div>
-
-                    <div class="remediation-box">
-                        <strong>🛡️ Recommended Remediation:</strong>
-                        <p>{html.escape(remediation)}</p>
-                        {snippet_html}
-                    </div>
-                </div>
-            </div>
-            """)
-
-        all_findings_str = "\n".join(findings_html) if findings_html else "<div class='empty-state'>No security findings recorded. Target is clean!</div>"
-
-        # OWASP Bar Chart SVG
-        owasp_bars = []
-        max_owasp = max(metrics["owasp_counts"].values()) if metrics["owasp_counts"] else 1
-        for cat, cnt in list(metrics["owasp_counts"].items())[:7]:
-            pct = int((cnt / max_owasp) * 100)
-            meta_name = OWASP_METADATA.get(cat, {}).get("name", cat)
-            owasp_bars.append(f"""
-            <div class="bar-row">
-                <span class="bar-label">{html.escape(cat)} - {html.escape(meta_name)} ({cnt})</span>
-                <div class="bar-container">
-                    <div class="bar-fill" style="width: {pct}%;"></div>
-                </div>
-            </div>
-            """)
-        owasp_bars_html = "\n".join(owasp_bars) or "<p class='text-muted'>No OWASP categories detected.</p>"
-
-        # SVG Donut Chart for Severity
-        sev_counts = metrics["severity_counts"]
-        total_sev = max(1, sum(sev_counts.values()))
-        crit_pct = round((sev_counts["critical"] / total_sev) * 100)
-        high_pct = round((sev_counts["high"] / total_sev) * 100)
-        med_pct = round((sev_counts["medium"] / total_sev) * 100)
-        low_pct = round((sev_counts["low"] / total_sev) * 100)
-
-        html_content = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>API Security Report - {html.escape(target_name)}</title>
-    <style>
-        :root {{
-            --bg-primary: #0a0e17;
-            --bg-secondary: #121824;
-            --bg-card: #182232;
-            --text-primary: #f1f5f9;
-            --text-secondary: #94a3b8;
-            --border: #223249;
-            --accent: #38bdf8;
-            --critical: #ef4444;
-            --high: #f97316;
-            --medium: #eab308;
-            --low: #3b82f6;
-            --info: #64748b;
-            --success: #10b981;
-        }}
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        body {{
-            background-color: var(--bg-primary);
-            color: var(--text-primary);
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            line-height: 1.5;
-            padding: 24px;
-        }}
-        .container {{ max-width: 1200px; margin: 0 auto; }}
-        header {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding-bottom: 20px;
-            border-bottom: 1px solid var(--border);
-            margin-bottom: 24px;
-        }}
-        .brand h1 {{ font-size: 24px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 8px; }}
-        .brand p {{ color: var(--text-secondary); font-size: 14px; }}
-        .header-actions button {{
-            background: var(--bg-card);
-            border: 1px solid var(--border);
-            color: var(--text-primary);
-            padding: 8px 16px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-weight: 500;
-        }}
-        .header-actions button:hover {{ background: #1e2d42; }}
-
-        /* KPI Cards */
-        .kpi-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 16px;
-            margin-bottom: 24px;
-        }}
-        .kpi-card {{
-            background: var(--bg-secondary);
-            border: 1px solid var(--border);
-            border-radius: 10px;
-            padding: 18px;
-        }}
-        .kpi-title {{ font-size: 13px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; }}
-        .kpi-value {{ font-size: 32px; font-weight: 700; margin-top: 6px; }}
-        .kpi-value.danger {{ color: var(--critical); }}
-        .kpi-value.warning {{ color: var(--high); }}
-        .kpi-value.clean {{ color: var(--success); }}
-
-        /* Chart section */
-        .analytics-grid {{
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 16px;
-            margin-bottom: 24px;
-        }}
-        .chart-box {{
-            background: var(--bg-secondary);
-            border: 1px solid var(--border);
-            border-radius: 10px;
-            padding: 20px;
-        }}
-        .chart-box h3 {{ font-size: 16px; margin-bottom: 16px; color: var(--text-primary); }}
-
-        .bar-row {{ margin-bottom: 10px; }}
-        .bar-label {{ font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 4px; }}
-        .bar-container {{ width: 100%; background: #1e293b; height: 10px; border-radius: 5px; overflow: hidden; }}
-        .bar-fill {{ background: var(--accent); height: 100%; border-radius: 5px; }}
-
-        /* Controls */
-        .controls {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 16px;
-            flex-wrap: wrap;
-            gap: 12px;
-        }}
-        .filter-group {{ display: flex; gap: 8px; flex-wrap: wrap; }}
-        .filter-btn {{
-            background: var(--bg-secondary);
-            border: 1px solid var(--border);
-            color: var(--text-secondary);
-            padding: 6px 12px;
-            border-radius: 6px;
-            font-size: 13px;
-            cursor: pointer;
-        }}
-        .filter-btn.active {{
-            background: var(--accent);
-            color: #04101d;
-            font-weight: 600;
-            border-color: var(--accent);
-        }}
-        .search-input {{
-            background: var(--bg-secondary);
-            border: 1px solid var(--border);
-            color: var(--text-primary);
-            padding: 8px 14px;
-            border-radius: 6px;
-            width: 280px;
-        }}
-
-        /* Findings Cards */
-        .finding-card {{
-            background: var(--bg-secondary);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            margin-bottom: 10px;
-            overflow: hidden;
-            transition: border-color 0.2s;
-        }}
-        .finding-card.is-confirmed {{ border-left: 4px solid var(--critical); }}
-        .finding-header {{
-            padding: 14px 18px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            cursor: pointer;
-            user-select: none;
-        }}
-        .finding-header:hover {{ background: rgba(255, 255, 255, 0.02); }}
-        .finding-title {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
-        .method-tag {{
-            font-size: 12px;
-            font-weight: 700;
-            padding: 2px 8px;
-            border-radius: 4px;
-            background: #334155;
-        }}
-        .method-GET {{ background: #0369a1; color: #e0f2fe; }}
-        .method-POST {{ background: #15803d; color: #dcfce7; }}
-        .method-DELETE {{ background: #b91c1c; color: #fee2e2; }}
-        .method-PUT {{ background: #b45309; color: #fef3c7; }}
-        .endpoint-name {{ font-family: monospace; font-size: 14px; font-weight: 600; }}
-
-        .badge {{
-            font-size: 11px;
-            font-weight: 700;
-            padding: 3px 8px;
-            border-radius: 9999px;
-            text-transform: uppercase;
-        }}
-        .badge-confirmed {{ background: rgba(239, 68, 68, 0.2); color: var(--critical); border: 1px solid rgba(239, 68, 68, 0.4); }}
-        .badge-unconfirmed {{ background: rgba(100, 116, 139, 0.15); color: var(--text-secondary); }}
-
-        .finding-meta {{ display: flex; align-items: center; gap: 14px; color: var(--text-secondary); font-size: 13px; }}
-        .expand-icon {{ font-size: 10px; color: var(--text-secondary); }}
-
-        .finding-details {{
-            padding: 18px;
-            border-top: 1px solid var(--border);
-            background: #0d131f;
-        }}
-        .detail-grid {{
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 16px;
-            margin-bottom: 14px;
-        }}
-        .detail-box h4 {{ font-size: 13px; color: var(--text-secondary); text-transform: uppercase; margin-bottom: 8px; }}
-        .detail-box p {{ font-size: 13px; margin-bottom: 6px; }}
-        .cve-tag {{ background: #1e293b; padding: 2px 6px; border-radius: 4px; font-size: 11px; margin-right: 4px; }}
-
-        .evidence-box, .code-box {{
-            background: #070b12;
-            padding: 12px;
-            border-radius: 6px;
-            font-family: monospace;
-            font-size: 12px;
-            overflow-x: auto;
-            border: 1px solid #1a2536;
-            color: #38bdf8;
-            max-height: 250px;
-        }}
-
-        .remediation-box {{
-            margin-top: 14px;
-            background: rgba(56, 189, 248, 0.08);
-            border: 1px solid rgba(56, 189, 248, 0.3);
-            border-radius: 6px;
-            padding: 12px 16px;
-            font-size: 13px;
-            color: #bae6fd;
-        }}
-        .empty-state {{ text-align: center; padding: 40px; color: var(--text-secondary); }}
-
-        @media (max-width: 768px) {{
-            .analytics-grid, .detail-grid {{ grid-template-columns: 1fr; }}
-            .controls {{ flex-direction: column; align-items: stretch; }}
-            .search-input {{ width: 100%; }}
-        }}
-        @media print {{
-            body {{ background: #fff; color: #000; }}
-            .finding-card {{ break-inside: avoid; border: 1px solid #ccc; }}
-            .finding-details {{ display: block !important; }}
-            .controls, .header-actions {{ display: none; }}
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <div class="brand">
-                <h1>🛡️ API Security Fuzzing Report</h1>
-                <p>Target: <strong>{html.escape(target_name)}</strong> ({html.escape(target_url)}) | Generated: {now_str}</p>
-            </div>
-            <div class="header-actions">
-                <button onclick="window.print()">🖨️ Print / Save PDF</button>
-            </div>
-        </header>
-
-        <section class="kpi-grid">
-            <div class="kpi-card">
-                <div class="kpi-title">Total Tests & Probes</div>
-                <div class="kpi-value">{metrics['total']}</div>
-            </div>
-            <div class="kpi-card">
-                <div class="kpi-title">Verified Exploits</div>
-                <div class="kpi-value {'danger' if metrics['confirmed'] > 0 else 'clean'}">{metrics['confirmed']}</div>
-            </div>
-            <div class="kpi-card">
-                <div class="kpi-title">Critical & High Vulnerabilities</div>
-                <div class="kpi-value {'danger' if (sev_counts['critical'] + sev_counts['high']) > 0 else 'clean'}">
-                    {sev_counts['critical'] + sev_counts['high']}
-                </div>
-            </div>
-            <div class="kpi-card">
-                <div class="kpi-title">Average Response Latency</div>
-                <div class="kpi-value">{metrics['avg_latency_ms']} <span style="font-size: 16px; font-weight: normal;">ms</span></div>
-            </div>
-        </section>
-
-        <section class="analytics-grid">
-            <div class="chart-box">
-                <h3>Severity Distribution</h3>
-                <div class="bar-row">
-                    <span class="bar-label">Critical ({sev_counts['critical']})</span>
-                    <div class="bar-container"><div class="bar-fill" style="width: {crit_pct}%; background: var(--critical);"></div></div>
-                </div>
-                <div class="bar-row">
-                    <span class="bar-label">High ({sev_counts['high']})</span>
-                    <div class="bar-container"><div class="bar-fill" style="width: {high_pct}%; background: var(--high);"></div></div>
-                </div>
-                <div class="bar-row">
-                    <span class="bar-label">Medium ({sev_counts['medium']})</span>
-                    <div class="bar-container"><div class="bar-fill" style="width: {med_pct}%; background: var(--medium);"></div></div>
-                </div>
-                <div class="bar-row">
-                    <span class="bar-label">Low ({sev_counts['low']})</span>
-                    <div class="bar-container"><div class="bar-fill" style="width: {low_pct}%; background: var(--low);"></div></div>
-                </div>
-            </div>
-
-            <div class="chart-box">
-                <h3>OWASP API Security Top 10 (2023)</h3>
-                {owasp_bars_html}
-            </div>
-        </section>
-
-        <section>
-            <div class="controls">
-                <div class="filter-group">
-                    <button class="filter-btn active" onclick="filterSeverity('all')">All ({metrics['total']})</button>
-                    <button class="filter-btn" onclick="filterConfirmed()">Confirmed Only ({metrics['confirmed']})</button>
-                    <button class="filter-btn" onclick="filterSeverity('critical')">Critical ({sev_counts['critical']})</button>
-                    <button class="filter-btn" onclick="filterSeverity('high')">High ({sev_counts['high']})</button>
-                    <button class="filter-btn" onclick="filterSeverity('medium')">Medium ({sev_counts['medium']})</button>
-                    <button class="filter-btn" onclick="filterSeverity('low')">Low ({sev_counts['low']})</button>
-                </div>
-                <input type="text" class="search-input" id="searchInput" onkeyup="searchFindings()" placeholder="Search endpoint, attack, CVE...">
-            </div>
-
-            <div id="findingsContainer">
-                {all_findings_str}
-            </div>
-        </section>
-    </div>
-
-    <script>
-        function toggleDetails(id) {{
-            const details = document.getElementById('details-' + id);
-            const icon = document.getElementById('icon-' + id);
-            if (details.style.display === 'none') {{
-                details.style.display = 'block';
-                icon.textContent = '▲';
-            }} else {{
-                details.style.display = 'none';
-                icon.textContent = '▼';
-            }}
-        }}
-
-        function filterSeverity(sev) {{
-            document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-            event.target.classList.add('active');
-            const cards = document.querySelectorAll('.finding-card');
-            cards.forEach(card => {{
-                if (sev === 'all' || card.getAttribute('data-severity') === sev) {{
-                    card.style.display = 'block';
-                }} else {{
-                    card.style.display = 'none';
-                }}
-            }});
-        }}
-
-        function filterConfirmed() {{
-            document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-            event.target.classList.add('active');
-            const cards = document.querySelectorAll('.finding-card');
-            cards.forEach(card => {{
-                if (card.getAttribute('data-confirmed') === 'true') {{
-                    card.style.display = 'block';
-                }} else {{
-                    card.style.display = 'none';
-                }}
-            }});
-        }}
-
-        function searchFindings() {{
-            const query = document.getElementById('searchInput').value.toLowerCase();
-            const cards = document.querySelectorAll('.finding-card');
-            cards.forEach(card => {{
-                const text = card.textContent.toLowerCase();
-                if (text.includes(query)) {{
-                    card.style.display = 'block';
-                }} else {{
-                    card.style.display = 'none';
-                }}
-            }});
-        }}
-    </script>
-</body>
-</html>
-"""
-        # Compute HMAC tamper-evident signature for integrity verification
         sig = compute_tamper_signature(html_content)
         footer_badge = f"""
         <footer style="margin-top: 40px; padding: 20px; border-top: 1px solid #334155; text-align: center; font-size: 13px; color: #94a3b8;">
@@ -873,14 +385,12 @@ class SecurityReporter:
         html_content = html_content.replace("</body>", f"{footer_badge}\n</body>")
         report_path.write_text(html_content, encoding="utf-8")
 
-        # Also maintain a symlink / copy as 'latest_report.html' for instant access
         latest_path = self.results_dir / "latest_report.html"
         try:
             shutil.copy2(report_path, latest_path)
         except Exception:
             pass
 
-        # Also automatically generate/update SARIF report for CI/CD integration
         try:
             self.generate_sarif_report(findings, target_info)
         except Exception:
@@ -902,150 +412,13 @@ class SecurityReporter:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             sarif_path = self.results_dir / f"report_{timestamp}.sarif"
 
-        # Determine reference schema file for accurate physicalLocation mapping
-        schema_file_ref = ""
-        if target_info:
-            raw_spec = target_info.get("schema") or target_info.get("schema_file") or target_info.get("schema_path") or ""
-            if raw_spec and not str(raw_spec).startswith(("http://", "https://")):
-                try:
-                    rel_p = Path(raw_spec).resolve()
-                    if PROJECT_ROOT in rel_p.parents or rel_p == PROJECT_ROOT:
-                        schema_file_ref = rel_p.relative_to(PROJECT_ROOT).as_posix()
-                    else:
-                        schema_file_ref = Path(raw_spec).as_posix()
-                except Exception:
-                    schema_file_ref = str(raw_spec)
-
-        rules_map: dict[str, dict[str, Any]] = {}
-        sarif_results: list[dict[str, Any]] = []
-
-        owasp_keys = list(OWASP_METADATA.keys())
-
-        for f in findings:
-            rule_id = f.get("owasp_category") or "API-SECURITY"
-            if rule_id not in rules_map:
-                meta = OWASP_METADATA.get(rule_id, {})
-                help_text = meta.get("remediation", "Apply strict authorization, input validation, and access controls.")
-                sarif_snippet = RemediationEngine.get_snippet(rule_id)
-                help_md = help_text
-                if sarif_snippet:
-                    help_md += f"\n\n### Recommended Fix ({sarif_snippet.framework})\n\n```\n{sarif_snippet.secure_example}\n```"
-
-                rule_entry: dict[str, Any] = {
-                    "id": rule_id,
-                    "name": meta.get("name", rule_id),
-                    "shortDescription": {"text": meta.get("name", rule_id)},
-                    "fullDescription": {"text": f"OWASP API Security Top 10 category {rule_id}"},
-                    "help": {
-                        "text": help_text,
-                        "markdown": help_md,
-                    },
-                    "defaultConfiguration": {
-                        "level": "error" if f.get("severity") in ("critical", "high") else "warning"
-                    },
-                }
-                if rule_id in owasp_keys:
-                    rule_entry["relationships"] = [{
-                        "target": {
-                            "id": rule_id,
-                            "index": owasp_keys.index(rule_id),
-                            "toolComponent": {"name": "OWASP API Security Top 10 2023"}
-                        },
-                        "kinds": ["superset"]
-                    }]
-                rules_map[rule_id] = rule_entry
-
-            level = "error" if f.get("severity") in ("critical", "high") else ("warning" if f.get("severity") == "medium" else "note")
-            msg_text = (
-                f"[{f.get('method', 'GET')}] {f.get('endpoint', '/')} - "
-                f"{f.get('attack_type', 'Vulnerability')} ({f.get('severity', 'info').upper()}). "
-                f"Confirmed: {f.get('confirmed', False)}. {f.get('evidence', '')}"
-            )
-
-            # Physical location: Prefer relative schema/spec file if available, else standard endpoint URI
-            if schema_file_ref:
-                artifact_uri = schema_file_ref
-            else:
-                endpoint_raw = str(f.get("endpoint", "/"))
-                artifact_uri = urllib.parse.quote(endpoint_raw, safe="/:@?&=#%+")
-
-            finding_props = {
-                "finding_id": f.get("finding_id", ""),
-                "target_app": f.get("target_app", ""),
-                "confirmed": bool(f.get("confirmed", False)),
-                "severity": f.get("severity", "info"),
-                "owasp_category": rule_id,
-                "attack_type": f.get("attack_type", ""),
-                "matched_cve": f.get("matched_cve", []),
-                "cwe_id": f.get("cwe_id") or "CWE-20",
-            }
-            if f.get("curl_command"):
-                finding_props["curl_command"] = f.get("curl_command")
-
-            res_entry: dict[str, Any] = {
-                "ruleId": rule_id,
-                "level": level,
-                "message": {"text": msg_text},
-                "locations": [{
-                    "physicalLocation": {
-                        "artifactLocation": {
-                            "uri": artifact_uri,
-                            "uriBaseId": "%SRCROOT%" if schema_file_ref else None,
-                        },
-                        "region": {"startLine": int(f.get("line_number") or 1)}
-                    }
-                }],
-                "properties": finding_props,
-            }
-            if rule_id in owasp_keys:
-                res_entry["taxa"] = [{
-                    "id": rule_id,
-                    "index": owasp_keys.index(rule_id),
-                    "toolComponent": {"name": "OWASP API Security Top 10 2023"}
-                }]
-            sarif_results.append(res_entry)
-
-        taxonomies = [{
-            "name": "OWASP API Security Top 10 2023",
-            "version": "2023",
-            "organization": "OWASP",
-            "shortDescription": {"text": "OWASP API Security Top 10 Standard (2023)"},
-            "taxa": [
-                {
-                    "id": cid,
-                    "name": c_meta.get("name", cid),
-                    "shortDescription": {"text": c_meta.get("name", cid)},
-                    "helpUri": f"https://owasp.org/API-Security/editions/2023/en/0xa{idx+1}-{cid.lower().replace(':', '-')}/"
-                }
-                for idx, (cid, c_meta) in enumerate(OWASP_METADATA.items())
-            ]
-        }]
-
-        sarif_doc = {
-            "version": "2.1.0",
-            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
-            "runs": [{
-                "tool": {
-                    "driver": {
-                        "name": "Schemathesis API Security Fuzzer",
-                        "informationUri": "https://github.com/Gilgamesh512/Schemathesis",
-                        "version": "2.0.0",
-                        "rules": list(rules_map.values()),
-                        "supportedTaxonomies": [{"name": "OWASP API Security Top 10 2023"}],
-                    }
-                },
-                "taxonomies": taxonomies,
-                "results": sarif_results,
-            }]
-        }
-
-        raw_sarif_str = json.dumps(sarif_doc, indent=2, ensure_ascii=False)
-        sarif_sig = compute_tamper_signature(raw_sarif_str)
-        sarif_doc["runs"][0]["properties"] = {
-            "tamper_evident_hmac": sarif_sig,
-            "signature_algorithm": "HMAC-SHA256",
-            "signed_at": datetime.now(timezone.utc).isoformat(),
-        }
+        sarif_doc = build_sarif_document(
+            findings,
+            owasp_metadata=OWASP_METADATA,
+            project_root=PROJECT_ROOT,
+            sign_fn=compute_tamper_signature,
+            target_info=target_info,
+        )
 
         sarif_path.write_text(json.dumps(sarif_doc, indent=2, ensure_ascii=False), encoding="utf-8")
         canonical_sarif = self.results_dir / "vulnerabilities.sarif"
@@ -1057,4 +430,4 @@ class SecurityReporter:
         return sarif_path
 
 
-__all__ = ["SecurityReporter", "OWASP_METADATA"]
+__all__ = ["SecurityReporter", "OWASP_METADATA", "compute_tamper_signature"]

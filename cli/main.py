@@ -65,7 +65,7 @@ def _render_menu_banner() -> None:
     print("  ╚════██║██║      ██╔══██║██╔══╝  ██║╚██╔╝██║██╔══██║   ██║   ██╔══██║██╔══╝  ╚════██║██║╚════██║")
     print("  ███████║╚██████╗ ██║  ██║███████╗██║ ╚═╝ ██║██║  ██║   ██║   ██║  ██║███████╗███████║██║███████║")
     print("  ╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝     ╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝╚══════╝\033[0m")
-    print("\033[1;33m" + "                     🛡️  HỆ THỐNG KIỂM THỬ BẢO MẬT API - SCHEMATHESIS PRO  🛡️".center(98) + "\033[0m")
+    print("\033[1;33m" + "                     🛡️  API SECURITY TESTING FRAMEWORK - SCHEMATHESIS PRO  🛡️".center(98) + "\033[0m")
     print("\033[90m" + "                   Universal Vulnerability Scanner • OWASP API Top 10 • Auto-Discovery".center(98) + "\033[0m\n")
     print(" \033[1mSelect an action from the menu below:\033[0m\n")
     print("  \033[1;32m[1]\033[0m 🚀 \033[1mQuick Scan Any API\033[0m (Paste URL -> Auto-Discover Schema -> Fuzz -> Report)")

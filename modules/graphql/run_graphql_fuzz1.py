@@ -50,28 +50,37 @@ import httpx
 from pydantic import BaseModel, Field, ValidationError
 
 from modules.security import rules_engine
-from core import (ConfirmationEngine, Evidence, Finding, RequestScheduler,
-                  ProjectPaths, ResultManager, TargetManager, content_hash,
-                  redact_headers, snapshot_response, stable_finding_id)
+from core import (
+    ConfirmationEngine,
+    Evidence,
+    Finding,
+    RequestScheduler,
+    ProjectPaths,
+    ResultManager,
+    RunState as _SharedRunState,
+    TargetManager,
+    DEFAULT_ERROR_SIGNALS as _BASE_ERROR_SIGNALS,
+    MAX_ATTEMPTS_PER_FINGERPRINT,
+    SEVERITY_BY_STATUS,
+    content_hash,
+    extract_response_elapsed_ms,
+    redact_headers,
+    snapshot_response,
+    stable_finding_id,
+)
 
 PROJECT_PATHS = ProjectPaths.from_root(PROJECT_ROOT)
 
 
-DEFAULT_ERROR_SIGNALS = [
-    "internal server error",
-    "traceback",
-    "stack trace",
+DEFAULT_ERROR_SIGNALS = list(dict.fromkeys([
+    *_BASE_ERROR_SIGNALS,
     "syntax error",
-    "syntaxerror",
     "exception",
     "unhandled",
     "database error",
-    "sql syntax",
     "graphql error",
-]
+]))
 
-SEVERITY_BY_STATUS = {500: "high", 502: "high", 503: "medium"}
-MAX_ATTEMPTS_PER_FINGERPRINT = 3
 RUN_ID = ""
 
 
@@ -110,88 +119,11 @@ def fingerprint_of(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-class RunState:
+class RunState(_SharedRunState):
+    """GraphQL RunState with auto-save enabled on each recorded attempt."""
+
     def __init__(self, path: Path):
-        self.path = path
-        self.data: dict[str, dict[str, Any]] = {}
-        if path.exists():
-            try:
-                raw = path.read_text(encoding="utf-8")
-                parsed = json.loads(raw)
-                if not isinstance(parsed, dict):
-                    raise ValueError(
-                        f"State file must contain a JSON object, got {type(parsed).__name__}"
-                    )
-                self.data = parsed
-            except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
-                archive = self.path.with_name(f"{self.path.stem}_corrupted{self.path.suffix}")
-                suffix = 2
-                while archive.exists():
-                    archive = self.path.with_name(f"{self.path.stem}_corrupted_{suffix}{self.path.suffix}")
-                    suffix += 1
-                archive_saved = False
-                try:
-                    shutil.copy2(self.path, archive)
-                    archive_saved = True
-                except OSError as copy_exc:
-                    print(f"[CANH BAO] Khong the luu ban sao state bi hong: {copy_exc}", file=sys.stderr)
-
-                if archive_saved:
-                    archive_msg = f"File goc da duoc luu tai {archive}."
-                else:
-                    archive_msg = "Khong the tao ban sao luu tru; file goc van duoc giu nguyen tren dia."
-
-                print(
-                    f"[CANH BAO] State {self.path} bi loi ({exc}). "
-                    f"{archive_msg} "
-                    f"Khoi tao state moi rong (du lieu lich su chua duoc khoi phuc).",
-                    file=sys.stderr,
-                )
-                self.data = {}
-            except OSError as exc:
-                print(
-                    f"[CANH BAO] Khong the doc file state {self.path}: {exc}. "
-                    "Khoi tao state moi rong.",
-                    file=sys.stderr,
-                )
-                self.data = {}
-
-    def status(self, fp: str) -> Optional[str]:
-        return self.data.get(fp, {}).get("status")
-
-    def attempts(self, fp: str) -> int:
-        return self.data.get(fp, {}).get("attempts", 0)
-
-    def record(self, fp: str, status: str) -> None:
-        entry = self.data.setdefault(fp, {"attempts": 0, "status": "new"})
-        entry["attempts"] += 1
-
-        current = entry.get("status", "new")
-        if current == "confirmed":
-            pass
-        elif current == "candidate" and status == "rejected":
-            pass
-        else:
-            entry["status"] = status
-
-        entry["last_seen"] = datetime.now(timezone.utc).isoformat()
-        self.save()
-
-    def save(self) -> None:
-        temp_path = self.path.with_name(f"{self.path.name}.tmp.{uuid.uuid4().hex[:8]}")
-        try:
-            temp_path.write_text(
-                json.dumps(self.data, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            temp_path.replace(self.path)
-        except Exception:
-            if temp_path.exists():
-                try:
-                    temp_path.unlink()
-                except OSError:
-                    pass
-            raise
+        super().__init__(path, auto_save=True)
 
 
 def load_durable_confirmed_fingerprints(results_dir: Path) -> set[str]:
@@ -223,7 +155,7 @@ def load_durable_confirmed_fingerprints(results_dir: Path) -> set[str]:
                     if is_confirmed and fp:
                         csv_confirmed.add(fp)
         except (csv.Error, OSError, UnicodeDecodeError) as exc:
-            print(f"[CANH BAO] Khong the doc CSV de kiem tra bao cao ben vung: {exc}", file=sys.stderr)
+            print(f"[WARNING] Could not read CSV for durable report verification: {exc}", file=sys.stderr)
             return set()
 
     ndjson_confirmed: set[str] = set()
@@ -246,7 +178,7 @@ def load_durable_confirmed_fingerprints(results_dir: Path) -> set[str]:
                     if is_confirmed and fp:
                         ndjson_confirmed.add(fp)
         except (OSError, UnicodeDecodeError) as exc:
-            print(f"[CANH BAO] Khong the doc NDJSON de kiem tra bao cao ben vung: {exc}", file=sys.stderr)
+            print(f"[WARNING] Could not read NDJSON for durable report verification: {exc}", file=sys.stderr)
             return set()
 
     if has_csv and has_ndjson:
@@ -265,14 +197,14 @@ def load_payloads(payload_path: str) -> list[GraphQLPayload]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
-        print(f"[LOI] Khong doc duoc payload file {path}: {exc}", file=sys.stderr)
+        print(f"[ERROR] Failed to read payload file {path}: {exc}", file=sys.stderr)
         sys.exit(1)
 
     if isinstance(raw, dict):
         raw = raw.get("payloads", [raw])
 
     if not isinstance(raw, list):
-        print("[LOI] Payload JSON phai la list hoac object co key 'payloads'.",
+        print("[ERROR] Payload JSON must be a list or an object with key 'payloads'.",
               file=sys.stderr)
         sys.exit(1)
 
@@ -280,19 +212,19 @@ def load_payloads(payload_path: str) -> list[GraphQLPayload]:
 
     for i, item in enumerate(raw):
         if not isinstance(item, dict):
-            print(f"[CANH BAO] Payload #{i} khong phai object, bo qua.",
+            print(f"[WARNING] Payload #{i} is not a JSON object, skipping.",
                   file=sys.stderr)
             continue
         try:
             valid.append(GraphQLPayload(**item))
         except ValidationError as exc:
             print(
-                f"[CANH BAO] GraphQL payload #{i} sai schema, bo qua:\n{exc}",
+                f"[WARNING] GraphQL payload #{i} failed schema validation, skipping:\n{exc}",
                 file=sys.stderr,
             )
 
     if not valid:
-        print("[LOI] Khong co GraphQL payload hop le nao.", file=sys.stderr)
+        print("[ERROR] No valid GraphQL payloads found.", file=sys.stderr)
         sys.exit(1)
 
     return valid
@@ -420,7 +352,7 @@ def generate_builtin_graphql_payloads(target_id: str, schema_file: Optional[Path
                             operation="query",
                         ))
         except Exception as exc:
-            print(f"[CANH BAO] Khong the phan tich schema GraphQL de sinh test cases: {exc}", file=sys.stderr)
+            print(f"[WARNING] Could not parse GraphQL schema for test generation: {exc}", file=sys.stderr)
 
     return payloads
 
@@ -599,14 +531,7 @@ def evaluate_response(
     # ------------------------------------------------------------
 
     # Time-based blind injection evaluation
-    elapsed_ms = None
-    try:
-        if hasattr(resp, "elapsed_ms"):
-            elapsed_ms = getattr(resp, "elapsed_ms", None)
-        elif hasattr(resp, "_elapsed") and getattr(resp, "_elapsed", None) is not None:
-            elapsed_ms = resp._elapsed.total_seconds() * 1000
-    except Exception:
-        elapsed_ms = None
+    elapsed_ms = extract_response_elapsed_ms(resp)
 
     is_time_attack = "TIME" in (payload.attack_type or "").upper() or any(
         k in str(payload.payload_value).lower()
@@ -672,18 +597,11 @@ def evaluate_response(
         severity = "info"
         candidate = False
 
-        evidence_parts = [
-            f"HTTP {status}",
-            f"generic signal only={generic_hits[:5]}",
-            "khong du de xac nhan vulnerability",
-        ]
-
-        if gql_errors:
-            evidence_parts.append(
-                f"GraphQL errors={gql_errors[:3]}"
-            )
-
-        evidence = "; ".join(evidence_parts)
+        evidence = (
+            f"HTTP {status}; "
+            f"generic signal only={generic_hits[:5]}; "
+            "insufficient to confirm vulnerability"
+        )
 
     # GraphQL errors are not vulnerabilities by themselves.
     elif gql_errors:
@@ -699,7 +617,7 @@ def evaluate_response(
         candidate = False
         evidence = (
             f"HTTP {status}; "
-            "khong phat hien dau hieu bat thuong"
+            "no anomalous signal detected"
         )
 
     return severity, candidate, evidence, cve_ids
@@ -786,7 +704,7 @@ async def process_payload(
     if resp is None or result is None:
         severity = "unknown"
         confirmed = False
-        evidence = f"request loi: {error_text}"
+        evidence = f"request error: {error_text}"
         status_code = None
         cve_ids: list[str] = []
         confidence = 0.1
@@ -901,8 +819,16 @@ async def run_all(
     target_id: str = "dvga",
     proxy: Optional[str] = None,
     insecure: bool = False,
+    session_keeper: Optional[Any] = None,
+    proxy_rotator: Optional[Any] = None,
+    auth_manager: Optional[Any] = None,
 ) -> list[Finding]:
-    scheduler = RequestScheduler(concurrency=concurrency, global_rps=global_rps)
+    scheduler = RequestScheduler(
+        concurrency=concurrency,
+        global_rps=global_rps,
+        proxy_rotator=proxy_rotator,
+        session_keeper=session_keeper,
+    )
     results_dir = state.path.parent
     durable_confirmed = load_durable_confirmed_fingerprints(results_dir)
 
@@ -933,9 +859,9 @@ async def run_all(
         # It was interrupted before persistence! Do NOT skip it!
         if state.status(fp) == "confirmed" and fp not in durable_confirmed:
             print(
-                f"[CANH BAO] Fingerprint '{fp}' da duoc ghi nhan confirmed trong state "
-                "nhung chua co trong bao cao ben vung (vulnerabilities.csv/ndjson). "
-                "Khoi phuc de chay lai va bao cao.",
+                f"[WARNING] Fingerprint '{fp}' is marked confirmed in state "
+                "but missing from durable reports (vulnerabilities.csv/ndjson). "
+                "Re-running to restore report consistency.",
                 file=sys.stderr,
             )
         elif state.attempts(fp) >= MAX_ATTEMPTS_PER_FINGERPRINT:
@@ -943,18 +869,26 @@ async def run_all(
 
         unique_payloads.append(payload)
 
+    merged_headers = dict(headers or {})
+    if auth_manager is not None:
+        merged_headers.update(auth_manager.get_headers())
+
     client_kwargs: dict[str, Any] = {"timeout": 20.0}
     proxy_url = proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("ALL_PROXY")
+    if not proxy_url and proxy_rotator is not None and proxy_rotator.has_proxies:
+        proxy_url = await proxy_rotator.get_next_proxy()
     if proxy_url:
         client_kwargs["proxy"] = proxy_url
     if insecure or os.environ.get("PYTHONHTTPSVERIFY") == "0":
         client_kwargs["verify"] = False
+    if auth_manager is not None and auth_manager.get_httpx_cert() is not None:
+        client_kwargs["cert"] = auth_manager.get_httpx_cert()
 
     async with httpx.AsyncClient(**client_kwargs) as client:
         tasks = [
             process_payload(
                 client, scheduler, payload, base_url, endpoint,
-                headers, rules, state, rate_limit_ms / 1000, target_id,
+                merged_headers, rules, state, rate_limit_ms / 1000, target_id,
             )
             for payload in unique_payloads
         ]
@@ -1053,124 +987,107 @@ def write_results(
     )
 
 
-def main() -> None:
+def execute_graphql_scan(
+    *,
+    target_id: str = "dvga",
+    base_url: Optional[str] = None,
+    endpoint: Optional[str] = None,
+    payloads_path: Optional[str] = None,
+    rules_path: Optional[str | Path] = None,
+    results_dir: Optional[str | Path] = None,
+    concurrency: int = 10,
+    rate_limit_ms: int = 200,
+    global_rps: float = 0,
+    headers: Optional[dict[str, str]] = None,
+    proxy: Optional[str] = None,
+    insecure: bool = False,
+    targets: Optional[TargetManager] = None,
+    session_keeper: Optional[Any] = None,
+    proxy_rotator: Optional[Any] = None,
+    auth_manager: Optional[Any] = None,
+) -> list[Finding]:
+    """Execute GraphQL fuzzing in-process with shared scheduler, session, and proxy hooks."""
     global RUN_ID
 
-    ap = argparse.ArgumentParser(
-        description="GraphQL API fuzzer"
-    )
-
-    ap.add_argument("--target-id", default="dvga",
-                     help="Target identifier from targets/registry.yaml (default: dvga)")
-    ap.add_argument("--payloads", required=True)
-    ap.add_argument(
-        "--base-url",
-        default=None,
-        help="Override target base URL from registry (or DVGA_BASE_URL when target is dvga)",
-    )
-    ap.add_argument(
-        "--endpoint",
-        default=None,
-    )
-    ap.add_argument("--results-dir", default=str(PROJECT_PATHS.results))
-    ap.add_argument("--rate-limit-ms", type=int, default=200)
-    ap.add_argument("--concurrency", type=int, default=10)
-    ap.add_argument("--global-rps", type=float, default=0,
-                    help="Gioi han request/giay toan cuc (0 = tat)")
-    ap.add_argument("--rules", default=str(PROJECT_PATHS.config / "rules.json"))
-    ap.add_argument("--auth-header", default=None)
-    ap.add_argument("--proxy", default=None, help="Upstream HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:8080)")
-    ap.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification")
-
-    args = ap.parse_args()
-
-    args.target_id = args.target_id.strip().lower()
-    target = TargetManager(PROJECT_ROOT).get_target(args.target_id)
+    tm = targets or TargetManager(PROJECT_ROOT)
+    tid = target_id.strip().lower()
+    target = tm.get_target(tid)
     if target.settings.get("protocol") != "graphql":
-        ap.error(f"Target '{args.target_id}' is not configured for GraphQL")
-    base_url = (
-        args.base_url
-        or (os.environ.get("DVGA_BASE_URL") if args.target_id == "dvga" else None)
+        raise ValueError(f"Target '{tid}' is not configured for GraphQL")
+
+    resolved_base_url = (
+        base_url
+        or (os.environ.get("DVGA_BASE_URL") if tid == "dvga" else None)
         or target.base_url
     )
-
     configured_endpoint = target.settings.get("endpoint", "/graphql")
-    endpoint = "/" + (args.endpoint or str(configured_endpoint)).strip("/")
-    print(f"[INFO] GraphQL target: {base_url.rstrip('/')}{endpoint}")
+    resolved_endpoint = "/" + (endpoint or str(configured_endpoint)).strip("/")
+    print(f"[INFO] GraphQL target: {resolved_base_url.rstrip('/')}{resolved_endpoint}")
 
-    rules_path = PROJECT_PATHS.resolve(args.rules, allow_outside=True)
+    resolved_rules_path = PROJECT_PATHS.resolve(
+        rules_path or (PROJECT_PATHS.config / "rules.json"),
+        allow_outside=True,
+    )
     rules = None
-    if rules_path.exists():
-        rules = rules_engine.load_rules(str(rules_path))
+    if resolved_rules_path.exists():
+        rules = rules_engine.load_rules(str(resolved_rules_path))
         n_cve = len(rules.get("cve_signals", []))
         last_upd = rules.get("meta", {}).get("cve_last_updated")
         print(
-            f"[INFO] Rules nap tu {rules_path}: {n_cve} CVE cache "
-            f"(cap nhat: {last_upd or 'chua tung'})."
+            f"[INFO] Loaded rules from {resolved_rules_path}: {n_cve} cached CVEs "
+            f"(last updated: {last_upd or 'never'})."
         )
     else:
         print(
-            f"[CANH BAO] Khong thay {args.rules} - dung signal mac dinh.",
+            f"[WARNING] Rules file not found at {resolved_rules_path} - using static signals.",
             file=sys.stderr,
         )
 
-    headers = {
+    req_headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
+        **(headers or {}),
     }
 
-    auth_header = os.environ.get("FUZZ_AUTH_HEADER") or args.auth_header
-    if auth_header:
-        key, sep, value = auth_header.partition(":")
-        if sep:
-            headers[key.strip()] = value.strip()
-        else:
-            print(
-                "[CANH BAO] Auth header phai co dang 'Header: value'.",
-                file=sys.stderr,
-            )
-
-    if args.payloads:
-        payloads = load_payloads(args.payloads)
+    if payloads_path:
+        payloads = load_payloads(payloads_path)
     else:
         schema_path = None
         if target.schema_source:
             try:
-                schema_path = TargetManager(PROJECT_ROOT).resolve_source(target.schema_source)
+                schema_path = tm.resolve_source(target.schema_source)
             except Exception:
                 pass
-        payloads = generate_builtin_graphql_payloads(args.target_id, schema_path)
-        print(f"[INFO] Built-in GraphQL Engine: sinh {len(payloads)} test cases bao mat tu dong.")
+        payloads = generate_builtin_graphql_payloads(tid, schema_path)
+        print(f"[INFO] Built-in GraphQL Engine: generated {len(payloads)} security test cases.")
     total_payloads = len(payloads)
 
     selected = []
     for payload in payloads:
-        payload_target = (payload.target_app or args.target_id).strip().lower()
-        if payload_target != args.target_id:
+        payload_target = (payload.target_app or tid).strip().lower()
+        if payload_target != tid:
             print(
-                f"[CANH BAO] target_app='{payload_target}' khac "
-                f"{args.target_id} -> bo qua.",
+                f"[WARNING] Payload target_app='{payload_target}' does not match "
+                f"'{tid}' - skipping.",
                 file=sys.stderr,
             )
             continue
         selected.append(payload)
 
     if not selected:
-        print(f"[LOI] Khong co GraphQL payload target_app='{args.target_id}'.",
-              file=sys.stderr)
-        sys.exit(1)
+        raise ValueError(f"No GraphQL payloads available for target_app='{tid}'.")
 
-    result_manager = ResultManager(PROJECT_ROOT, results_dir=args.results_dir)
-    results_dir = result_manager.ensure_results_dir()
+    result_manager = ResultManager(PROJECT_ROOT, results_dir=results_dir or PROJECT_PATHS.results)
+    resolved_results_dir = result_manager.ensure_results_dir()
 
     RUN_ID = result_manager.make_run_id(prefix="graphql")
-    state = RunState(results_dir / "state_graphql.json")
+    state = RunState(resolved_results_dir / "state_graphql.json")
 
     before_attempts = {}
     for payload in selected:
         fp = fingerprint_of(
-            (payload.target_app or args.target_id).lower(),
-            endpoint,
+            (payload.target_app or tid).lower(),
+            resolved_endpoint,
             payload.operation or payload.operation_name,
             payload.attack_type,
             payload.query,
@@ -1181,17 +1098,20 @@ def main() -> None:
     findings = asyncio.run(
         run_all(
             selected,
-            base_url,
-            endpoint,
-            headers,
+            resolved_base_url,
+            resolved_endpoint,
+            req_headers,
             rules,
             state,
-            max(1, args.concurrency),
-            max(0, args.rate_limit_ms),
-            args.global_rps,
-            args.target_id,
-            proxy=args.proxy,
-            insecure=args.insecure,
+            max(1, concurrency),
+            max(0, rate_limit_ms),
+            global_rps,
+            tid,
+            proxy=proxy,
+            insecure=insecure,
+            session_keeper=session_keeper,
+            proxy_rotator=proxy_rotator,
+            auth_manager=auth_manager,
         )
     )
 
@@ -1205,29 +1125,92 @@ def main() -> None:
         )
     )
 
-    try:
-        write_results(
-            findings,
-            results_dir,
-            RUN_ID,
-            f"{base_url.rstrip('/')}{endpoint}",
-            total_payloads,
-            total_skipped_dedup,
-        )
-    except Exception as exc:
-        print(f"[LOI] Khong the luu bao cao ket qua: {exc}", file=sys.stderr)
-        sys.exit(1)
-
+    write_results(
+        findings,
+        resolved_results_dir,
+        RUN_ID,
+        f"{resolved_base_url.rstrip('/')}{resolved_endpoint}",
+        total_payloads,
+        total_skipped_dedup,
+    )
     state.save()
 
     print(
-        f"[XONG] run_id={RUN_ID} | "
-        f"payload_hop_le={len(selected)}/{total_payloads} | "
-        f"ban={len(findings)} | "
-        f"bo_qua(dedup)={total_skipped_dedup} | "
-        f"phat_hien={sum(1 for x in findings if x.confirmed)} | "
-        f"log: {results_dir / 'vulnerabilities.csv'}"
+        f"[DONE] run_id={RUN_ID} | "
+        f"valid_payloads={len(selected)}/{total_payloads} | "
+        f"fired={len(findings)} | "
+        f"skipped_dedup={total_skipped_dedup} | "
+        f"confirmed={sum(1 for x in findings if x.confirmed)} | "
+        f"log: {resolved_results_dir / 'vulnerabilities.csv'}"
     )
+    return findings
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    ap = argparse.ArgumentParser(description="GraphQL API Security Fuzzer")
+
+    ap.add_argument("--target-id", default="dvga",
+                    help="Target identifier from targets/registry.yaml (default: dvga)")
+    ap.add_argument("--payloads", default=None,
+                    help="Optional JSON payload file; without it, generates built-in GraphQL probes")
+    ap.add_argument(
+        "--base-url",
+        default=None,
+        help="Override target base URL from registry (or DVGA_BASE_URL when target is dvga)",
+    )
+    ap.add_argument("--endpoint", default=None)
+    ap.add_argument("--results-dir", default=str(PROJECT_PATHS.results))
+    ap.add_argument("--rate-limit-ms", type=int, default=200)
+    ap.add_argument("--concurrency", type=int, default=10)
+    ap.add_argument("--global-rps", type=float, default=0,
+                    help="Global requests-per-second limit (0 = unlimited)")
+    ap.add_argument("--rules", default=str(PROJECT_PATHS.config / "rules.json"))
+    ap.add_argument("--auth-header", default=None)
+    ap.add_argument("--proxy", default=None, help="Upstream HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:8080)")
+    ap.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification")
+
+    args = ap.parse_args(argv)
+
+    args.target_id = args.target_id.strip().lower()
+    tm = TargetManager(PROJECT_ROOT)
+    target = tm.get_target(args.target_id)
+    if target.settings.get("protocol") != "graphql":
+        ap.error(f"Target '{args.target_id}' is not configured for GraphQL")
+
+    headers: dict[str, str] = {}
+    auth_header = os.environ.get("FUZZ_AUTH_HEADER") or args.auth_header
+    if auth_header:
+        key, sep, value = auth_header.partition(":")
+        if sep:
+            headers[key.strip()] = value.strip()
+        else:
+            print(
+                "[WARNING] Auth header must be in 'Header: value' format.",
+                file=sys.stderr,
+            )
+
+    try:
+        execute_graphql_scan(
+            target_id=args.target_id,
+            base_url=args.base_url,
+            endpoint=args.endpoint,
+            payloads_path=args.payloads,
+            rules_path=args.rules,
+            results_dir=args.results_dir,
+            concurrency=args.concurrency,
+            rate_limit_ms=args.rate_limit_ms,
+            global_rps=args.global_rps,
+            headers=headers,
+            proxy=args.proxy,
+            insecure=args.insecure,
+            targets=tm,
+        )
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        print(f"[ERROR] Failed to persist scan results: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

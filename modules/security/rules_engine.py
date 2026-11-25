@@ -35,9 +35,7 @@ PROJECT_PATHS = ProjectPaths.from_root(PROJECT_ROOT)
 NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 OSV_API_URL = "https://api.osv.dev/v1/query"
 
-# Tu khoa lien quan toi de tai (API REST, cac cong nghe dung trong
-# crAPI/DVGA/VAmPI: Flask, Express, GraphQL, JWT...) - chinh lai neu
-# target stack cua nhom khac.
+# Keywords related to target API stacks (REST, GraphQL, Flask, Express, JWT)
 DEFAULT_KEYWORDS = [
     "REST API injection",
     "JWT authentication bypass",
@@ -48,7 +46,7 @@ DEFAULT_KEYWORDS = [
     "broken object level authorization",
 ]
 
-# Cac package thuong gap trong API stack de fallback truy van OSV khi NVD bi rate-limit/nghen
+# Common API stack packages used for OSV fallback when NVD is rate-limited
 DEFAULT_OSV_PACKAGES = [
     ("flask", "PyPI"),
     ("graphene", "PyPI"),
@@ -57,7 +55,7 @@ DEFAULT_OSV_PACKAGES = [
     ("spring-boot", "Maven"),
 ]
 
-RATE_LIMIT_SLEEP_S = 6  # khong co API key -> ~5 req/30s, de an toan choi 6s/req
+RATE_LIMIT_SLEEP_S = 6  # Safe pacing without NVD API key (~5 req/30s)
 NVD_PAGE_SIZE = 50
 
 
@@ -74,7 +72,7 @@ def _severity_from_cvss(score: Optional[float]) -> str:
 
 
 def fetch_cves_for_keyword(keyword: str, days_back: int, api_key: Optional[str]) -> list[dict]:
-    """Goi NVD CVE API 2.0, tra ve list CVE ngan gon (id, desc, cvss, severity)."""
+    """Query NVD CVE API 2.0 and return concise CVE entries (id, desc, cvss, severity)."""
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days_back)
     params = {
@@ -95,7 +93,7 @@ def fetch_cves_for_keyword(keyword: str, days_back: int, api_key: Optional[str])
             resp.raise_for_status()
             data = resp.json()
         except (requests.RequestException, ValueError) as exc:
-            print(f"[CANH BAO] Khong goi duoc NVD API cho keyword '{keyword}' "
+            print(f"[WARNING] Failed to query NVD API for keyword '{keyword}' "
                   f"(startIndex={start_index}): {exc}", file=sys.stderr)
             break
 
@@ -167,7 +165,7 @@ def fetch_cves_from_osv(package_name: str, ecosystem: str = "PyPI") -> list[dict
             })
         return out
     except Exception as exc:
-        print(f"[CANH BAO] Khong the goi OSV API cho {package_name}: {exc}", file=sys.stderr)
+        print(f"[WARNING] Failed to query OSV API for {package_name}: {exc}", file=sys.stderr)
         return []
 
 
@@ -176,7 +174,7 @@ def update_from_nvd(rules: dict, keywords: list[str], days_back: int,
     all_cves = []
     nvd_failed = False
     for kw in keywords:
-        print(f"[INFO] Truy van NVD: '{kw}' ({days_back} ngay gan nhat)...")
+        print(f"[INFO] Querying NVD: '{kw}' (last {days_back} days)...")
         fetched = fetch_cves_for_keyword(kw, days_back, api_key)
         all_cves.extend(fetched)
         if not fetched:
@@ -184,14 +182,14 @@ def update_from_nvd(rules: dict, keywords: list[str], days_back: int,
         if not api_key:
             time.sleep(RATE_LIMIT_SLEEP_S)
 
-    # Fallback sang Google OSV API neu NVD khong tra ve ket qua (do rate limit hoac mang chan)
+    # Fallback to Google OSV API if NVD returns empty or fails due to rate limits/network blocks
     if not all_cves or nvd_failed:
-        print("[INFO] Kich hoat fallback sang Google OSV API (api.osv.dev) cho cac package API...")
+        print("[INFO] Activating fallback to Google OSV API (api.osv.dev) for API stack packages...")
         for pkg, eco in DEFAULT_OSV_PACKAGES:
             osv_results = fetch_cves_from_osv(pkg, eco)
             all_cves.extend(osv_results)
 
-    # dedup theo cve_id, giu ban co cvss cao nhat neu trung
+    # Deduplicate by cve_id, retaining highest CVSS score
     by_id: dict[str, dict] = {}
     for c in all_cves:
         cid = c["cve_id"]
@@ -203,15 +201,15 @@ def update_from_nvd(rules: dict, keywords: list[str], days_back: int,
     rules["cve_signals"] = sorted(by_id.values(),
                                    key=lambda c: c["cvss_score"] or 0, reverse=True)
     rules["meta"]["cve_last_updated"] = datetime.now(timezone.utc).isoformat()
-    print(f"[XONG] Cap nhat {len(rules['cve_signals'])} CVE lien quan.")
+    print(f"[DONE] Updated {len(rules['cve_signals'])} relevant CVEs.")
     return rules
 
 
 def load_rules(path: str) -> dict:
     p = Path(path)
     if not p.exists():
-        print(f"[LOI] Khong tim thay {path}. Chay --update lan dau de tao, "
-              f"hoac dung file rules.json mau di kem.", file=sys.stderr)
+        print(f"[ERROR] Rules file not found at {path}. Run --update to generate it "
+              "or provide the bundled rules.json.", file=sys.stderr)
         sys.exit(1)
     return json.loads(p.read_text())
 
@@ -221,21 +219,16 @@ def save_rules(rules: dict, path: str) -> None:
 
 
 def get_all_signals(rules: dict) -> list[str]:
-    """Tra ve toan bo signal (static + CVE description keyword rut gon) dung
-    de so khop trong response body khi Nguoi 1 danh gia ket qua fuzzing."""
+    """Return all static and category error signals for response evaluation."""
     signals = list(rules.get("static_error_signals", []))
     for cat in rules.get("owasp_categories", {}).values():
         signals.extend(cat.get("signals", []))
-    # CVE description thuong dai, chi lay cac tu khoa ky thuat ngan gon
-    # da duoc cau hinh san trong static_error_signals; CVE dung chinh de
-    # NANG SEVERITY khi trung endpoint/tech, khong dung de match text.
     return sorted(set(s.lower() for s in signals))
 
 
 STOPWORDS = {"api", "the", "and", "for", "with", "via", "attackers", "allows"}
 
-# attack_type (dung trong payload cua B) khong cung tu vung voi mo ta CVE
-# tieng Anh tu nhien -> can bang dong nghia de match co y nghia.
+# Synonym map bridging attack_type labels to natural-language CVE descriptions
 ATTACK_TYPE_SYNONYMS = {
     "sqli": ["sql", "sql injection", "injection"],
     "xss": ["cross-site scripting", "script injection", "xss"],
@@ -256,9 +249,7 @@ ATTACK_TYPE_SYNONYMS = {
 def match_cves_by_keyword(rules: dict, attack_type: str, owasp_category: Optional[str] = None,
                           technology: Optional[dict] = None
                            ) -> list[dict]:
-    """Tim CVE trong cache lien quan toi loai tan cong dang test, dung bang
-    dong nghia thay vi so khop chu-doi-chu (attack_type/owasp code thuong
-    khong cung tu vung voi mo ta CVE tu nhien)."""
+    """Match cached CVEs relevant to the tested attack_type using the synonym table."""
     key = attack_type.lower().replace(" ", "").replace("_", "")
     phrases = list(ATTACK_TYPE_SYNONYMS.get(key, [attack_type.lower()]))
 
@@ -285,18 +276,18 @@ def match_cves_by_keyword(rules: dict, attack_type: str, owasp_category: Optiona
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Cap nhat rules (CVE tu NVD) cho tool cua Nguoi 1")
+    ap = argparse.ArgumentParser(description="Update OWASP/CVE security rules from NVD and Google OSV")
     ap.add_argument("--rules", default=str(PROJECT_PATHS.config / "rules.json"))
-    ap.add_argument("--update", action="store_true", help="Goi NVD API cap nhat CVE")
+    ap.add_argument("--update", action="store_true", help="Query NVD/OSV APIs to refresh CVEs")
     ap.add_argument("--days", type=int, default=30)
-    ap.add_argument("--api-key", default=None, help="NVD API key (khuyen khich - tang rate limit)")
-    ap.add_argument("--keywords", nargs="*", default=None, help="Ghi de tu khoa mac dinh")
+    ap.add_argument("--api-key", default=None, help="NVD API key (recommended for higher rate limits)")
+    ap.add_argument("--keywords", nargs="*", default=None, help="Override default search keywords")
     args = ap.parse_args()
 
     rules_path = PROJECT_PATHS.resolve(args.rules, allow_outside=True)
     if not rules_path.exists():
-        print(f"[LOI] {rules_path} chua ton tai. Tao file rules.json mau truoc "
-              f"(xem file rules.json dinh kem).", file=sys.stderr)
+        print(f"[ERROR] {rules_path} does not exist. Create or restore the base rules.json first.",
+              file=sys.stderr)
         sys.exit(1)
 
     rules = load_rules(str(rules_path))
@@ -306,9 +297,9 @@ def main():
         rules = update_from_nvd(rules, keywords, args.days, args.api_key)
         save_rules(rules, str(rules_path))
     else:
-        print(f"[INFO] Rules hien tai: {len(get_all_signals(rules))} signal, "
-              f"{len(rules.get('cve_signals', []))} CVE cache "
-              f"(cap nhat luc: {rules['meta'].get('cve_last_updated')}).")
+        print(f"[INFO] Current rules: {len(get_all_signals(rules))} signals, "
+              f"{len(rules.get('cve_signals', []))} cached CVEs "
+              f"(last updated: {rules['meta'].get('cve_last_updated')}).")
 
 
 if __name__ == "__main__":

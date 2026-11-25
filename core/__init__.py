@@ -99,6 +99,15 @@ from .resource_exhaustion_fuzzer import (
     ResourceProbeResult,
 )
 from .result_manager import ResultManager, make_run_id
+from .run_state import (
+    DEFAULT_ERROR_SIGNALS,
+    MAX_ATTEMPTS_PER_FINGERPRINT,
+    RunState,
+    SEVERITY_BY_STATUS,
+    extract_response_elapsed_ms,
+    normalize_auth_header,
+    parse_tokens_env,
+)
 from .schema_converter import (
     convert_any_to_openapi,
     convert_file_to_openapi,
@@ -219,4 +228,11 @@ __all__ = [
     "ProxyState",
     "RemediationEngine",
     "RemediationSnippet",
+    "DEFAULT_ERROR_SIGNALS",
+    "MAX_ATTEMPTS_PER_FINGERPRINT",
+    "RunState",
+    "SEVERITY_BY_STATUS",
+    "extract_response_elapsed_ms",
+    "normalize_auth_header",
+    "parse_tokens_env",
 ]

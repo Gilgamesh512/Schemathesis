@@ -1,14 +1,14 @@
-"""core/curl_builder.py — Tiện ích tự động tạo lệnh cURL hoàn chỉnh (1-Click Reproduce) cho Schemathesis.
+"""core/curl_builder.py — Cross-platform cURL command generator (1-click reproduce).
 
-Chuyển đổi mọi finding kiểm thử bảo mật thành 1 dòng lệnh cURL chuẩn xác,
-giúp Developer/QA chỉ cần copy và paste trực tiếp vào Terminal để tái hiện lỗi ngay lập tức.
+Converts any security finding into a reproducible cURL command for Linux, macOS,
+PowerShell, and Windows CMD.
 """
 
 from __future__ import annotations
 
 import json
 import urllib.parse
-from typing import Any, Optional
+from typing import Any
 
 
 def build_curl_command(
@@ -23,14 +23,15 @@ def build_curl_command(
     insecure: bool = False,
     shell: str = "bash",
 ) -> str:
-    """Tạo chuỗi lệnh curl chuẩn xác, tương thích đa nền tảng:
-    - shell='bash': Tương thích Linux, macOS, WSL, và Windows PowerShell (dùng single quote quanh payload)
-    - shell='cmd': Tương thích Windows Command Prompt cmd.exe (dùng escaped double quotes quanh payload)
+    """Build a cross-platform cURL command string.
+
+    - shell='bash': Compatible with Linux, macOS, WSL, and PowerShell (single-quoted payload).
+    - shell='cmd': Compatible with Windows cmd.exe (escaped double-quoted payload).
     """
     clean_method = method.upper().strip()
     target_url = url.strip()
 
-    # Xử lý query params nếu có
+    # Append query parameters if supplied
     if params:
         encoded_params = urllib.parse.urlencode(params)
         sep = "&" if "?" in target_url else "?"
@@ -44,10 +45,8 @@ def build_curl_command(
     cmd_parts.extend(["-X", clean_method])
     cmd_parts.append(f'"{target_url}"')
 
-    # Headers
     req_headers = dict(headers or {})
 
-    # Cookies
     if cookies:
         cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
         req_headers["Cookie"] = cookie_str
@@ -58,7 +57,6 @@ def build_curl_command(
         clean_val = str(h_val).replace('"', '\\"')
         cmd_parts.extend(["-H", f'"{h_name}: {clean_val}"'])
 
-    # Body data
     body_payload = None
     if json_data is not None:
         if isinstance(json_data, (dict, list)):
@@ -98,7 +96,7 @@ def build_curl_dual(
     cookies: dict[str, str] | None = None,
     insecure: bool = False,
 ) -> dict[str, str]:
-    """Tạo cả 2 định dạng curl: 'bash' (POSIX/PowerShell) và 'cmd' (Windows cmd.exe)."""
+    """Generate both 'bash' (POSIX/PowerShell) and 'cmd' (Windows cmd.exe) cURL variants."""
     return {
         "bash": build_curl_command(
             method, url, headers=headers, params=params, data=data,
@@ -112,7 +110,7 @@ def build_curl_dual(
 
 
 def build_curl_from_finding(finding: Any, base_url: str = "", shell: str = "bash") -> str:
-    """Tạo lệnh curl từ một Schemathesis Finding object hoặc dictionary finding."""
+    """Build a cURL command from a Finding model instance or finding dictionary."""
     if isinstance(finding, dict):
         endpoint = finding.get("endpoint") or "/"
         method = finding.get("method") or "GET"
@@ -124,13 +122,13 @@ def build_curl_from_finding(finding: Any, base_url: str = "", shell: str = "bash
         payload = getattr(finding, "payload", None)
         evidence = getattr(finding, "evidence", None)
 
-    # Ghép URL đầy đủ
+    # Assemble full target URL
     if endpoint.startswith("http://") or endpoint.startswith("https://"):
         full_url = endpoint
     else:
         full_url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}" if base_url else endpoint
 
-    # Lấy auth context hoặc headers từ evidence nếu có
+    # Extract auth context or non-redacted headers from evidence
     headers: dict[str, Any] = {}
     if evidence:
         if isinstance(evidence, dict):
@@ -164,7 +162,7 @@ def build_curl_from_finding(finding: Any, base_url: str = "", shell: str = "bash
 
 
 def build_curl_dual_from_finding(finding: Any, base_url: str = "") -> dict[str, str]:
-    """Tạo cả 2 lệnh cURL (Bash/PowerShell và Windows CMD) từ finding."""
+    """Generate both Bash/PowerShell and Windows CMD cURL commands from a finding."""
     return {
         "bash": build_curl_from_finding(finding, base_url=base_url, shell="bash"),
         "cmd": build_curl_from_finding(finding, base_url=base_url, shell="cmd"),

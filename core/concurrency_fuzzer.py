@@ -50,10 +50,19 @@ class ConcurrencyBurstResult(BaseModel):
 class ConcurrencyFuzzer:
     """Synchronized burst request runner for detecting Race Condition vulnerabilities."""
 
-    def __init__(self, burst_size: int = 5, timeout: float = 5.0, http2: bool = True):
+    def __init__(
+        self,
+        burst_size: int = 5,
+        timeout: float = 5.0,
+        http2: bool = True,
+        verify_ssl: bool = True,
+        proxy: Optional[str] = None,
+    ):
         self.burst_size = max(2, burst_size)
         self.timeout = timeout
         self.http2 = http2
+        self.verify_ssl = verify_ssl
+        self.proxy = proxy
 
     @staticmethod
     def is_candidate_endpoint(endpoint: str, method: str) -> bool:
@@ -111,7 +120,9 @@ class ConcurrencyFuzzer:
         req_headers = dict(headers or {})
 
         # Attempt HTTP/2 for multiplexed single-connection delivery, fallback to HTTP/1.1
-        client_kwargs: dict[str, Any] = {"verify": False}
+        client_kwargs: dict[str, Any] = {"verify": self.verify_ssl}
+        if self.proxy:
+            client_kwargs["proxy"] = self.proxy
         if self.http2:
             try:
                 import h2  # noqa: F401
@@ -228,7 +239,7 @@ class ConcurrencyFuzzer:
             status_code=result.status_codes[0] if result.status_codes else 200,
             response_time_ms=evidence.response_time_ms,
             evidence=evidence,
-            severity="HIGH",
+            severity="high",
             confidence=0.9,
             confirmed=True,
             lifecycle="confirmed",

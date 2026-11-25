@@ -1,19 +1,18 @@
 """core/safety_cleanup.py — Staging Data Integrity, Audit Headers & Rollback Cleanup Manifest.
 
-Bảo vệ môi trường Staging/UAT:
-- Đính kèm header `X-Fuzzer-Audit: true` và `X-Fuzzer-Run-Id: <id>` giúp WAF/SIEM phân tách lưu lượng kiểm thử.
-- Tự động ghi nhận mọi tài nguyên được tạo ra (POST/PUT) và xuất `cleanup_manifest.json` để DBA/DevOps rollback.
+Protects staging/UAT environments during automated testing:
+- Attaches `X-Fuzzer-Audit: true` and `X-Fuzzer-Run-Id: <id>` headers so WAF/SIEM can isolate test traffic.
+- Tracks created resources (POST/PUT/PATCH) and writes `cleanup_manifest.json` for rollback.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import re
-import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import requests
 
@@ -21,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_audit_headers(run_id: str = "") -> dict[str, str]:
-    """Trả về headers kiểm toán minh bạch cho toàn bộ request ra ngoài."""
+    """Return transparent audit headers for all outbound security test requests."""
     rid = run_id or "schemathesis-run"
     return {
         "X-Fuzzer-Audit": "true",
@@ -43,7 +42,7 @@ class CreatedResource:
 
 
 class CleanupTracker:
-    """Theo dõi và lưu vết các tài nguyên đã tạo trong quá trình fuzzing để rollback an toàn."""
+    """Tracks resources created during fuzzing so they can be safely rolled back."""
 
     def __init__(self, run_id: str, out_dir: str | Path = "results") -> None:
         self.run_id = run_id
@@ -59,7 +58,7 @@ class CleanupTracker:
         response_data: Any = None,
         response_headers: dict[str, Any] | None = None,
     ) -> None:
-        """Ghi nhận một hành vi làm biến đổi dữ liệu thành công (POST / PUT / PATCH trả về 200, 201)."""
+        """Record a successful state-mutating request (POST/PUT/PATCH returning 2xx)."""
         clean_method = method.upper().strip()
         if clean_method not in ("POST", "PUT", "PATCH") or status_code not in (200, 201, 202, 204):
             return
@@ -67,7 +66,7 @@ class CleanupTracker:
         created_id = None
         rollback_url = ""
 
-        # 1. Thử bóc tách từ Location header
+        # 1. Try extracting resource location from Location header
         if response_headers:
             loc = response_headers.get("Location") or response_headers.get("location")
             if loc:
@@ -76,22 +75,21 @@ class CleanupTracker:
                 if parts:
                     created_id = parts[-1]
 
-        # 2. Thử bóc tách từ response JSON body
+        # 2. Try extracting created ID from JSON response body
         if not created_id and isinstance(response_data, dict):
             for id_key in ("id", "user_id", "userId", "order_id", "orderId", "uuid", "key", "account_id"):
                 if id_key in response_data and response_data[id_key] is not None:
                     created_id = response_data[id_key]
                     break
 
-        # Nếu không có Location header, tự suy luận rollback URL từ endpoint và created_id
+        # Infer rollback URL only when a concrete resource ID was discovered
         if not rollback_url:
             if created_id is not None:
                 base = endpoint.rstrip("/")
                 rollback_url = f"{base}/{created_id}"
             else:
-                rollback_url = ""  # Không tự ý DELETE toàn bộ collection endpoint nếu không có ID cụ thể
+                rollback_url = ""  # Never issue DELETE against an entire collection endpoint without an ID
 
-        from datetime import datetime, timezone
         res = CreatedResource(
             run_id=self.run_id,
             target_url=target_url,
@@ -106,7 +104,7 @@ class CleanupTracker:
         self.created_resources.append(res)
 
     def write_manifest(self) -> Path:
-        """Xuất file cleanup_manifest.json để phục vụ DBA / DevOps rollback."""
+        """Write cleanup_manifest.json to facilitate staging data rollback."""
         self.out_dir.mkdir(parents=True, exist_ok=True)
         manifest_file = self.out_dir / "cleanup_manifest.json"
 
@@ -114,8 +112,8 @@ class CleanupTracker:
             "run_id": self.run_id,
             "total_created_resources": len(self.created_resources),
             "instructions": (
-                "File này ghi nhận toàn bộ các tài nguyên đã được tạo ra trong quá trình fuzzing. "
-                "DBA hoặc DevOps có thể chạy các lệnh DELETE tương ứng hoặc chạy execute_auto_cleanup để hoàn tác dữ liệu."
+                "This file lists resources created during security testing. "
+                "Run the listed DELETE rollback URLs or invoke execute_auto_cleanup() to revert state."
             ),
             "resources": [
                 {
@@ -143,7 +141,7 @@ class CleanupTracker:
         timeout: float = 5.0,
         insecure: bool = False,
     ) -> dict[str, Any]:
-        """Tự động thực thi các lệnh DELETE để dọn dẹp các tài nguyên vừa tạo."""
+        """Automatically execute DELETE requests for tracked created resources."""
         results = {"total": len(self.created_resources), "deleted": 0, "failed": 0, "skipped": 0}
         req_headers = dict(headers or {})
         req_headers.update(get_audit_headers(self.run_id))
@@ -169,7 +167,7 @@ class CleanupTracker:
                 else:
                     results["failed"] += 1
             except Exception as e:
-                logger.warning(f"Failed to auto-delete {target}: {e}")
+                logger.warning("Failed to auto-delete %s: %s", target, e)
                 results["failed"] += 1
 
         return results

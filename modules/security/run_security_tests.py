@@ -21,16 +21,22 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from core import (
     ApiDependencyGraph,
+    AuthConfig,
+    AuthManager,
     CallbackVerifier,
     Finding,
     ProjectPaths,
     ResultManager,
+    SchemaManager,
     SecurityReporter,
     TargetManager,
     TokenVerifier,
     WorkflowDefinition,
     WorkflowRunner,
     discover_api,
+    normalize_auth_header,
+    parse_tokens_env as _core_parse_tokens_env,
+    parse_har_file,
     PiiDetector,
     HeaderTamperFuzzer,
     ResourceExhaustionFuzzer,
@@ -70,48 +76,8 @@ def banner(title: str) -> None:
     print("=" * 70)
 
 
-def normalize_auth_header(token_or_header: str | None) -> str | None:
-    """Normalize raw token or header string into 'Header: Value' format.
-
-    Examples:
-        - 'eyJhbGciOi...' -> 'Authorization: Bearer eyJhbGciOi...'
-        - 'Bearer eyJhbGci...' -> 'Authorization: Bearer eyJhbGci...'
-        - 'Authorization: Bearer ...' -> 'Authorization: Bearer ...'
-        - 'X-API-Key: secret' -> 'X-API-Key: secret'
-    """
-    if not token_or_header:
-        return None
-    val = token_or_header.strip()
-    if not val:
-        return None
-    if ":" in val:
-        return val
-    if val.lower().startswith("bearer "):
-        return f"Authorization: {val}"
-    return f"Authorization: Bearer {val}"
-
-
 def parse_tokens_env(path: Path = TOKENS_FILE) -> dict[str, str]:
-    if not path.exists():
-        print(f"[CANH BAO] Khong thay {path} - fuzzing se chay KHONG co auth header.")
-        return {}
-
-    tokens: dict[str, str] = {}
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        tokens[key] = value
-    return tokens
+    return _core_parse_tokens_env(path, auth_headers_only=False, warn_missing=True)
 
 
 def auth_env_for(
@@ -248,7 +214,7 @@ def run_command(label: str, command: list[str],
     ).rstrip(os.pathsep)
     if extra_env:
         env.update(extra_env)
-        print("[INFO] Auth header được truyền qua môi trường của tiến trình.")
+        print("[INFO] Auth header passed via process environment.")
     else:
         env.pop("FUZZ_AUTH_HEADER", None)
 
@@ -256,6 +222,80 @@ def run_command(label: str, command: list[str],
     if result.returncode != 0:
         raise RuntimeError(f"{label} failed with exit code {result.returncode}")
     print(f"[+] {label}: OK")
+
+
+_DEFAULT_RUN_COMMAND = run_command
+
+
+def _extract_audit_targets_from_schema(
+    schema_source: str | None,
+    *,
+    allow_remote: bool = False,
+) -> dict[str, list]:
+    """Derive endpoints, callback params, race candidates, and resource params from an OpenAPI spec."""
+    extracted: dict[str, list] = {
+        "endpoints": [],
+        "callback_params": [],
+        "race_candidates": [],
+        "resource_candidates": [],
+    }
+    if not schema_source:
+        return extracted
+    try:
+        spec = SchemaManager(PROJECT_ROOT).load(
+            schema_source,
+            allow_remote=allow_remote,
+            allow_outside=True,
+        )
+    except Exception:
+        return extracted
+
+    paths = spec.get("paths")
+    if not isinstance(paths, dict):
+        return extracted
+
+    seen_eps: set[tuple[str, str]] = set()
+    for path, path_item in paths.items():
+        if not isinstance(path_item, dict):
+            continue
+        path_level_params = path_item.get("parameters") if isinstance(path_item.get("parameters"), list) else []
+        for method_key, op in path_item.items():
+            method = method_key.upper()
+            if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"} or not isinstance(op, dict):
+                continue
+            ep_pair = (method, path)
+            if ep_pair not in seen_eps:
+                seen_eps.add(ep_pair)
+                extracted["endpoints"].append(ep_pair)
+
+            if ConcurrencyFuzzer is not None and ConcurrencyFuzzer.is_candidate_endpoint(path, method):
+                extracted["race_candidates"].append(ep_pair)
+
+            op_params = op.get("parameters") if isinstance(op.get("parameters"), list) else []
+            for p in [*path_level_params, *op_params]:
+                if not isinstance(p, dict):
+                    continue
+                p_name = str(p.get("name") or "").strip()
+                p_loc = str(p.get("in") or "query").strip().lower()
+                if not p_name:
+                    continue
+                if CallbackVerifier.is_callback_parameter(p_name):
+                    extracted["callback_params"].append((method, path, p_name, p_loc))
+                if method == "GET" and p_loc == "query":
+                    extracted["resource_candidates"].append((method, path, p_name))
+
+            req_body = op.get("requestBody")
+            if isinstance(req_body, dict):
+                content = req_body.get("content", {})
+                json_schema = content.get("application/json", {}).get("schema", {}) if isinstance(content, dict) else {}
+                props = json_schema.get("properties", {}) if isinstance(json_schema, dict) else {}
+                for prop_name in props:
+                    if CallbackVerifier.is_callback_parameter(prop_name):
+                        extracted["callback_params"].append((method, path, prop_name, "body"))
+                    if method in {"POST", "PUT", "PATCH"}:
+                        extracted["resource_candidates"].append((method, path, prop_name))
+
+    return extracted
 
 
 def run_target(
@@ -266,6 +306,10 @@ def run_target(
     targets: TargetManager = TARGETS,
     proxy: str | None = None,
     insecure: bool = False,
+    session_keeper: SessionKeeper | None = None,
+    proxy_rotator: ProxyRotator | None = None,
+    auth_manager: AuthManager | None = None,
+    seed_corpus: Any = None,
 ) -> None:
     label, command = build_target_command(
         target_id,
@@ -275,22 +319,101 @@ def run_target(
         insecure=insecure,
     )
     extra_env = auth_env_for(target_id, tokens or {}, targets=targets) or {}
-    proxy_val = proxy or targets.get_target(target_id).settings.get("proxy")
+    target = targets.get_target(target_id)
+    proxy_val = proxy or target.settings.get("proxy")
     if proxy_val:
         extra_env["HTTP_PROXY"] = str(proxy_val)
         extra_env["HTTPS_PROXY"] = str(proxy_val)
-    if insecure or targets.get_target(target_id).settings.get("insecure"):
+    if insecure or target.settings.get("insecure"):
         extra_env["PYTHONHTTPSVERIFY"] = "0"
 
-    schema_source = targets.get_target(target_id).schema_source
+    schema_source = target.schema_source
     if schema_source and str(schema_source).lower().endswith(".har"):
         extra_env["SCHEMATHESIS_SEED_CORPUS"] = str(schema_source)
 
-    run_command(
-        f"FUZZING - {label}",
-        command,
-        extra_env if extra_env else None,
+    # Preserve compatibility when unit tests monkeypatch run_command
+    if run_command is not _DEFAULT_RUN_COMMAND:
+        run_command(
+            f"FUZZING - {label}",
+            command,
+            extra_env if extra_env else None,
+        )
+        return
+
+    protocol = target.settings.get("protocol")
+    effective_insecure = bool(insecure or target.settings.get("insecure"))
+    headers: dict[str, str] = {}
+    if extra_env.get("FUZZ_AUTH_HEADER"):
+        hk, _, hv = extra_env["FUZZ_AUTH_HEADER"].partition(":")
+        if hk.strip():
+            headers[hk.strip()] = hv.strip()
+    if extra_env.get("FUZZ_EXTRA_HEADERS_JSON"):
+        try:
+            for hk, hv in json.loads(extra_env["FUZZ_EXTRA_HEADERS_JSON"]).items():
+                headers[str(hk).strip()] = str(hv).strip()
+        except Exception:
+            pass
+
+    user2_headers: dict[str, str] = {}
+    if extra_env.get("FUZZ_AUTH_HEADER_USER2"):
+        hk2, _, hv2 = extra_env["FUZZ_AUTH_HEADER_USER2"].partition(":")
+        if hk2.strip():
+            user2_headers[hk2.strip()] = hv2.strip()
+
+    payload_source = target.settings.get("payload_source")
+    payload_path = (
+        str(targets.resolve_source(payload_source))
+        if include_payload and isinstance(payload_source, str) and payload_source
+        else None
     )
+
+    if protocol == "rest":
+        from modules.rest import run_schemathesis1 as rest_runner
+
+        remote_schema = bool(schema_source and str(schema_source).startswith(("http://", "https://")))
+        resolved_schema = str(schema_source) if remote_schema else str(targets.resolve_source(schema_source or ""))
+        schema, base_url = rest_runner.load_schema(
+            resolved_schema,
+            target.base_url,
+            allow_remote=bool(target.settings.get("allow_remote_schema", False) or remote_schema),
+        )
+        rest_runner.execute_rest_scan(
+            targets={target_id: (schema, base_url)},
+            targets_desc=f"{target_id}={resolved_schema}",
+            headers=headers,
+            user2_headers=user2_headers or None,
+            payloads_path=payload_path,
+            rules_path=RULES,
+            results_dir=RESULTS.ensure_results_dir(),
+            concurrency=3,
+            proxy=str(proxy_val) if proxy_val else None,
+            insecure=effective_insecure,
+            session_keeper=session_keeper,
+            proxy_rotator=proxy_rotator,
+            auth_manager=auth_manager,
+            seed_corpus=seed_corpus,
+        )
+    elif protocol == "graphql":
+        from modules.graphql import run_graphql_fuzz1 as gql_runner
+
+        gql_runner.execute_graphql_scan(
+            target_id=target_id,
+            base_url=target.base_url,
+            endpoint=str(target.settings.get("endpoint", "/graphql")),
+            payloads_path=payload_path,
+            rules_path=RULES,
+            results_dir=RESULTS.ensure_results_dir(),
+            concurrency=3,
+            headers=headers,
+            proxy=str(proxy_val) if proxy_val else None,
+            insecure=effective_insecure,
+            targets=targets,
+            session_keeper=session_keeper,
+            proxy_rotator=proxy_rotator,
+            auth_manager=auth_manager,
+        )
+    else:
+        raise ValueError(f"Target '{target_id}' has unsupported protocol '{protocol}'")
 
 
 def run_token_audit(
@@ -429,7 +552,11 @@ def run_concurrency_audit(
     if ConcurrencyFuzzer is None:
         print("[!] ConcurrencyFuzzer module is unavailable in this environment, skipping.")
         return []
-    fuzzer = ConcurrencyFuzzer(burst_size=burst_size)
+    fuzzer = ConcurrencyFuzzer(
+        burst_size=burst_size,
+        verify_ssl=not insecure,
+        proxy=proxy,
+    )
     print(f"[i] Testing state-changing actions with synchronized burst size: {burst_size} req/burst")
 
     candidates = candidate_endpoints or [
@@ -709,6 +836,8 @@ def run_dynamic_target(
     verify_graphql_advanced: bool = False,
     proxy_pool: str | None = None,
     auth_automation: dict[str, Any] | None = None,
+    client_cert: str | None = None,
+    client_key: str | None = None,
     concurrency_burst: int = 5,
     callback_url: str | None = None,
     callback_poll_url: str | None = None,
@@ -841,6 +970,27 @@ def run_dynamic_target(
             effective_proxy = first_proxy
         print(f"[+] Smart Proxy Pool activated ({rotator.count} proxies). Active: {effective_proxy}")
 
+    auth_manager: AuthManager | None = None
+    if client_cert or auth_token:
+        auth_cfg = AuthConfig(
+            token=auth_token.replace("Bearer ", "").strip() if auth_token and ":" not in auth_token else None,
+            client_cert=client_cert,
+            client_key=client_key,
+        )
+        if auth_token:
+            auth_manager = AuthManager.from_header_string(auth_token)
+            auth_manager.config.client_cert = client_cert
+            auth_manager.config.client_key = client_key
+        else:
+            auth_manager = AuthManager(auth_cfg)
+
+    seed_corpus = None
+    if har and Path(har).is_file():
+        try:
+            seed_corpus = parse_har_file(har)
+        except Exception:
+            seed_corpus = None
+
     mgr = targets or TargetManager(PROJECT_ROOT)
     # If target_id collides in manager, give it a unique suffix
     if target_id in mgr.targets:
@@ -867,8 +1017,10 @@ def run_dynamic_target(
         print(f"[i] GraphQL Endpoint: {settings.get('endpoint')}")
     if auth.get("header"):
         print("[i] Auth: Configured via CLI")
-    if proxy:
-        print(f"[i] Upstream Proxy: {proxy}")
+    if client_cert:
+        print(f"[i] mTLS Client Cert: {client_cert}")
+    if effective_proxy:
+        print(f"[i] Upstream Proxy: {effective_proxy}")
     if insecure:
         print("[i] SSL Verify: Disabled (--insecure)")
     if resolved_payloads:
@@ -877,22 +1029,40 @@ def run_dynamic_target(
         print("[i] Payloads: None (Generating cases directly from OpenAPI schema)")
     print(f"[i] Results dir: {RESULTS.results_dir}")
 
+    audit_targets = (
+        _extract_audit_targets_from_schema(
+            resolved_schema,
+            allow_remote=bool(settings.get("allow_remote_schema", False)),
+        )
+        if protocol == "rest"
+        else {"endpoints": [], "callback_params": [], "race_candidates": [], "resource_candidates": []}
+    )
+
     try:
         kwargs: dict[str, Any] = {
             "include_payload": bool(resolved_payloads),
             "targets": mgr,
         }
-        if proxy:
-            kwargs["proxy"] = proxy
+        if effective_proxy:
+            kwargs["proxy"] = effective_proxy
         if insecure:
             kwargs["insecure"] = insecure
+        if session_keeper is not None:
+            kwargs["session_keeper"] = session_keeper
+        if rotator is not None:
+            kwargs["proxy_rotator"] = rotator
+        if auth_manager is not None and (client_cert or auth_automation):
+            kwargs["auth_manager"] = auth_manager
+        if seed_corpus is not None:
+            kwargs["seed_corpus"] = seed_corpus
         run_target(target_id, **kwargs)
 
         if verify_tokens and auth_token:
             token_findings = run_token_audit(
                 base_url=url,
                 auth_token=auth_token,
-                proxy=proxy,
+                endpoints=audit_targets["endpoints"] or None,
+                proxy=effective_proxy,
                 insecure=insecure,
             )
             if token_findings:
@@ -905,7 +1075,8 @@ def run_dynamic_target(
         if verify_callbacks:
             callback_findings = run_callback_audit(
                 base_url=url,
-                proxy=proxy,
+                candidate_params=audit_targets["callback_params"] or None,
+                proxy=effective_proxy,
                 insecure=insecure,
                 external_url=callback_url,
                 poll_url=callback_poll_url,
@@ -921,9 +1092,10 @@ def run_dynamic_target(
         if verify_concurrency:
             race_findings = run_concurrency_audit(
                 base_url=url,
+                candidate_endpoints=audit_targets["race_candidates"] or None,
                 auth_token=auth_token,
                 burst_size=concurrency_burst,
-                proxy=proxy,
+                proxy=effective_proxy,
                 insecure=insecure,
             )
             if race_findings:
@@ -934,10 +1106,12 @@ def run_dynamic_target(
                 )
 
         if verify_pii:
+            get_eps = [ep for ep in audit_targets["endpoints"] if ep[0] == "GET"]
             pii_findings = run_pii_audit(
                 base_url=url,
+                endpoints=get_eps or audit_targets["endpoints"] or None,
                 auth_token=auth_token,
-                proxy=proxy,
+                proxy=effective_proxy,
                 insecure=insecure,
             )
             if pii_findings:
@@ -950,8 +1124,9 @@ def run_dynamic_target(
         if verify_headers:
             header_findings = run_header_tamper_audit(
                 base_url=url,
+                endpoints=audit_targets["endpoints"][:10] or None,
                 auth_token=auth_token,
-                proxy=proxy,
+                proxy=effective_proxy,
                 insecure=insecure,
             )
             if header_findings:
@@ -964,8 +1139,9 @@ def run_dynamic_target(
         if verify_resources:
             res_findings = run_resource_exhaustion_audit(
                 base_url=url,
+                candidate_endpoints=audit_targets["resource_candidates"][:10] or None,
                 auth_token=auth_token,
-                proxy=proxy,
+                proxy=effective_proxy,
                 insecure=insecure,
             )
             if res_findings:
@@ -980,7 +1156,7 @@ def run_dynamic_target(
                 base_url=url,
                 endpoint=settings.get("endpoint", "/graphql"),
                 headers={"Authorization": auth_token} if auth_token else {},
-                proxy=proxy,
+                proxy=effective_proxy,
                 insecure=insecure,
             )
             if gql_findings:
@@ -1187,6 +1363,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--login-url", default=None, help="Automated login URL for generic token refreshing")
     parser.add_argument("--login-body", default=None, help="JSON body for automated login request")
     parser.add_argument("--token-extract", default="json:access_token", help="Extraction rule for session token")
+    parser.add_argument("--client-cert", default=None, help="Path to mTLS client certificate file")
+    parser.add_argument("--client-key", default=None, help="Path to mTLS client private key file")
     parser.add_argument("--concurrency-burst", type=int, default=5, help="Number of synchronized burst requests (default: 5)")
     parser.add_argument("--callback-url", default=None, help="External canary callback URL for OOB SSRF detection")
     parser.add_argument("--poll-url", default=None, help="External Canary API polling endpoint URL (use {token} placeholder)")
@@ -1248,6 +1426,8 @@ def main(argv: list[str] | None = None) -> int:
             verify_graphql_advanced=args.verify_graphql_advanced,
             proxy_pool=args.proxy_pool,
             auth_automation=auth_auto_dict,
+            client_cert=args.client_cert,
+            client_key=args.client_key,
             concurrency_burst=args.concurrency_burst,
             callback_url=args.callback_url,
             callback_poll_url=args.poll_url,

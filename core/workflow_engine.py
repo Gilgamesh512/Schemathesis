@@ -257,10 +257,13 @@ class WorkflowRunner:
             error_message = None
 
             if step.assert_denied:
-                # Expecting access denied (401 or 403)
-                if status == 200:
+                # Expecting access denied (401, 403, or 404); any 2xx response indicates BOLA
+                if 200 <= status < 300:
                     success = False
-                    error_message = f"Broken Object Authorization (BOLA): Step '{step.name}' expected 401/403 but got 200 OK."
+                    error_message = (
+                        f"Broken Object Authorization (BOLA): Step '{step.name}' "
+                        f"expected 401/403 but got HTTP {status}."
+                    )
                     finding = Finding(
                         finding_id=stable_finding_id(
                             "workflow", step.method, endpoint, "BOLA", step.name,

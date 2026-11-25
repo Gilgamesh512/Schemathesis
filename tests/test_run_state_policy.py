@@ -109,9 +109,9 @@ def test_truncated_or_malformed_json_triggers_quarantine_recovery(tmp_path, stat
 
     # Warning must be emitted to stderr
     captured = capsys.readouterr().err
-    assert "CANH BAO" in captured
+    assert "WARNING" in captured
     assert "state_corrupted.json" in captured
-    assert "File goc da duoc luu tai" in captured
+    assert "Original file archived at" in captured
 
     # Original malformed content must remain available in quarantine file
     quarantine = tmp_path / "state_corrupted.json"
@@ -215,10 +215,10 @@ def test_quarantine_copy_failure_reports_truthful_diagnostic(tmp_path, state_cla
 
     captured = capsys.readouterr().err
     # Must report the copy failure
-    assert "Khong the luu ban sao state bi hong" in captured
+    assert "Failed to save backup of corrupted state" in captured
     # Must truthfully report that archive was NOT created and original file is kept
-    assert "Khong the tao ban sao luu tru; file goc van duoc giu nguyen tren dia" in captured
-    assert "File goc da duoc luu tai" not in captured
+    assert "Could not create backup archive; original file preserved on disk" in captured
+    assert "Original file archived at" not in captured
 
     # Original corrupted file must remain untouched on disk
     assert state_file.exists()

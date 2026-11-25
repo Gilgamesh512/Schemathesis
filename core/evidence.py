@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class CircuitBreakerTrippedError(RuntimeError):
@@ -350,6 +350,14 @@ class Finding(BaseModel):
     cve_confidence: float = 0.0
     curl_command: Optional[str] = None
 
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _normalize_severity(cls, value: Any) -> str:
+        sev = str(value or "info").strip().lower()
+        if sev in {"critical", "high", "medium", "low", "info", "unknown"}:
+            return sev
+        return "info"
+
 
 def verify_deep_state_persistence(
     get_url: str,
@@ -359,23 +367,25 @@ def verify_deep_state_persistence(
     timeout: float = 5.0,
     verify_ssl: bool = True,
 ) -> tuple[bool, str]:
-    """Deep State Loopback Verification: Gọi GET đối ứng để xác minh dữ liệu thực sự có bị biến đổi trong DB hay không.
-    
-    Giúp triệt tiêu False Positive (khi server trả về 200/201 nhưng thực chất bỏ qua trường độc hoặc chỉ là echo DTO).
-    Trả về (is_persisted, details_message).
+    """Deep State Loopback Verification: issue a corresponding GET request to verify whether
+    the mutated data actually persisted in the backend datastore.
+
+    Eliminates false positives where the server returns HTTP 200/201 while silently
+    ignoring extra properties or echoing a DTO without persisting changes.
+    Returns (is_persisted, details_message).
     """
     import requests
     try:
         resp = requests.get(get_url, headers=headers or {}, timeout=timeout, verify=verify_ssl)
         if resp.status_code != 200:
             return False, f"Loopback GET returned HTTP {resp.status_code}"
-        
+
         try:
             data = resp.json()
         except Exception:
             return False, "Loopback GET response is not valid JSON"
 
-        # Đệ quy kiểm tra trường và giá trị trong JSON
+        # Recursively search for the target field and value in the JSON payload
         def _check_in_dict(obj: Any) -> bool:
             if isinstance(obj, dict):
                 if expected_field in obj:

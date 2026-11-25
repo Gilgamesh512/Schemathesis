@@ -192,6 +192,7 @@ class PurePythonSchemaValidator:
     def __init__(self, schema: dict[str, Any]):
         self.raw_schema = schema
         self._validator = None
+        self.degraded = False
         try:
             import jsonschema
             self._validator = jsonschema.Draft202012Validator(schema)
@@ -201,14 +202,17 @@ class PurePythonSchemaValidator:
                 self._validator = jsonschema.Draft7Validator(schema)
             except Exception:
                 self._validator = None
+                self.degraded = True
+                logger.warning("PurePythonSchemaValidator initialized without jsonschema backend; validation is degraded.")
 
     def is_valid(self, instance: Any) -> bool:
         if self._validator is None:
             return True
         try:
             return self._validator.is_valid(instance)
-        except Exception:
-            return True
+        except Exception as exc:
+            logger.debug("Schema validation check error: %s", exc)
+            return False
 
     def validate(self, instance: Any) -> tuple[bool, list[str]]:
         """Validate instance against schema and return (is_valid, error_messages)."""

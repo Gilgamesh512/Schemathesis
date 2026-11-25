@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .evidence import sanitize_body
 from .path_manager import ProjectPaths
 
 
@@ -78,14 +79,13 @@ class ResultManager:
             or archive.stat().st_size != csv_path.stat().st_size
         ):
             raise RuntimeError(
-                "Khong the xac minh ban sao CSV lich su; "
-                "da dung de tranh mat du lieu."
+                "Could not verify legacy CSV archive; aborting to prevent data loss."
             )
 
         print(
-            "[CANH BAO] CSV schema cu khong khop schema hien tai.\\n"
-            f"  Lich su duoc luu tai: {archive}\\n"
-            f"  Bat dau CSV schema moi tai: {csv_path}"
+            "[WARNING] Legacy CSV schema does not match current schema.\n"
+            f"  Archived history at: {archive}\n"
+            f"  Starting new canonical CSV at: {csv_path}"
         )
 
         # Start a fresh canonical CSV with the current schema.
@@ -118,11 +118,14 @@ class ResultManager:
 
             for finding in findings:
                 record = finding.model_dump()
-                if "payload" in record:
+                if "payload" in record and record["payload"] is not None:
+                    sanitized_payload = sanitize_body(record["payload"])
                     record["payload"] = json.dumps(
-                        record["payload"],
+                        sanitized_payload,
                         ensure_ascii=False,
                     )
+                if isinstance(record.get("evidence"), dict) and record["evidence"].get("payload") is not None:
+                    record["evidence"]["payload"] = sanitize_body(record["evidence"]["payload"])
                 writer.writerow(record)
 
         # Keep the existing NDJSON behavior and source attribution.
@@ -130,6 +133,10 @@ class ResultManager:
         with ndjson_path.open("a", encoding="utf-8") as output:
             for finding in findings:
                 record = finding.model_dump()
+                if record.get("payload") is not None:
+                    record["payload"] = sanitize_body(record["payload"])
+                if isinstance(record.get("evidence"), dict) and record["evidence"].get("payload") is not None:
+                    record["evidence"]["payload"] = sanitize_body(record["evidence"]["payload"])
                 record["source"] = source
                 output.write(json.dumps(record, ensure_ascii=False) + "\n")
 

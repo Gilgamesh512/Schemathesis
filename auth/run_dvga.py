@@ -186,18 +186,18 @@ def graphql_request(query: str, variables: dict = None, headers: dict = None):
         return None
 
 def dynamic_register_and_login():
-    """Tự động sinh tài khoản ngẫu nhiên, đăng ký và login lấy access token."""
+    """Automatically generate a random account, register, and login for an access token."""
     print("\n[*] DVGA DYNAMIC AUTH & AUTO-PROVISIONING...")
 
-    # 1. Sinh thông tin tài khoản duy nhất (Unique)
+    # 1. Generate unique credentials
     uid = uuid.uuid4().hex[:6]
     username = f"fuzzer_{uid}"
     password = f"Pass_{uid}!"
     email = f"{username}@test.lab"
 
-    print(f"    [*] Đang tạo tài khoản mới: {username}")
+    print(f"    [*] Creating temporary account: {username}")
 
-    # 2. Gửi mutation createUser
+    # 2. Send createUser mutation
     create_user_query = """
     mutation CreateUser($userData: UserInput!) {
         createUser(userData: $userData) {
@@ -216,11 +216,11 @@ def dynamic_register_and_login():
     })
 
     if res_reg is None or res_reg.status_code != 200:
-        print("    [!] Đăng ký qua createUser thất bại, tiếp tục thử login...")
+        print("    [!] createUser registration failed, continuing to login...")
     else:
-        print(f"    [+] Đăng ký tài khoản '{username}' thành công!")
+        print(f"    [+] Registered account '{username}' successfully.")
 
-    # 3. Đăng nhập lấy JWT Access Token
+    # 3. Login to obtain JWT access token
     login_query = """
     mutation Login($username: String!, $password: String!) {
         login(username: $username, password: $password) {
@@ -230,15 +230,15 @@ def dynamic_register_and_login():
     }
     """
     res_login = graphql_request(login_query, {"username": username, "password": password})
-    
+
     if res_login is None:
-        print("    [X] Không nhận được phản hồi từ server khi đăng nhập.")
+        print("    [X] No response received from server during login.")
         return None
 
     try:
         payload = res_login.json()
     except Exception:
-        print(f"    [X] Phản hồi không phải JSON: {res_login.text}")
+        print(f"    [X] Non-JSON login response: {res_login.text}")
         return None
 
     data_field = payload.get("data") if isinstance(payload, dict) else None
@@ -247,16 +247,16 @@ def dynamic_register_and_login():
         if isinstance(login_field, dict):
             token = login_field.get("accessToken")
             if token:
-                print("    [+] LOGIN SUCCESS: Đã lấy JWT Token thành công!")
+                print("    [+] LOGIN SUCCESS: Retrieved JWT access token.")
                 return str(token)
 
     errors = payload.get("errors") if isinstance(payload, dict) else None
     if errors:
-        print(f"    [X] Login thất bại: {errors}")
+        print(f"    [X] Login failed: {errors}")
     return None
 
 def update_dvga_token_env(token: str):
-    """Ghi token vào file tokens.env"""
+    """Persist token into tokens.env."""
     lines = ENV_FILE.read_text(encoding="utf-8").splitlines() if ENV_FILE.exists() else []
     key = "DVGA_AUTH_HEADER"
     value = f"Authorization: Bearer {token}"
@@ -268,7 +268,7 @@ def update_dvga_token_env(token: str):
         os.chmod(ENV_FILE, 0o600)
     except OSError:
         pass
-    print(f"[+] Token đã được lưu vào {ENV_FILE}")
+    print(f"[+] Token saved to {ENV_FILE}")
 
 def introspect(auth_header: str = None):
     print("\n[*] Running GraphQL introspection...")
@@ -338,26 +338,26 @@ def main():
     print(" DVGA GRAPHQL DISCOVERY & DYNAMIC AUTH")
     print("=" * 60)
 
-    # 1. Kiểm tra DVGA
+    # 1. Wait for DVGA readiness
     if not wait_for_dvga():
         print("[X] DVGA unavailable.")
         sys.exit(1)
 
-    # 2. Tự động sinh user, đăng ký và login lấy token
+    # 2. Dynamically register and authenticate to obtain token
     token = dynamic_register_and_login()
     auth_header = None
     if token:
         update_dvga_token_env(token)
         auth_header = f"Bearer {token}"
     else:
-        print("[!] Không lấy được token, tiếp tục chạy discovery không header...")
+        print("[!] Failed to retrieve token; continuing discovery without auth header...")
 
-    # 3. Introspect Schema
+    # 3. Introspect schema
     data = introspect(auth_header)
     if data is None:
         sys.exit(1)
 
-    # 4. Phân tích và lưu Schema
+    # 4. Analyze and persist schema
     analysis = analyze_schema(data)
 
     print("\n[*] GraphQL Schema")

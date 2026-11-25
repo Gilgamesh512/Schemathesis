@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "schemathesis-api-security"
 version = "2.0.0"
-description = "Enterprise Automated API Security Testing, Fuzzing & DevSecOps Quality Gate Framework"
+description = "Automated API Security Testing, Fuzzing & DevSecOps Quality Gate Framework"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 license = { text = "MIT" }
 authors = [
-    { name = "Schemathesis Security Team" }
+    { name = "Schemathesis Security" }
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -28,15 +28,17 @@ dependencies = [
     "schemathesis==4.24.3",
     "pyyaml>=6.0.2",
     "pydantic>=2.9.2",
-    "httpx>=0.28.1",
+    "httpx[http2]>=0.28.1",
     "requests>=2.32.3",
-    "rich>=13.9.4",
+    "jsonschema>=4.23.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
     "hypothesis>=6.100.0",
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
 ]
 
 [project.scripts]
@@ -46,3 +48,17 @@ api-gate = "run_all:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["core*", "auth*", "cli*", "modules*", "lab*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+exclude = [".lab", "results", "targets", ".venv"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+exclude = "(^\\.lab/|^results/|^targets/)"

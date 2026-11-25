@@ -18,8 +18,8 @@ class SchemaManager:
     def __init__(self, root: str | Path | None = None):
         self.paths = ProjectPaths.from_root(root)
 
-    def resolve_local_schema(self, value: str | Path) -> Path:
-        resolved = self.paths.resolve(value)
+    def resolve_local_schema(self, value: str | Path, *, allow_outside: bool = False) -> Path:
+        resolved = self.paths.resolve(value, allow_outside=allow_outside)
         if not resolved.exists():
             raise FileNotFoundError(f"Schema file not found: {resolved}")
         if not resolved.is_file():
@@ -31,9 +31,10 @@ class SchemaManager:
         schema_source: str | Path,
         *,
         allow_remote: bool = False,
+        allow_outside: bool = False,
     ) -> dict[str, Any]:
         if isinstance(schema_source, Path):
-            return self.load_local(schema_source)
+            return self.load_local(schema_source, allow_outside=allow_outside)
         scheme = urlparse(str(schema_source)).scheme
         if scheme in {"http", "https"}:
             if not allow_remote:
@@ -41,10 +42,10 @@ class SchemaManager:
             return self.load_remote(str(schema_source))
         if "://" in str(schema_source):
             raise ValueError(f"Unsupported schema URL scheme: {scheme}")
-        return self.load_local(str(schema_source))
+        return self.load_local(str(schema_source), allow_outside=allow_outside)
 
-    def load_local(self, schema_path: str | Path) -> dict[str, Any]:
-        path = self.resolve_local_schema(schema_path)
+    def load_local(self, schema_path: str | Path, *, allow_outside: bool = False) -> dict[str, Any]:
+        path = self.resolve_local_schema(schema_path, allow_outside=allow_outside)
         text = path.read_text(encoding="utf-8")
         if path.suffix.lower() in {".yaml", ".yml"}:
             payload = yaml.safe_load(text)

@@ -5,7 +5,7 @@
 
 FROM python:3.12-slim-bookworm
 
-LABEL maintainer="Schemathesis API Security Team"
+LABEL maintainer="Schemathesis API Security"
 LABEL description="Enterprise automated API security testing and fuzzing engine"
 LABEL version="2.0.0"
 

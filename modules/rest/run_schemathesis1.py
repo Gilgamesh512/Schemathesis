@@ -42,11 +42,30 @@ import schemathesis
 from pydantic import BaseModel, Field, ValidationError
 
 from modules.security import rules_engine
-from core import (ConfirmationEngine, Evidence, Finding, RequestScheduler,
-                  ProjectPaths, ResultManager, SchemaManager, content_hash,
-                  redact_headers, snapshot_response, stable_finding_id,
-                  FeedbackAnalyzer, SemanticMutationEngine, ParamSchema,
-                  CleanupTracker, get_audit_headers, verify_deep_state_persistence)
+from core import (
+    ConfirmationEngine,
+    Evidence,
+    Finding,
+    RequestScheduler,
+    ProjectPaths,
+    ResultManager,
+    RunState,
+    SchemaManager,
+    DEFAULT_ERROR_SIGNALS,
+    MAX_ATTEMPTS_PER_FINGERPRINT,
+    SEVERITY_BY_STATUS,
+    content_hash,
+    extract_response_elapsed_ms,
+    redact_headers,
+    snapshot_response,
+    stable_finding_id,
+    FeedbackAnalyzer,
+    SemanticMutationEngine,
+    ParamSchema,
+    CleanupTracker,
+    get_audit_headers,
+    verify_deep_state_persistence,
+)
 
 PROJECT_PATHS = ProjectPaths.from_root(PROJECT_ROOT)
 GLOBAL_CLEANUP_TRACKER = CleanupTracker(
@@ -59,162 +78,52 @@ GLOBAL_CLEANUP_TRACKER = CleanupTracker(
 # --------------------------------------------------------------------------
 
 class Payload(BaseModel):
-    endpoint: str                     # vd: "/api/v1/users/{id}"
+    endpoint: str                     # e.g. "/api/v1/users/{id}"
     method: str                       # GET/POST/PUT/DELETE/PATCH
-    target_param: str = ""            # ten tham so bi nham (query/path/body field)
+    target_param: str = ""            # target parameter name (query/path/body field)
     param_location: str = "query"     # "query" | "path" | "body" | "header"
     attack_type: str                  # SQLi, XSS, BOLA, MassAssignment, ...
-    payload_value: Any                # gia tri thuc su se nhoi vao param
+    payload_value: Any                # actual value injected into the parameter
     owasp_category: Optional[str] = None
     context: Optional[str] = None
-    expected_signal: list[str] = Field(default_factory=list)  # tu khoa nghi ngo trong response
+    expected_signal: list[str] = Field(default_factory=list)  # expected response indicators
     technology: Optional[dict[str, str]] = None
     mutation_family: Optional[str] = None
     target_app: Optional[str] = None  # Identifier for multi-target tracking
 
 
 # --------------------------------------------------------------------------
-# 2. Cac tu khoa/nguong dung de danh gia response co "nghi ngo" khong
-#    (co the mo rong theo OWASP API Top 10 khi can)
+# 2. Evaluation context and run state
 # --------------------------------------------------------------------------
 
-# Fallback neu khong co --rules (giu tuong thich nguoc); binh thuong
-# nen luon chay voi rules.json duoc rules_engine.py cap nhat.
-DEFAULT_ERROR_SIGNALS = [
-    "sql syntax", "syntaxerror", "traceback", "stack trace",
-    "internal server error", "unhandled exception", "odbc",
-    "psql", "sqlite", "ora-", "you have an error in your sql",
-]
-
-SEVERITY_BY_STATUS = {
-    500: "high",
-    503: "medium",
-}
-
-# ContextVar de moi task async biet run_id hien tai ma khong can truyen tay
-# qua tung ham (cac task chay song song dung chung 1 run).
+# ContextVar so parallel async tasks share the current run_id without plumbing it manually.
 STATE_RUN_ID: "contextvars.ContextVar[str]" = contextvars.ContextVar("run_id", default="")
 
 
 def fingerprint_of(target_app: str, endpoint: str, method: str, param: str,
                    attack_type: str, mutation_family: Optional[str] = None) -> str:
-    """Fingerprint tren (target_app, endpoint, method, param, attack_type).
-    PHAI co target_app: khi chay multi-target, VAmPI va crAPI co the cung
-    co endpoint /users/{id} - thieu target_app se lam 2 app khac nhau bi
-    coi la CUNG 1 fingerprint, dedup/state se sai lech giua 2 target."""
+    """Compute a stable fingerprint over (target_app, endpoint, method, param, attack_type).
+    target_app is required so identical paths across different targets do not collide."""
     raw = (f"{target_app.lower()}|{method.upper()}|{endpoint}|{param}|"
            f"{attack_type.lower()}|{mutation_family or ''}")
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
 # --------------------------------------------------------------------------
-# 3. State giua cac lan chay (tranh danh lai cho da confirm)
-# --------------------------------------------------------------------------
-
-class RunState:
-    def __init__(self, path: Path):
-        self.path = path
-        self.data: dict[str, dict] = {}
-        if path.exists():
-            try:
-                raw = path.read_text(encoding="utf-8")
-                parsed = json.loads(raw)
-                if not isinstance(parsed, dict):
-                    raise ValueError(
-                        f"State file must contain a JSON object, got {type(parsed).__name__}"
-                    )
-                self.data = parsed
-            except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
-                archive = self.path.with_name(f"{self.path.stem}_corrupted{self.path.suffix}")
-                suffix = 2
-                while archive.exists():
-                    archive = self.path.with_name(f"{self.path.stem}_corrupted_{suffix}{self.path.suffix}")
-                    suffix += 1
-                archive_saved = False
-                try:
-                    shutil.copy2(self.path, archive)
-                    archive_saved = True
-                except OSError as copy_exc:
-                    print(f"[CANH BAO] Khong the luu ban sao state bi hong: {copy_exc}", file=sys.stderr)
-
-                if archive_saved:
-                    archive_msg = f"File goc da duoc luu tai {archive}."
-                else:
-                    archive_msg = "Khong the tao ban sao luu tru; file goc van duoc giu nguyen tren dia."
-
-                print(
-                    f"[CANH BAO] State {self.path} bi loi ({exc}). "
-                    f"{archive_msg} "
-                    f"Khoi tao state moi rong (du lieu lich su chua duoc khoi phuc).",
-                    file=sys.stderr,
-                )
-                self.data = {}
-            except OSError as exc:
-                print(
-                    f"[CANH BAO] Khong the doc file state {self.path}: {exc}. "
-                    "Khoi tao state moi rong.",
-                    file=sys.stderr,
-                )
-                self.data = {}
-
-    def status(self, fp: str) -> Optional[str]:
-        return self.data.get(fp, {}).get("status")
-
-    def attempts(self, fp: str) -> int:
-        return self.data.get(fp, {}).get("attempts", 0)
-
-    def record(self, fp: str, status: str) -> None:
-        entry = self.data.setdefault(fp, {"attempts": 0, "status": "new"})
-        entry["attempts"] += 1
-
-        current = entry.get("status", "new")
-        if current == "confirmed":
-            pass
-        elif current == "candidate" and status == "rejected":
-            pass
-        else:
-            entry["status"] = status
-
-        entry["last_seen"] = datetime.now(timezone.utc).isoformat()
-
-    def save(self) -> None:
-        temp_path = self.path.with_name(f"{self.path.name}.tmp.{uuid.uuid4().hex[:8]}")
-        try:
-            temp_path.write_text(
-                json.dumps(self.data, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            temp_path.replace(self.path)
-        except Exception:
-            if temp_path.exists():
-                try:
-                    temp_path.unlink()
-                except OSError:
-                    pass
-            raise
-
-
-MAX_ATTEMPTS_PER_FINGERPRINT = 3  # dung Nhiem vu 3.3: dung sau 3 lan thu that bai
-
-
-# --------------------------------------------------------------------------
-# 4. Load OpenAPI tu A + payload tu B, voi xu ly loi thuong gap
+# 4. Load OpenAPI specs and payloads with explicit error diagnostics
 # --------------------------------------------------------------------------
 
 def _read_spec_dict(spec_path: str) -> dict:
-    """Doc spec ra dict, ho tro ca JSON va YAML - OpenAPI thuong duoc viet
-    bang YAML tren thuc te, khong chi JSON."""
-    return SchemaManager(PROJECT_ROOT).load_local(spec_path)
+    """Read an OpenAPI spec into a dict, supporting both JSON and YAML."""
+    return SchemaManager(PROJECT_ROOT).load_local(spec_path, allow_outside=True)
 
 
 def extract_base_url(spec_path: str) -> Optional[str]:
-    """Schemathesis.openapi.from_path KHONG tu doc field 'servers'/'host'+
-    'basePath' de suy ra base_url (khac voi from_url). Day la loi tich hop
-    hay gap nhat khi lay spec dang file tu A - phai tu trich xuat."""
+    """Extract base_url from OpenAPI 'servers' or Swagger 2.0 'host'+'basePath'."""
     try:
         raw = _read_spec_dict(spec_path)
     except Exception as exc:
-        print(f"[CANH BAO] Khong doc duoc spec de trich base_url: {exc}", file=sys.stderr)
+        print(f"[WARNING] Failed to read spec for base_url extraction: {exc}", file=sys.stderr)
         return None
     if not isinstance(raw, dict):
         return None
@@ -245,18 +154,17 @@ def load_schema(
             schema = schemathesis.openapi.from_dict(schema_document)
             resolved_spec = spec_path
         else:
-            resolved_spec = schema_manager.resolve_local_schema(spec_path)
-            schema_document = schema_manager.load_local(resolved_spec)
+            resolved_spec = schema_manager.resolve_local_schema(spec_path, allow_outside=True)
+            schema_document = schema_manager.load_local(resolved_spec, allow_outside=True)
             try:
                 schema = schemathesis.openapi.from_dict(schema_document)
             except Exception:
                 schema = schemathesis.openapi.from_path(str(resolved_spec))
-    except Exception as exc:  # spec loi cu phap / version khong ho tro
-        print(f"[LOI] Khong doc duoc OpenAPI spec tu A: {spec_path}\n  -> {exc}",
+    except Exception as exc:
+        print(f"[ERROR] Could not load OpenAPI spec: {spec_path}\n  -> {exc}",
               file=sys.stderr)
-        print("  Kiem tra: (1) spec co dung OpenAPI 3.0/3.1 khong (Swagger 2.0 "
-              "phai convert truoc), (2) $ref co bi loop khong, (3) co field "
-              "'servers'/'host'+'basePath' de xac dinh base_url khong.",
+        print("  Check: (1) valid OpenAPI 3.0/3.1 (or convertible Swagger 2.0/Postman/HAR), "
+              "(2) no circular $ref loops, (3) valid 'servers' or --base-url.",
               file=sys.stderr)
         sys.exit(1)
 
@@ -264,12 +172,11 @@ def load_schema(
         None if is_remote else extract_base_url(str(resolved_spec))
     )
     if not base_url:
-        print(f"[LOI] Khong tim duoc base_url. Spec cua A khong co 'servers' "
-              f"(hoac 'host'+'basePath') hop le - can chay lai voi --base-url.",
+        print("[ERROR] Could not resolve base_url from spec ('servers'/'host'+'basePath'); "
+              "re-run with --base-url.",
               file=sys.stderr)
         sys.exit(1)
-    # Trong Schemathesis 4.x, BaseSchema.clone() khong nhan base_url truc
-    # tiep - base_url duoc truyen o buoc goi request (Case.call(base_url=...)).
+    # In Schemathesis 4.x, base_url is passed at request construction time (Case.as_transport_kwargs(base_url=...)).
     return schema, base_url
 
 
@@ -279,16 +186,16 @@ def load_targets(
     *,
     allow_remote_schema: bool = False,
 ) -> dict[str, tuple]:
-    """Nap NHIEU spec cung luc cho che do multi-target.
+    """Load multiple OpenAPI specs for multi-target execution.
     --targets 'vampi=vampi_spec.yaml,crapi=crapi_spec.json'
-    --base-urls 'vampi=http://localhost:5000,crapi=http://localhost:8888' (tuy chon)
-    Tra ve dict {ten_app: (schema, base_url)}."""
+    --base-urls 'vampi=http://localhost:5002,crapi=http://localhost:8888'
+    Returns {target_name: (schema, base_url)}."""
     base_url_overrides: dict[str, str] = {}
     if base_urls_arg:
         for pair in base_urls_arg.split(","):
             name, sep, url = pair.partition("=")
             if not sep:
-                print(f"[LOI] --base-urls sai dinh dang o '{pair}'. Dung 'ten=url'.", file=sys.stderr)
+                print(f"[ERROR] Invalid --base-urls entry '{pair}'. Use 'name=url'.", file=sys.stderr)
                 sys.exit(1)
             base_url_overrides[name.strip().lower()] = url.strip()
 
@@ -296,13 +203,13 @@ def load_targets(
     for pair in targets_arg.split(","):
         name, sep, spec_path = pair.partition("=")
         if not sep:
-            print(f"[LOI] --targets sai dinh dang o '{pair}'. Dung 'ten=duong_dan', "
-                  f"vd 'vampi=vampi_spec.yaml'.", file=sys.stderr)
+            print(f"[ERROR] Invalid --targets entry '{pair}'. Use 'name=path', "
+                  "e.g. 'vampi=vampi_spec.yaml'.", file=sys.stderr)
             sys.exit(1)
         name = name.strip().lower()
         spec_path = spec_path.strip()
         if name in targets:
-            print(f"[LOI] Ten target '{name}' bi lap trong --targets.", file=sys.stderr)
+            print(f"[ERROR] Duplicate target name '{name}' in --targets.", file=sys.stderr)
             sys.exit(1)
         schema, base_url = load_schema(
             spec_path,
@@ -310,10 +217,10 @@ def load_targets(
             allow_remote=allow_remote_schema,
         )
         targets[name] = (schema, base_url)
-        print(f"[INFO] Da nap target '{name}': {spec_path} -> base_url={base_url}")
+        print(f"[INFO] Loaded target '{name}': {spec_path} -> base_url={base_url}")
 
     if not targets:
-        print("[LOI] --targets khong co target nao hop le.", file=sys.stderr)
+        print("[ERROR] --targets produced no valid targets.", file=sys.stderr)
         sys.exit(1)
     return targets
 
@@ -445,29 +352,26 @@ def load_payloads(payload_path: str) -> list[Payload]:
         try:
             valid.append(Payload(**item))
         except ValidationError as exc:
-            # Day la loi tich hop pho bien nhat voi B: LLM sinh sai field/kieu.
-            # KHONG crash ca batch - bo qua item loi, ghi canh bao, chay tiep.
-            print(f"[CANH BAO] Payload #{i} tu B khong dung schema, bo qua:\n{exc}",
+            # Skip malformed items rather than aborting the entire batch
+            print(f"[WARNING] Payload #{i} failed schema validation, skipping:\n{exc}",
                   file=sys.stderr)
     if not valid:
-        print("[LOI] Khong co payload hop le nao tu B.", file=sys.stderr)
+        print("[ERROR] No valid payloads found in payload corpus.", file=sys.stderr)
         sys.exit(1)
     return valid
 
 
 # --------------------------------------------------------------------------
-# 5. Ghep payload vao dung operation cua schema, ban request that
+# 5. Match payloads to OpenAPI operations and build Schemathesis cases
 # --------------------------------------------------------------------------
 
 def find_operation(schema, endpoint: str, method: str):
-    """Tim operation khop endpoint+method trong 1 schema.
-    Xu ly ca truong hop B ghi path khong khop 100% (vd thieu {id})."""
+    """Find an operation matching endpoint+method in a schema (with loose path-prefix fallback)."""
     for result in schema.get_all_operations():
         if result.ok():
             op = result.ok()
             if op.method.upper() == method.upper() and op.path == endpoint:
                 return op
-    # thu khop long leo hon: bo qua path params trong so sanh
     norm = lambda p: p.split("{")[0].rstrip("/")
     for result in schema.get_all_operations():
         if result.ok():
@@ -478,18 +382,12 @@ def find_operation(schema, endpoint: str, method: str):
 
 
 def find_operation_multi(targets: dict[str, tuple], payload: "Payload"):
-    """Loi cua 'Multi-Spec Engine': tim payload thuoc app nao trong so
-    nhieu target da nap. Neu payload.target_app duoc B dien san thi chi
-    tim trong dung app do (nhanh + khong bao gio nham). Neu B KHONG dien
-    (truong hop pho bien khi B chua sua prompt LLM) thi tu do tim trong
-    TAT CA target, va CANH BAO neu trung o >1 app (vi 2 app khac nhau co
-    the tinh co cung dinh nghia /users/{id} nhung ngu nghia hoan toan
-    khac nhau - khong nen tu y doan bua)."""
+    """Resolve which loaded target owns a payload in multi-target mode."""
     if payload.target_app:
         name = payload.target_app.strip().lower()
         if name not in targets:
-            print(f"[CANH BAO] payload ghi target_app='{payload.target_app}' nhung "
-                  f"target nay khong nam trong --targets ({sorted(targets)}) - bo qua.",
+            print(f"[WARNING] Payload target_app='{payload.target_app}' is not in "
+                  f"--targets ({sorted(targets)}) - skipping.",
                   file=sys.stderr)
             return None
         schema, base_url = targets[name]
@@ -506,14 +404,11 @@ def find_operation_multi(targets: dict[str, tuple], payload: "Payload"):
 
     if not candidates:
         return None
-    # sap xep truoc de ket qua on dinh (khong phu thuoc thu tu dict cua
-    # Python) VA de thong bao canh bao khop dung voi target thuc su duoc chon
     candidates.sort(key=lambda c: c[0])
     if len(candidates) > 1:
         names = [c[0] for c in candidates]
-        print(f"[CANH BAO] Endpoint '{payload.method} {payload.endpoint}' trung "
-              f"trong NHIEU target: {names}. B nen dien field 'target_app' trong "
-              "payload de tranh nham lan. Bo qua payload mo ho.",
+        print(f"[WARNING] Endpoint '{payload.method} {payload.endpoint}' matches "
+              f"multiple targets: {names}. Specify 'target_app' in payload to disambiguate; skipping.",
               file=sys.stderr)
         return None
     return candidates[0]
@@ -576,7 +471,7 @@ def build_case(schema, op, payload: Payload, baseline_case=None):
         values[payload.target_param] = str(payload.payload_value)
         kwargs["cookies"] = values
     else:
-        raise ValueError(f"param_location khong ho tro: {payload.param_location}")
+        raise ValueError(f"Unsupported param_location: {payload.param_location}")
     try:
         return schema.make_case(**kwargs)
     except Exception as exc:
@@ -598,11 +493,7 @@ def build_baseline_case(schema, op):
 
 
 class PreparedCase:
-    """1 payload da duoc resolve xong: biet thuoc target nao, base_url nao,
-    va Case cua Schemathesis da build san. Tach buoc nay ra khoi vong lap
-    async de: (1) loi resolve/build (endpoint khong ton tai, param sai...)
-    bi bat va bao cao HET 1 lan truoc khi ban request nao, thay vi loi
-    ret ra giua chung fuzzing; (2) nhom fingerprint chinh xac tu dau."""
+    """Resolved payload bound to its target, base_url, baseline Case, and attack Case."""
     __slots__ = ("fingerprint", "target_app", "base_url", "baseline_case", "case", "payload")
 
     def __init__(self, fingerprint, target_app, base_url, baseline_case, case, payload):
@@ -619,8 +510,8 @@ def prepare_cases(payloads: list[Payload], targets: dict[str, tuple]) -> list[Pr
     for payload in payloads:
         match = find_operation_multi(targets, payload)
         if match is None:
-            print(f"[CANH BAO] Endpoint '{payload.method} {payload.endpoint}' "
-                  f"khong co trong bat ky target nao ({sorted(targets)}) - bo qua.",
+            print(f"[WARNING] Endpoint '{payload.method} {payload.endpoint}' "
+                  f"not found in any loaded target ({sorted(targets)}) - skipping.",
                   file=sys.stderr)
             continue
         name, schema, base_url, op = match
@@ -628,7 +519,7 @@ def prepare_cases(payloads: list[Payload], targets: dict[str, tuple]) -> list[Pr
             try:
                 case = build_baseline_case(schema, op)
             except Exception as exc:
-                print(f"[CANH BAO] Khong tao duoc schema case cho {payload.endpoint} "
+                print(f"[WARNING] Could not build schema case for {payload.endpoint} "
                       f"(target={name}): {exc}", file=sys.stderr)
                 continue
             fp = fingerprint_of(
@@ -642,8 +533,8 @@ def prepare_cases(payloads: list[Payload], targets: dict[str, tuple]) -> list[Pr
         try:
             baseline_case = build_baseline_case(schema, op)
         except Exception as exc:
-            print(f"[CANH BAO] Khong tao duoc baseline cho {payload.endpoint} "
-                  f"(target={name}); finding se khong duoc auto-confirm: {exc}",
+            print(f"[WARNING] Could not build baseline case for {payload.endpoint} "
+                  f"(target={name}); finding will not auto-confirm: {exc}",
                   file=sys.stderr)
         try:
             case = build_case(schema, op, payload, baseline_case)
@@ -653,11 +544,11 @@ def prepare_cases(payloads: list[Payload], targets: dict[str, tuple]) -> list[Pr
                     case = build_case(schema, op, payload)
                     baseline_case = None
                 except Exception:
-                    print(f"[CANH BAO] Khong tao duoc case cho {payload.endpoint} "
+                    print(f"[WARNING] Could not build attack case for {payload.endpoint} "
                           f"(target={name}): {exc}", file=sys.stderr)
                     continue
             else:
-                print(f"[CANH BAO] Khong tao duoc case cho {payload.endpoint} "
+                print(f"[WARNING] Could not build attack case for {payload.endpoint} "
                       f"(target={name}): {exc}", file=sys.stderr)
                 continue
         fp = fingerprint_of(name, payload.endpoint, payload.method,
@@ -755,14 +646,7 @@ def evaluate_response(resp, payload: Payload, rules: Optional[dict] = None
         )
 
     # Time-based blind injection evaluation
-    elapsed_ms = None
-    try:
-        if hasattr(resp, "elapsed_ms"):
-            elapsed_ms = getattr(resp, "elapsed_ms", None)
-        elif hasattr(resp, "_elapsed") and getattr(resp, "_elapsed", None) is not None:
-            elapsed_ms = resp._elapsed.total_seconds() * 1000
-    except Exception:
-        elapsed_ms = None
+    elapsed_ms = extract_response_elapsed_ms(resp)
 
     if elapsed_ms is not None and elapsed_ms >= 3500:
         is_time_attack = "TIME" in attack_type or any(
@@ -798,12 +682,11 @@ def evaluate_response(resp, payload: Payload, rules: Optional[dict] = None
 # --------------------------------------------------------------------------
 
 async def fire_case(client: "httpx.AsyncClient", case, base_url: str, headers: dict):
-    """Bao mot Case (Schemathesis) thanh request that qua httpx async,
-    dung as_transport_kwargs() de lay method/url/params/json dung dinh dang."""
+    """Translate a Schemathesis Case into an async httpx request via as_transport_kwargs()."""
     kwargs = case.as_transport_kwargs(base_url=base_url)
     if headers:
         kwargs["headers"] = {**kwargs.get("headers", {}), **headers}
-    if not kwargs.get("cookies"):  # httpx canh bao neu truyen cookies={} rong
+    if not kwargs.get("cookies"):  # httpx warns on empty cookies={}
         kwargs.pop("cookies", None)
     return await client.request(**kwargs)
 
@@ -813,14 +696,12 @@ async def process_fingerprint_group(
     fp: str, group: list[PreparedCase], headers: dict,
     rules: Optional[dict], state: RunState, rate_limit_s: float,
     user2_headers: Optional[dict] = None,
+    cleanup_tracker: Optional[CleanupTracker] = None,
 ) -> list[Finding]:
-    """1 group = cung fingerprint (target_app, endpoint, method, param,
-    attack_type) - moi phan tu trong group chac chan CUNG 1 target_app
-    (vi fingerprint da bao gom target_app). Xu ly TUAN TU trong group
-    (dung sau khi confirmed hoac het luot thu) de khong ban thua cho
-    cung 1 loai loi - nhung CAC GROUP KHAC NHAU (kha nang khac ca target)
-    chay song song voi nhau, day la phan async giup tang toc."""
+    """Process one fingerprint group sequentially (stopping once confirmed or retry budget exhausted),
+    while distinct fingerprint groups execute concurrently."""
     results: list[Finding] = []
+    tracker = cleanup_tracker or GLOBAL_CLEANUP_TRACKER
 
     if state.status(fp) == "confirmed":
         return results
@@ -833,6 +714,7 @@ async def process_fingerprint_group(
         if state.attempts(fp) >= MAX_ATTEMPTS_PER_FINGERPRINT:
             break
 
+        payload_value = pc.payload.payload_value
         attack_response = None
         try:
             async def execute_baseline():
@@ -871,7 +753,7 @@ async def process_fingerprint_group(
 
         resp = attack_response
         if resp is None or result is None:
-            severity, confirmed, evidence, cve_ids = "unknown", False, f"request loi: {error_text}", []
+            severity, confirmed, evidence, cve_ids = "unknown", False, f"request error: {error_text}", []
             status_code = None
             confidence = 0.1
             confirmation_differences = {}
@@ -891,15 +773,15 @@ async def process_fingerprint_group(
 
             # Dual-token BOLA / IDOR cross-account verification
             if user2_headers and pc.payload.attack_type.upper() in ("BOLA", "IDOR"):
-                if status_code == 200:
+                if 200 <= status_code < 300:
                     confirmed = True
                     confidence = 0.95
                     severity = "high"
-                    evidence = f"HTTP 200; BOLA verified via dual-token cross-user validation (User 2 accessed User 1 resource)"
+                    evidence = f"HTTP {status_code}; BOLA verified via dual-token cross-user validation (Secondary user accessed primary resource)"
                 elif status_code in (401, 403):
                     confirmed = False
                     severity = "info"
-                    evidence = f"HTTP {status_code}; Access denied as expected for User 2 (Authorization properly enforced)"
+                    evidence = f"HTTP {status_code}; Access denied as expected for secondary user (Authorization properly enforced)"
 
             # Deep State Loopback Verification for Mass Assignment (API3:2023)
             if pc.payload.attack_type.upper() == "MASS_ASSIGNMENT" and status_code in (200, 201) and resp is not None:
@@ -950,7 +832,7 @@ async def process_fingerprint_group(
                         resp_data = resp.json()
                     except Exception:
                         resp_data = resp.text
-                    GLOBAL_CLEANUP_TRACKER.record_mutation(
+                    tracker.record_mutation(
                         method=pc.payload.method,
                         target_url=pc.base_url,
                         endpoint=pc.payload.endpoint,
@@ -962,7 +844,6 @@ async def process_fingerprint_group(
                     pass
         elapsed_ms = result.attack.response_time_ms if result and result.attack else 0
 
-        payload_value = pc.payload.payload_value
         evidence_model = Evidence(
             status_code=status_code,
             response_headers=redact_headers(dict(resp.headers)) if resp is not None else {},
@@ -1024,21 +905,36 @@ async def run_all(prepared: list[PreparedCase], headers: dict,
                    rate_limit_ms: int, global_rps: float = 0,
                    user2_headers: Optional[dict] = None,
                    proxy: Optional[str] = None,
-                   insecure: bool = False) -> list[Finding]:
+                   insecure: bool = False,
+                   session_keeper: Optional[Any] = None,
+                   proxy_rotator: Optional[Any] = None,
+                   auth_manager: Optional[Any] = None,
+                   cleanup_tracker: Optional[CleanupTracker] = None) -> list[Finding]:
     groups: dict[str, list[PreparedCase]] = {}
     for pc in prepared:
         groups.setdefault(pc.fingerprint, []).append(pc)
 
     merged_headers = dict(headers or {})
+    if auth_manager is not None:
+        merged_headers.update(auth_manager.get_headers())
     merged_headers.update(get_audit_headers(STATE_RUN_ID.get() or "schemathesis-run"))
 
-    scheduler = RequestScheduler(concurrency=concurrency, global_rps=global_rps)
+    scheduler = RequestScheduler(
+        concurrency=concurrency,
+        global_rps=global_rps,
+        proxy_rotator=proxy_rotator,
+        session_keeper=session_keeper,
+    )
     client_kwargs: dict[str, Any] = {"timeout": 20.0}
     proxy_url = proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("ALL_PROXY")
+    if not proxy_url and proxy_rotator is not None and proxy_rotator.has_proxies:
+        proxy_url = await proxy_rotator.get_next_proxy()
     if proxy_url:
         client_kwargs["proxy"] = proxy_url
     if insecure or os.environ.get("PYTHONHTTPSVERIFY") == "0":
         client_kwargs["verify"] = False
+    if auth_manager is not None and auth_manager.get_httpx_cert() is not None:
+        client_kwargs["cert"] = auth_manager.get_httpx_cert()
 
     async with httpx.AsyncClient(**client_kwargs) as client:
         tasks = [
@@ -1046,6 +942,7 @@ async def run_all(prepared: list[PreparedCase], headers: dict,
                 client, scheduler, fp, group, merged_headers,
                 rules, state, rate_limit_ms / 1000,
                 user2_headers=user2_headers,
+                cleanup_tracker=cleanup_tracker,
             )
             for fp, group in groups.items()
         ]
@@ -1057,74 +954,188 @@ async def run_all(prepared: list[PreparedCase], headers: dict,
     return all_findings
 
 
+def execute_rest_scan(
+    *,
+    targets: dict[str, tuple],
+    targets_desc: str,
+    headers: Optional[dict[str, str]] = None,
+    user2_headers: Optional[dict[str, str]] = None,
+    payloads_path: Optional[str] = None,
+    rules_path: Optional[str | Path] = None,
+    results_dir: Optional[str | Path] = None,
+    concurrency: int = 10,
+    rate_limit_ms: int = 200,
+    global_rps: float = 0,
+    proxy: Optional[str] = None,
+    insecure: bool = False,
+    session_keeper: Optional[Any] = None,
+    proxy_rotator: Optional[Any] = None,
+    auth_manager: Optional[Any] = None,
+    seed_corpus: Optional[Any] = None,
+    cleanup_tracker: Optional[CleanupTracker] = None,
+) -> list[Finding]:
+    """Execute REST fuzzing in-process with shared scheduler, session, and proxy hooks."""
+    resolved_rules_path = PROJECT_PATHS.resolve(
+        rules_path or (PROJECT_PATHS.config / "rules.json"),
+        allow_outside=True,
+    )
+    rules = None
+    if resolved_rules_path.exists():
+        rules = rules_engine.load_rules(str(resolved_rules_path))
+        n_cve = len(rules.get("cve_signals", []))
+        last_upd = rules["meta"].get("cve_last_updated")
+        print(
+            f"[INFO] Loaded rules from {resolved_rules_path}: {n_cve} cached CVEs "
+            f"(last updated: {last_upd or 'never'})."
+        )
+    else:
+        print(
+            f"[WARNING] Rules file not found at {resolved_rules_path} - using static signals.",
+            file=sys.stderr,
+        )
+
+    result_manager = ResultManager(PROJECT_ROOT, results_dir=results_dir or PROJECT_PATHS.results)
+    resolved_results_dir = result_manager.ensure_results_dir()
+    run_id = result_manager.make_run_id(prefix="rest")
+    token_reset = STATE_RUN_ID.set(run_id)
+    try:
+        state = RunState(resolved_results_dir / "state.json")
+        tracker = cleanup_tracker or GLOBAL_CLEANUP_TRACKER
+        tracker.run_id = run_id
+        tracker.out_dir = resolved_results_dir
+
+        payloads = (
+            load_payloads(payloads_path)
+            if payloads_path
+            else schema_payloads(targets, seed_corpus=seed_corpus)
+        )
+        if not payloads_path:
+            print(f"[INFO] Schema-only mode: generated {len(payloads)} cases from OpenAPI.")
+        total_payloads = len(payloads)
+
+        prepared = prepare_cases(payloads, targets)
+        total_prepared = len(prepared)
+        total_dropped_at_prepare = total_payloads - total_prepared
+
+        findings = asyncio.run(run_all(
+            prepared,
+            headers or {},
+            rules,
+            state,
+            concurrency,
+            rate_limit_ms,
+            global_rps,
+            user2_headers=user2_headers,
+            proxy=proxy,
+            insecure=insecure,
+            session_keeper=session_keeper,
+            proxy_rotator=proxy_rotator,
+            auth_manager=auth_manager,
+            cleanup_tracker=tracker,
+        ))
+        total_fired = len(findings)
+        total_skipped = total_prepared - total_fired
+
+        result_manager.append_findings(
+            findings,
+            source="schemathesis",
+            fieldnames=list(Finding.model_fields.keys()),
+        )
+        state.save()
+
+        result_manager.append_run_summary({
+            "run_id": run_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tool": "schemathesis",
+            "targets": targets_desc,
+            "total_payloads": total_payloads,
+            "total_dropped_at_prepare": total_dropped_at_prepare,
+            "total_fired": total_fired,
+            "total_skipped_dedup": total_skipped,
+            "total_confirmed": sum(1 for f in findings if f.confirmed),
+            "llm_used": bool(payloads_path),
+        }, [
+            "run_id", "timestamp", "tool", "targets", "total_payloads",
+            "total_dropped_at_prepare", "total_fired", "total_skipped_dedup",
+            "total_confirmed", "llm_used",
+        ])
+        result_manager.write_manifest(
+            targets_desc,
+            run_id=run_id,
+            metadata={
+                "tool": "schemathesis",
+                "total_payloads": total_payloads,
+                "total_fired": total_fired,
+                "total_confirmed": sum(1 for finding in findings if finding.confirmed),
+                "payload_mode": "custom" if payloads_path else "openapi",
+            },
+        )
+
+        try:
+            manifest_path = tracker.write_manifest()
+            if tracker.created_resources:
+                print(
+                    f"[STAGING SAFETY] Recorded {len(tracker.created_resources)} "
+                    f"created resource(s) in {manifest_path.name}"
+                )
+        except Exception:
+            pass
+
+        print(
+            f"[DONE] run_id={run_id} | prepared={total_prepared}/{total_payloads} "
+            f"| fired={total_fired} | skipped_dedup={total_skipped} "
+            f"| confirmed={sum(1 for f in findings if f.confirmed)} "
+            f"| log: {resolved_results_dir / 'vulnerabilities.csv'}"
+        )
+        return findings
+    finally:
+        STATE_RUN_ID.reset(token_reset)
+
+
 # --------------------------------------------------------------------------
-# 6. Main
+# 6. CLI Entrypoint
 # --------------------------------------------------------------------------
 
-def main():
-    ap = argparse.ArgumentParser(description="Nguoi 1: tich hop Schemathesis (ho tro multi-target)")
+def main(argv: Optional[list[str]] = None):
+    ap = argparse.ArgumentParser(description="Schemathesis REST API Security Fuzzer (single and multi-target)")
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--spec", default=None,
-                       help="[Che do 1 target - nhu cu] duong dan OpenAPI spec don (.json/.yaml)")
+                      help="Single-target mode: path/URL to one OpenAPI spec (.json/.yaml)")
     mode.add_argument("--targets", default=None,
-                       help="[Che do multi-target - MOI] danh sach 'ten=duong_dan' cach nhau "
-                            "boi dau phay. Vd: 'vampi=vampi_spec.yaml,crapi=crapi_spec.json'. "
-                            "DVGA la GraphQL, dung run_graphql.py rieng, khong dua vao day.")
+                      help="Multi-target mode: comma-separated 'name=path' entries, "
+                           "e.g. 'vampi=vampi_spec.yaml,crapi=crapi_spec.json'")
     ap.add_argument(
         "--payloads",
         default=None,
         help="Optional JSON payload file; without it, generate schema-valid cases from OpenAPI",
     )
     ap.add_argument("--base-url", default=None,
-                     help="[Chi dung voi --spec] Ghi de base_url")
+                    help="Override base_url for --spec mode")
     ap.add_argument("--base-urls", default=None,
-                     help="[Chi dung voi --targets] Ghi de base_url tung app, vd "
-                          "'vampi=http://localhost:5000,crapi=http://localhost:8888'")
+                    help="Override per-target base_url for --targets mode, e.g. "
+                         "'vampi=http://localhost:5002,crapi=http://localhost:8888'")
     ap.add_argument(
         "--allow-remote-schema",
         action="store_true",
         help="Explicitly allow loading an OpenAPI document from an HTTP(S) URL",
     )
     ap.add_argument("--auth-header", default=None,
-                     help='[KHONG KHUYEN KHICH - lo trong bash history] '
-                          'Vd: "Authorization: Bearer <jwt>". '
-                          'Nen dung bien moi truong FUZZ_AUTH_HEADER thay vi co nay.')
+                    help="Auth header (prefer FUZZ_AUTH_HEADER env var to avoid shell history leakage)")
     ap.add_argument("--results-dir", default=str(PROJECT_PATHS.results))
     ap.add_argument("--rate-limit-ms", type=int, default=200,
-                     help="Delay giua cac request TRONG CUNG 1 fingerprint group "
-                          "(an toan cho container lab)")
+                    help="Delay in ms between requests within the same fingerprint group")
     ap.add_argument("--concurrency", type=int, default=10,
-                     help="So request toi da chay song song (bat dong bo)")
+                    help="Maximum concurrent async requests")
     ap.add_argument("--global-rps", type=float, default=0,
-                     help="Gioi han request/giay toan cuc (0 = tat)")
+                    help="Global requests-per-second limit (0 = unlimited)")
     ap.add_argument(
         "--rules",
         default=str(PROJECT_PATHS.config / "rules.json"),
-        help="File rules OWASP+CVE (rules_engine.py)",
+        help="OWASP+CVE rules JSON file",
     )
     ap.add_argument("--proxy", default=None, help="Upstream HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:8080)")
     ap.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification")
-    args = ap.parse_args()
-
-    rules_path = PROJECT_PATHS.resolve(args.rules, allow_outside=True)
-    rules = None
-    if rules_path.exists():
-        rules = rules_engine.load_rules(str(rules_path))
-        n_cve = len(rules.get("cve_signals", []))
-        last_upd = rules["meta"].get("cve_last_updated")
-        print(f"[INFO] Rules nap tu {rules_path}: {n_cve} CVE cache "
-              f"(cap nhat: {last_upd or 'chua tung'}). "
-              f"Neu qua cu, cap nhat rules qua CLI rules-engine.")
-    else:
-        print(f"[CANH BAO] Khong thay {rules_path} - dung signal tinh mac dinh.",
-              file=sys.stderr)
-
-    result_manager = ResultManager(PROJECT_ROOT, results_dir=args.results_dir)
-    results_dir = result_manager.ensure_results_dir()
-    run_id = result_manager.make_run_id(prefix="rest")
-    STATE_RUN_ID.set(run_id)
-
-    state = RunState(results_dir / "state.json")
+    args = ap.parse_args(argv)
 
     if args.spec:
         schema, base_url = load_schema(
@@ -1134,7 +1145,7 @@ def main():
         )
         target_name = Path(args.spec).stem.lower()
         targets = {target_name: (schema, base_url)}
-        print(f"[INFO] Che do 1-target (tuong thich nguoc): '{target_name}'")
+        print(f"[INFO] Single-target mode: '{target_name}'")
         targets_desc = args.spec
     else:
         targets = load_targets(
@@ -1142,18 +1153,16 @@ def main():
             args.base_urls,
             allow_remote_schema=args.allow_remote_schema,
         )
-        print(f"[INFO] Che do multi-target: {sorted(targets)}")
+        print(f"[INFO] Multi-target mode: {sorted(targets)}")
         targets_desc = args.targets
 
     headers = {}
     auth_header = os.environ.get("FUZZ_AUTH_HEADER")
     if auth_header:
-        print("[INFO] Doc auth header tu bien moi truong FUZZ_AUTH_HEADER.")
+        print("[INFO] Loaded auth header from FUZZ_AUTH_HEADER environment variable.")
     elif args.auth_header:
-        print("[CANH BAO] --auth-header truyen qua CLI se luu trong bash "
-              "history/ps output - danh cho token that. Doi sang:\n"
-              "  export FUZZ_AUTH_HEADER='Authorization: Bearer <jwt>'\n"
-              "  python3 run_schemathesis.py ... (khong can --auth-header)",
+        print("[WARNING] Passing --auth-header via CLI may expose tokens in shell history/ps. "
+              "Prefer setting FUZZ_AUTH_HEADER in the environment.",
               file=sys.stderr)
         auth_header = args.auth_header
     if auth_header:
@@ -1174,82 +1183,19 @@ def main():
     if auth_header_user2:
         k2, _, v2 = auth_header_user2.partition(":")
         user2_headers[k2.strip()] = v2.strip()
-        print("[INFO] Da nap User 2 Auth Header cho kiem thu BOLA/IDOR cheo.")
+        print("[INFO] Loaded secondary user auth header for cross-user BOLA/IDOR testing.")
 
-    payloads = (
-        load_payloads(args.payloads)
-        if args.payloads
-        else schema_payloads(targets)
-    )
-    if not args.payloads:
-        print(f"[INFO] Schema-only mode: generated {len(payloads)} cases from OpenAPI.")
-    total_payloads = len(payloads)
-
-    prepared = prepare_cases(payloads, targets)
-    total_prepared = len(prepared)
-    total_dropped_at_prepare = total_payloads - total_prepared
-
-    findings = asyncio.run(run_all(
-        prepared, headers, rules, state,
-        args.concurrency, args.rate_limit_ms,
-        args.global_rps,
-        user2_headers=user2_headers,
+    execute_rest_scan(
+        targets=targets,
+        targets_desc=targets_desc,
+        headers=headers,
+        user2_headers=user2_headers or None,
+        payloads_path=args.payloads,
+        rules_path=args.rules,
+        results_dir=args.results_dir,
+        concurrency=args.concurrency,
+        rate_limit_ms=args.rate_limit_ms,
+        global_rps=args.global_rps,
         proxy=args.proxy,
         insecure=args.insecure,
-    ))
-    total_fired = len(findings)
-    total_skipped = total_prepared - total_fired
-
-    result_manager.append_findings(
-        findings,
-        source="schemathesis",
-        fieldnames=list(Finding.model_fields.keys()),
     )
-
-    state.save()
-
-    # --- experiment_runs.csv (tong hop 1 dong / lan chay, cho D doi chieu) ---
-    result_manager.append_run_summary({
-            "run_id": run_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "tool": "schemathesis",
-            "targets": targets_desc,
-            "total_payloads": total_payloads,
-            "total_dropped_at_prepare": total_dropped_at_prepare,
-            "total_fired": total_fired,
-            "total_skipped_dedup": total_skipped,
-            "total_confirmed": sum(1 for f in findings if f.confirmed),
-            "llm_used": bool(args.payloads),
-        }, [
-            "run_id", "timestamp", "tool", "targets", "total_payloads",
-            "total_dropped_at_prepare", "total_fired", "total_skipped_dedup",
-            "total_confirmed", "llm_used"
-        ])
-    result_manager.write_manifest(
-        targets_desc,
-        run_id=run_id,
-        metadata={
-            "tool": "schemathesis",
-            "total_payloads": total_payloads,
-            "total_fired": total_fired,
-            "total_confirmed": sum(1 for finding in findings if finding.confirmed),
-            "payload_mode": "custom" if args.payloads else "openapi",
-        },
-    )
-
-    try:
-        GLOBAL_CLEANUP_TRACKER.run_id = run_id
-        manifest_path = GLOBAL_CLEANUP_TRACKER.write_manifest()
-        if GLOBAL_CLEANUP_TRACKER.created_resources:
-            print(f"[🛡️] Staging Safety: Ghi nhan {len(GLOBAL_CLEANUP_TRACKER.created_resources)} tai nguyen vao {manifest_file.name}")
-    except Exception:
-        pass
-
-    print(f"[XONG] run_id={run_id} | chuan_bi={total_prepared}/{total_payloads} "
-          f"| ban={total_fired} | bo_qua(dedup)={total_skipped} "
-          f"| phat_hien={sum(1 for f in findings if f.confirmed)} "
-          f"| log: {results_dir / 'vulnerabilities.csv'}")
-
-
-if __name__ == "__main__":
-    main()

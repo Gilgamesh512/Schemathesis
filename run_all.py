@@ -15,8 +15,10 @@ import urllib.error
 import urllib.request
 
 try:
+    from core import parse_tokens_env as _core_parse_tokens_env
     from core.alerting import send_webhook_alert
 except ImportError:
+    _core_parse_tokens_env = None  # type: ignore
     send_webhook_alert = None  # type: ignore
 
 
@@ -169,6 +171,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def parse_tokens_env(path: Path = TOKENS_FILE) -> dict[str, str]:
+    if _core_parse_tokens_env is not None:
+        return _core_parse_tokens_env(path, auth_headers_only=True, warn_missing=False)
     if not path.exists():
         return {}
     tokens: dict[str, str] = {}
@@ -225,6 +229,15 @@ def validate_handoff() -> bool:
 def run_script(script: Path, *arguments: str) -> None:
     if not script.is_file():
         raise FileNotFoundError(f"Missing required script: {script}")
+    if script == RUN_SECURITY_TESTS:
+        from modules.security import run_security_tests as sec_runner
+
+        exit_code = sec_runner.main(list(arguments))
+        if exit_code:
+            raise RuntimeError(
+                f"{script.relative_to(ROOT)} failed with exit code {exit_code}"
+            )
+        return
     print(f"\n[+] RUNNING: {script.relative_to(ROOT)} {' '.join(arguments)}".rstrip())
     cmd = list(PYTHON_CMD) + [str(script), *arguments]
     result = subprocess.run(cmd, cwd=ROOT, check=False)
@@ -314,8 +327,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if is_alive:
                 print(f"[+] Pre-flight PASS: Target is reachable ({msg})")
             else:
-                print(f"[CANH BAO] Target pre-flight check failed: {msg}")
-                print(f"[i] If testing an offline/local container, verify it is running or pass --no-preflight.")
+                print(f"[WARNING] Target pre-flight check failed: {msg}")
+                print("[i] If testing an offline/local container, verify it is running or pass --no-preflight.")
 
         scan_args = [
             "--url", args.url,
@@ -367,6 +380,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             scan_args.extend(["--login-body", args.login_body])
         if args.token_extract:
             scan_args.extend(["--token-extract", args.token_extract])
+        if args.client_cert:
+            scan_args.extend(["--client-cert", args.client_cert])
+        if args.client_key:
+            scan_args.extend(["--client-key", args.client_key])
         if args.concurrency_burst:
             scan_args.extend(["--concurrency-burst", str(args.concurrency_burst)])
         if args.callback_url:

@@ -1283,8 +1283,14 @@ def run_dynamic_target(
         # Render terminal dashboard and generate HTML report
         reporter = SecurityReporter(RESULTS.results_dir)
         findings = reporter.load_latest_findings()
-        reporter.render_terminal_dashboard(findings, target_info={"name": target_name, "url": url})
-        html_report = reporter.generate_html_report(findings, target_info={"name": target_name, "url": url})
+        target_meta = {
+            "name": target_name,
+            "url": url,
+            "schema": resolved_schema or "",
+            "protocol": protocol,
+        }
+        reporter.render_terminal_dashboard(findings, target_info=target_meta)
+        html_report = reporter.generate_html_report(findings, target_info=target_meta)
         print(f"[+] Standalone HTML Report: {html_report}")
         print(f"[+] Latest Report Link:     {RESULTS.results_dir / 'latest_report.html'}")
 

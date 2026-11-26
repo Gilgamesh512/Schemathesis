@@ -405,3 +405,43 @@ def test_quality_gate_blocks_actual_high_and_confirmed_findings(tmp_path: Path):
     rc = run_all.main(["gate", "--sarif", str(sarif_path), "--max-critical", "0", "--max-high", "2", "--allow-confirmed"])
     assert rc == 1
 
+
+def test_html_report_renders_and_infers_target_metadata(tmp_path: Path):
+    from core import SecurityReporter
+
+    run_dir = tmp_path / "rest-20261126-test"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(
+        json.dumps({
+            "run_id": "rest-20261126-test",
+            "target": "target_dummyjson_com=targets/schemas/dummyjson_spec.yaml",
+            "metadata": {"tool": "schemathesis"},
+        }),
+        encoding="utf-8",
+    )
+
+    reporter = SecurityReporter(results_dir=tmp_path)
+    findings = [{
+        "finding_id": "f-html-1",
+        "run_id": "rest-20261126-test",
+        "target_app": "target_dummyjson_com",
+        "endpoint": "/products/1",
+        "method": "GET",
+        "attack_type": "BOLA",
+        "owasp_category": "API1:2023",
+        "severity": "medium",
+        "confirmed": False,
+        "evidence": "Probe check",
+        "curl_command": "curl -X GET 'https://dummyjson.com/products/1'",
+    }]
+
+    # Even without explicit target_info, report must display inferred target name, URL, app, run_id & schema
+    html_path = reporter.generate_html_report(findings)
+    content = html_path.read_text(encoding="utf-8")
+    assert "target_dummyjson_com" in content
+    assert "https://dummyjson.com" in content
+    assert "rest-20261126-test" in content
+    assert "targets/schemas/dummyjson_spec.yaml" in content
+    assert "Target Base URL" in content
+
+

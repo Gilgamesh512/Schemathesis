@@ -175,13 +175,13 @@ def test_target_selection_deduplicates_repeated_flags():
     assert exit_code == 0
 
 
-def test_target_selection_distinct_targets_preserves_order():
+def test_target_selection_distinct_targets_preserves_order(tmp_path: Path):
     calls = []
 
     def mock_run_target(target_id, tokens=None, targets=None):
         calls.append(target_id)
 
-    tm = TargetManager()
+    tm = TargetManager(tmp_path)
     tm.add_target("api_two", base_url="http://127.0.0.1:8002", schema_source="tests/fixtures/sample_openapi.yaml", settings={"protocol": "rest"})
     tm.add_target("api_one", base_url="http://127.0.0.1:8001", schema_source="tests/fixtures/sample_openapi.yaml", settings={"protocol": "rest"})
 
@@ -197,13 +197,13 @@ def test_target_selection_distinct_targets_preserves_order():
     assert exit_code == 0
 
 
-def test_target_selection_omitted_runs_all_configured_targets():
+def test_target_selection_omitted_runs_all_configured_targets(tmp_path: Path):
     calls = []
 
     def mock_run_target(target_id, tokens=None, targets=None):
         calls.append(target_id)
 
-    tm = TargetManager()
+    tm = TargetManager(tmp_path)
     tm.add_target("api_b", base_url="http://127.0.0.1:8002", schema_source="tests/fixtures/sample_openapi.yaml", settings={"protocol": "rest"})
     tm.add_target("api_a", base_url="http://127.0.0.1:8001", schema_source="tests/fixtures/sample_openapi.yaml", settings={"protocol": "rest"})
 

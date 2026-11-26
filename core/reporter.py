@@ -233,6 +233,100 @@ class SecurityReporter:
             "confirmed": confirmed,
             "fingerprint": str(raw.get("fingerprint") or ""),
             "matched_cve": matched_cve,
+            "curl_command": raw.get("curl_command") or "",
+        }
+
+    def _infer_target_info(
+        self,
+        findings: list[dict[str, Any]],
+        target_info: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        """Resolve target name, base URL, apps, run ID, and schema for reports."""
+        info = dict(target_info or {})
+        apps = list(dict.fromkeys(
+            str(f.get("target_app") or "").strip()
+            for f in findings
+            if str(f.get("target_app") or "").strip() not in {"", "default"}
+        ))
+        run_ids = list(dict.fromkeys(
+            str(f.get("run_id") or "").strip()
+            for f in findings
+            if str(f.get("run_id") or "").strip()
+        ))
+
+        inferred_url = str(info.get("url") or "").strip()
+        inferred_schema = str(info.get("schema") or info.get("schema_file") or info.get("schema_path") or "").strip()
+        inferred_protocol = str(info.get("protocol") or "").strip().upper()
+
+        # Try reading manifest.json from latest run directory
+        if run_ids:
+            manifest_path = self.results_dir / run_ids[-1] / "manifest.json"
+            if manifest_path.is_file():
+                try:
+                    m_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    target_desc = str(m_data.get("target") or "").strip()
+                    if target_desc and not inferred_schema and "=" in target_desc:
+                        _, _, rhs = target_desc.partition("=")
+                        inferred_schema = rhs.strip()
+                    meta = m_data.get("metadata") or {}
+                    if not inferred_protocol and meta.get("tool"):
+                        inferred_protocol = "GraphQL" if meta["tool"] == "graphql" else "REST"
+                except Exception as exc:
+                    logger.debug("Could not inspect run manifest %s: %s", manifest_path, exc)
+
+        # Infer base URL from curl_command or target_app name if not supplied
+        if not inferred_url:
+            urls_found: list[str] = []
+            for f in findings:
+                cmd = str(f.get("curl_command") or "")
+                m_url = re.search(r"https?://[^\s'\"\\]+", cmd)
+                if m_url:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(m_url.group(0))
+                    if parsed.scheme and parsed.netloc:
+                        base = f"{parsed.scheme}://{parsed.netloc}"
+                        if base not in urls_found:
+                            urls_found.append(base)
+            if urls_found:
+                inferred_url = ", ".join(urls_found[:3])
+
+        # Fallback: look up saved target profiles when URL or name is still missing
+        if (not inferred_url or not info.get("name")) and apps:
+            try:
+                from .target_manager import TargetManager
+                tm = TargetManager(PROJECT_ROOT)
+                matched_urls: list[str] = []
+                matched_names: list[str] = []
+                for app in apps:
+                    t_cfg = tm.targets.get(app)
+                    if t_cfg:
+                        if t_cfg.base_url and t_cfg.base_url not in matched_urls:
+                            matched_urls.append(t_cfg.base_url)
+                        if t_cfg.name and t_cfg.name not in matched_names:
+                            matched_names.append(t_cfg.name)
+                if not inferred_url and matched_urls:
+                    inferred_url = ", ".join(matched_urls[:3])
+                if not info.get("name") and matched_names:
+                    info["name"] = ", ".join(matched_names[:3])
+            except Exception as exc:
+                logger.debug("Target profile lookup during report generation skipped: %s", exc)
+
+        inferred_name = str(info.get("name") or "").strip()
+        if not inferred_name:
+            if apps:
+                inferred_name = ", ".join(apps[:3]) + (f" (+{len(apps) - 3})" if len(apps) > 3 else "")
+            elif inferred_url:
+                inferred_name = inferred_url
+            else:
+                inferred_name = "API Security Fuzzing"
+
+        return {
+            "name": inferred_name,
+            "url": inferred_url or "Not specified",
+            "apps": ", ".join(apps) if apps else inferred_name,
+            "run_id": run_ids[-1] if run_ids else "N/A",
+            "schema": inferred_schema or "N/A",
+            "protocol": inferred_protocol or "API",
         }
 
     def compute_metrics(self, findings: list[dict[str, Any]]) -> dict[str, Any]:
@@ -351,8 +445,9 @@ class SecurityReporter:
     ) -> Path:
         """Generate a standalone interactive HTML report with zero external dependencies."""
         metrics = self.compute_metrics(findings)
-        target_name = (target_info or {}).get("name") or "API Security Fuzzing"
-        target_url = (target_info or {}).get("url") or "Target Endpoint"
+        resolved_target = self._infer_target_info(findings, target_info)
+        target_name = resolved_target["name"]
+        target_url = resolved_target["url"]
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         self.results_dir.mkdir(parents=True, exist_ok=True)
@@ -367,6 +462,7 @@ class SecurityReporter:
             metrics,
             target_name=target_name,
             target_url=target_url,
+            target_meta=resolved_target,
             now_str=now_str,
             owasp_metadata=OWASP_METADATA,
             severity_colors=SEVERITY_COLORS,

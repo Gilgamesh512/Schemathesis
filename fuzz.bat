@@ -57,65 +57,85 @@ if not defined PYTHON (
 )
 
 REM ------------------------------------------------------------------------------
-REM Argument Dispatcher
+REM Argument Dispatcher (must jump to labels outside parentheses before shift)
 REM ------------------------------------------------------------------------------
-if "%~1"=="auto" (
-    if "%~2"=="" (
-        echo [!] Please specify an OpenAPI schema, e.g.: fuzz.bat auto .\openapi.json --url http://127.0.0.1:8000
-        pause
-        exit /b 1
-    )
-    shift
-    echo [*] Running Autonomous BOLA Workflow...
-    "%PYTHON%" run_all.py auto-workflow %*
-    goto :end
-)
+set "EXIT_CODE=0"
+if /i "%~1"=="auto" goto :cmd_auto
+if /i "%~1"=="profiles" goto :cmd_profiles
+if /i "%~1"=="report" goto :cmd_report
+if /i "%~1"=="dashboard" goto :cmd_dashboard
+if /i "%~1"=="gate" goto :cmd_gate
+if /i "%~1"=="scan" goto :cmd_scan
+if not "%~1"=="" goto :cmd_forward
+goto :menu
 
-if "%~1"=="profiles" (
-    echo [*] Running Saved Target Profiles...
-    "%PYTHON%" run_all.py profiles
-    goto :end
+:cmd_auto
+shift
+if "%~1"=="" (
+    echo [!] Please specify an OpenAPI schema, e.g.: fuzz.bat auto .\openapi.json --url http://127.0.0.1:8000
+    exit /b 1
 )
+set "REST_ARGS="
+:auto_loop
+if "%~1"=="" goto :auto_run
+set "REST_ARGS=%REST_ARGS% %1"
+shift
+goto :auto_loop
+:auto_run
+echo [*] Running Autonomous BOLA Workflow...
+"%PYTHON%" -B run_all.py auto-workflow%REST_ARGS%
+exit /b %errorlevel%
 
-if "%~1"=="report" (
-    "%PYTHON%" -m cli --report
-    goto :end
-)
+:cmd_profiles
+echo [*] Running Saved Target Profiles...
+"%PYTHON%" -B run_all.py profiles
+exit /b %errorlevel%
 
-if "%~1"=="dashboard" (
-    "%PYTHON%" -m cli --dashboard
-    goto :end
-)
+:cmd_report
+"%PYTHON%" -B -m cli --report
+exit /b %errorlevel%
 
-if "%~1"=="gate" (
-    shift
-    "%PYTHON%" run_all.py gate %*
-    goto :end
-)
+:cmd_dashboard
+"%PYTHON%" -B -m cli --dashboard
+exit /b %errorlevel%
 
-if "%~1"=="scan" (
-    if "%~2"=="" (
-        echo [!] Please specify a target URL, e.g.: fuzz.bat scan http://localhost:8000
-        pause
-        exit /b 1
-    )
-    shift
-    set "FIRST_ARG=%~1"
-    if not "!FIRST_ARG:~0,2!"=="--" (
-        set "SCAN_URL=%~1"
-        shift
-        "%PYTHON%" run_all.py scan --url "!SCAN_URL!" %*
-    ) else (
-        "%PYTHON%" run_all.py scan %*
-    )
-    goto :end
-)
+:cmd_gate
+shift
+set "REST_ARGS="
+:gate_loop
+if "%~1"=="" goto :gate_run
+set "REST_ARGS=%REST_ARGS% %1"
+shift
+goto :gate_loop
+:gate_run
+"%PYTHON%" -B run_all.py gate%REST_ARGS%
+exit /b %errorlevel%
 
-if not "%~1"=="" (
-    REM Forward arbitrary arguments directly to run_all.py
-    "%PYTHON%" run_all.py %*
-    goto :end
+:cmd_scan
+shift
+if "%~1"=="" (
+    echo [!] Please specify a target URL, e.g.: fuzz.bat scan http://localhost:8000
+    exit /b 1
 )
+set "FIRST_ARG=%~1"
+set "SCAN_PREFIX="
+if "%FIRST_ARG:~0,2%"=="--" goto :scan_collect
+set "SCAN_PREFIX= --url %1"
+shift
+:scan_collect
+set "REST_ARGS="
+:scan_loop
+if "%~1"=="" goto :scan_run
+set "REST_ARGS=%REST_ARGS% %1"
+shift
+goto :scan_loop
+:scan_run
+"%PYTHON%" -B run_all.py scan%SCAN_PREFIX%%REST_ARGS%
+exit /b %errorlevel%
+
+:cmd_forward
+"%PYTHON%" -B run_all.py %*
+exit /b %errorlevel%
 
 REM ------------------------------------------------------------------------------
 REM Interactive One-Click Menu (When launched with no arguments / double-clicked)

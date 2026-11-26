@@ -86,9 +86,11 @@ def render_finding_card(
                     <div class="detail-grid">
                         <div class="detail-box">
                             <h4>Attack Details</h4>
+                            <p><strong>Target App:</strong> <code>{html.escape(str(finding.get('target_app') or 'N/A'))}</code></p>
                             <p><strong>Attack Type:</strong> {html.escape(finding['attack_type'])}</p>
                             <p><strong>OWASP Category:</strong> {html.escape(owasp_cat)} - {html.escape(owasp_metadata.get(owasp_cat, {}).get('name', 'N/A'))}</p>
                             <p><strong>Matched CVEs:</strong> {cve_badges}</p>
+                            <p><strong>Run ID:</strong> <code>{html.escape(str(finding.get('run_id') or 'N/A'))}</code></p>
                             <p><strong>Fingerprint:</strong> <code>{html.escape(finding.get('fingerprint', ''))}</code></p>
                         </div>
                         <div class="detail-box">
@@ -132,6 +134,7 @@ def render_html_document(
     now_str: str,
     owasp_metadata: dict[str, dict[str, str]],
     severity_colors: dict[str, tuple[str, str]],
+    target_meta: dict[str, str] | None = None,
 ) -> str:
     """Render the full standalone HTML security report document."""
     findings_html = [
@@ -171,6 +174,12 @@ def render_html_document(
     high_pct = round((sev_counts["high"] / total_sev) * 100)
     med_pct = round((sev_counts["medium"] / total_sev) * 100)
     low_pct = round((sev_counts["low"] / total_sev) * 100)
+
+    meta = target_meta or {}
+    target_apps = meta.get("apps") or target_name
+    run_id_label = meta.get("run_id") or "N/A"
+    schema_label = meta.get("schema") or "N/A"
+    protocol_label = meta.get("protocol") or "API"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -366,6 +375,20 @@ def render_html_document(
             color: #bae6fd;
         }}
         .empty-state {{ text-align: center; padding: 40px; color: var(--text-secondary); }}
+        .target-banner {{
+            background: linear-gradient(135deg, #111c2f 0%, #162238 100%);
+            border: 1px solid var(--border);
+            border-left: 4px solid var(--accent);
+            border-radius: 10px;
+            padding: 16px 20px;
+            margin-bottom: 20px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 12px 20px;
+        }}
+        .target-field-label {{ font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-secondary); }}
+        .target-field-value {{ font-size: 14px; font-weight: 600; color: #e2e8f0; margin-top: 2px; word-break: break-all; }}
+        .target-field-value code {{ color: var(--accent); font-family: monospace; font-size: 13px; }}
         @media (max-width: 768px) {{
             .analytics-grid, .detail-grid {{ grid-template-columns: 1fr; }}
             .controls {{ flex-direction: column; align-items: stretch; }}
@@ -384,12 +407,31 @@ def render_html_document(
         <header>
             <div class="brand">
                 <h1>🛡️ API Security Fuzzing Report</h1>
-                <p>Target: <strong>{html.escape(target_name)}</strong> ({html.escape(target_url)}) | Generated: {now_str}</p>
+                <p>Target: <strong>{html.escape(target_name)}</strong> | URL: <code>{html.escape(target_url)}</code> | Generated: {now_str}</p>
             </div>
             <div class="header-actions">
                 <button onclick="window.print()">🖨️ Print / Save PDF</button>
             </div>
         </header>
+
+        <section class="target-banner" aria-label="Target Metadata">
+            <div>
+                <div class="target-field-label">Target Name</div>
+                <div class="target-field-value">{html.escape(target_name)}</div>
+            </div>
+            <div>
+                <div class="target-field-label">Target Base URL</div>
+                <div class="target-field-value"><code>{html.escape(target_url)}</code></div>
+            </div>
+            <div>
+                <div class="target-field-label">Target App ID(s) & Protocol</div>
+                <div class="target-field-value"><code>{html.escape(target_apps)}</code> ({html.escape(protocol_label)})</div>
+            </div>
+            <div>
+                <div class="target-field-label">Latest Run ID / Schema</div>
+                <div class="target-field-value"><code>{html.escape(run_id_label)}</code><br><span style="font-size: 12px; font-weight: 400; color: #94a3b8;">{html.escape(schema_label)}</span></div>
+            </div>
+        </section>
 
         <section class="kpi-grid">
             <div class="kpi-card">

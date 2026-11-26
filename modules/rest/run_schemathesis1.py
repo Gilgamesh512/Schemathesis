@@ -18,6 +18,7 @@ import asyncio
 import contextvars
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sys
@@ -28,14 +29,16 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+logger = logging.getLogger(__name__)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
     import core.schema_validator  # Ensures pure-Python fallback shim is loaded if needed
-except Exception:
-    pass
+except Exception as exc:
+    logger.debug("Optional schema_validator shim init skipped: %s", exc)
 
 import httpx
 import schemathesis
@@ -237,8 +240,8 @@ def schema_payloads(targets: dict[str, tuple], seed_corpus: Any = None) -> list[
             try:
                 from core import parse_har_file
                 seed_corpus = parse_har_file(har_env)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to parse HAR seed corpus '%s': %s", har_env, exc)
 
     for target_name, (schema, _) in sorted(targets.items()):
         for result in schema.get_all_operations():
@@ -285,8 +288,8 @@ def schema_payloads(targets: dict[str, tuple], seed_corpus: Any = None) -> list[
                             context="schema_conformant",
                             target_app=target_name,
                         ))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Parameter inspection failed on %s %s: %s", operation.method, operation.path, exc)
 
             # Fallback path params if iter_parameters did not catch all path templates
             path_params = re.findall(r"\{([^}]+)\}", operation.path)
@@ -487,8 +490,8 @@ def build_baseline_case(schema, op):
     if callable(strategy):
         try:
             return strategy().example()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Hypothesis strategy.example() failed on %s %s; falling back to make_case: %s", op.method, op.path, exc)
     return schema.make_case(operation=op, method=op.method, path=op.path)
 
 
@@ -681,11 +684,19 @@ def evaluate_response(resp, payload: Payload, rules: Optional[dict] = None
 # 6. Main
 # --------------------------------------------------------------------------
 
-async def fire_case(client: "httpx.AsyncClient", case, base_url: str, headers: dict):
+async def fire_case(client: "httpx.AsyncClient", case, base_url: str, headers: dict, *, strip_auth: bool = False):
     """Translate a Schemathesis Case into an async httpx request via as_transport_kwargs()."""
     kwargs = case.as_transport_kwargs(base_url=base_url)
+    req_headers = dict(kwargs.get("headers", {}) or {})
+    if strip_auth:
+        auth_keys = {"authorization", "cookie", "x-api-key", "x-auth-token"}
+        req_headers = {k: v for k, v in req_headers.items() if k.lower() not in auth_keys}
     if headers:
-        kwargs["headers"] = {**kwargs.get("headers", {}), **headers}
+        req_headers.update(headers)
+    if req_headers:
+        kwargs["headers"] = req_headers
+    elif "headers" in kwargs:
+        kwargs["headers"] = {}
     if not kwargs.get("cookies"):  # httpx warns on empty cookies={}
         kwargs.pop("cookies", None)
     return await client.request(**kwargs)
@@ -771,13 +782,43 @@ async def process_fingerprint_group(
                     recs_summary = "; ".join(feedback.adaptive_recommendations[:2])
                     evidence = f"HTTP {status_code}; Schema validation barrier ({feedback.framework_hint}): {recs_summary}"
 
-            # Dual-token BOLA / IDOR cross-account verification
+            # Dual-token BOLA / IDOR cross-account verification (with public-read suppression)
             if user2_headers and pc.payload.attack_type.upper() in ("BOLA", "IDOR"):
                 if 200 <= status_code < 300:
-                    confirmed = True
-                    confidence = 0.95
-                    severity = "high"
-                    evidence = f"HTTP {status_code}; BOLA verified via dual-token cross-user validation (Secondary user accessed primary resource)"
+                    unauth_status = None
+                    try:
+                        unauth_resp = await scheduler.request(
+                            pc.target_app,
+                            lambda: fire_case(client, pc.case, pc.base_url, {}, strip_auth=True),
+                        )
+                        unauth_status = unauth_resp.status_code
+                    except Exception as unauth_err:
+                        logger.debug("Unauthenticated BOLA control check failed on %s: %s", pc.payload.endpoint, unauth_err)
+
+                    if unauth_status is not None and 200 <= unauth_status < 300:
+                        confirmed = False
+                        confidence = 0.25
+                        severity = "info"
+                        evidence = (
+                            f"HTTP {status_code}; Unauthenticated request also returned HTTP {unauth_status} "
+                            "(public-read or unprotected endpoint; suppressed dual-user BOLA false positive)"
+                        )
+                    elif unauth_status in (401, 403):
+                        confirmed = True
+                        confidence = 0.95
+                        severity = "high"
+                        evidence = (
+                            f"HTTP {status_code}; BOLA verified via dual-token cross-user validation "
+                            f"(unauthenticated returned HTTP {unauth_status}, secondary user accessed primary resource)"
+                        )
+                    else:
+                        confirmed = False
+                        confidence = min(confidence, 0.5)
+                        severity = "medium"
+                        evidence = (
+                            f"HTTP {status_code}; Secondary user succeeded but unauthenticated control returned "
+                            f"HTTP {unauth_status}; kept unconfirmed pending authorization check"
+                        )
                 elif status_code in (401, 403):
                     confirmed = False
                     severity = "info"
@@ -800,8 +841,8 @@ async def process_fingerprint_group(
                                 if id_k in resp_json and resp_json[id_k] is not None:
                                     loopback_url = f"{pc.payload.endpoint.rstrip('/')}/{resp_json[id_k]}"
                                     break
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Could not parse JSON for mass-assignment loopback URL on %s: %s", pc.payload.endpoint, exc)
 
                 if loopback_url:
                     full_get_url = loopback_url if loopback_url.startswith(("http://", "https://")) else f"{pc.base_url.rstrip('/')}/{loopback_url.lstrip('/')}"
@@ -840,8 +881,8 @@ async def process_fingerprint_group(
                         response_data=resp_data,
                         response_headers=dict(resp.headers),
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("CleanupTracker mutation recording failed on %s: %s", pc.payload.endpoint, exc)
         elapsed_ms = result.attack.response_time_ms if result and result.attack else 0
 
         evidence_model = Evidence(
@@ -1078,8 +1119,8 @@ def execute_rest_scan(
                     f"[STAGING SAFETY] Recorded {len(tracker.created_resources)} "
                     f"created resource(s) in {manifest_path.name}"
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to write cleanup manifest: %s", exc)
 
         print(
             f"[DONE] run_id={run_id} | prepared={total_prepared}/{total_payloads} "
@@ -1175,8 +1216,8 @@ def main(argv: Optional[list[str]] = None):
             if isinstance(extra_map, dict):
                 for hk, hv in extra_map.items():
                     headers[str(hk).strip()] = str(hv).strip()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Ignoring malformed FUZZ_EXTRA_HEADERS_JSON: %s", exc)
 
     user2_headers = {}
     auth_header_user2 = os.environ.get("FUZZ_AUTH_HEADER_USER2")

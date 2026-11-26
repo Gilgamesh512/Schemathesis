@@ -9,11 +9,14 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 import json
+import logging
 import time
 from typing import Any, Optional
 from urllib.parse import urlparse
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -86,8 +89,8 @@ class AuthManager:
                     self.config.token = new_token
                     self._last_refresh_time = time.monotonic()
                     return True
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("OAuth2 client credentials token fetch failed: %s", exc)
         return False
 
     @classmethod
@@ -200,8 +203,8 @@ class AuthManager:
                         self.config.token = new_token
                         self._last_refresh_time = time.monotonic()
                         return True
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Token refresh request failed: %s", exc)
 
         return False
 

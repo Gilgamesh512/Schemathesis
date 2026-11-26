@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import json
+import logging
 import re
 import time
 from typing import Any, Optional
@@ -22,6 +23,8 @@ import httpx
 from pydantic import BaseModel, Field
 
 from .evidence import Evidence, Finding, content_hash, redact_headers, stable_finding_id
+
+logger = logging.getLogger(__name__)
 
 
 class HeaderTamperProbe(BaseModel):
@@ -135,7 +138,8 @@ class HeaderTamperFuzzer:
                     follow_redirects=False,
                 )
                 elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Header tamper probe '%s' failed on %s %s: %s", probe.name, method, clean_ep, exc)
                 continue
 
             resp_body = resp.text or ""
@@ -151,14 +155,25 @@ class HeaderTamperFuzzer:
             elif self.CANARY_HOST in resp_body and self.CANARY_HOST not in baseline_body:
                 is_vuln = True
                 reason = f"Reflected untrusted host header into response body content."
-            # Check 3: Gateway route override success
+            # Check 3: Gateway route override success (never confirm on 4xx/5xx error reflections)
             elif probe.attack_category == "GATEWAY_ROUTE_OVERRIDE":
-                if baseline_status in (404, 403, 401) and resp.status_code == 200:
+                resp_lower = resp_body.lower()
+                base_lower = baseline_body.lower()
+                if baseline_status in (404, 403, 401) and 200 <= resp.status_code < 300:
                     is_vuln = True
-                    reason = f"Route override header changed response status from {baseline_status} to 200 OK."
-                elif any(sig in resp_body.lower() for sig in probe.expected_signal) and not any(sig in baseline_body.lower() for sig in probe.expected_signal):
-                    is_vuln = True
-                    reason = f"Route override header exposed administrative content in response body."
+                    reason = f"Route override header changed response status from {baseline_status} to {resp.status_code}."
+                elif 200 <= resp.status_code < 300:
+                    # Ignore error-echo bodies reflecting injected header name/value
+                    echoed_header = any(h.lower() in resp_lower for h in probe.headers) or "/admin" in resp_lower
+                    if not echoed_header:
+                        new_signals = [
+                            sig for sig in probe.expected_signal
+                            if re.search(rf"\b{re.escape(sig.lower())}\b", resp_lower)
+                            and not re.search(rf"\b{re.escape(sig.lower())}\b", base_lower)
+                        ]
+                        if new_signals:
+                            is_vuln = True
+                            reason = f"Route override header exposed administrative content in HTTP {resp.status_code} response body ({new_signals[:2]})."
 
             if is_vuln:
                 fid = stable_finding_id(target_app, method, clean_ep, probe.attack_category, probe.name)

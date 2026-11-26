@@ -161,20 +161,41 @@ class ConcurrencyFuzzer:
         reason = ""
 
         # Assessment logic:
-        # If single-use/sensitive endpoint receives multiple 2xx OK in identical burst
-        tokens = re.split(r"[/_\-\?\&=]+", endpoint.lower())
-        single_use_action = any(k in tokens for k in ("coupon", "voucher", "redeem", "apply", "claim", "reset"))
+        # Only truly single-use transactional actions (not idempotent /password/reset or /apply-filter)
+        # qualify for multi-2xx burst detection, and error-in-200 bodies must not be counted.
+        tokens = set(re.split(r"[/_\-\?\&=]+", endpoint.lower()))
+        single_use_tokens = {"coupon", "voucher", "redeem", "claim", "promo", "discount", "withdraw", "mint"}
+        single_use_action = bool(tokens & single_use_tokens)
+        effective_successes = [
+            r for r in responses
+            if 200 <= r[1] < 300
+            and not any(
+                err in r[3].lower()
+                for err in ('"success":false', '"success": false', '"ok":false', '"ok": false', "already ", "invalid ")
+            )
+        ]
 
-        if single_use_action and success_count > 1:
+        deadlock_signals = (
+            "deadlock",
+            "lock wait timeout",
+            "serialization failure",
+            "could not serialize",
+            "sqlite_busy",
+            "database is locked",
+            "concurrent modification",
+            "optimistic lock",
+        )
+
+        if single_use_action and len(effective_successes) > 1:
             is_vuln = True
             reason = (
-                f"Single-use action allowed multiple successful executions ({success_count}/{self.burst_size} HTTP 200/201/204). "
+                f"Single-use action allowed multiple successful executions ({len(effective_successes)}/{self.burst_size} HTTP 200/201/204). "
                 "Possible Race Condition / Limit Bypass."
             )
-        elif server_errors >= 2 and any("deadlock" in r[3].lower() or "internal" in r[3].lower() for r in responses):
+        elif server_errors >= 2 and any(any(sig in r[3].lower() for sig in deadlock_signals) for r in responses if 500 <= r[1] < 600):
             is_vuln = True
             reason = (
-                f"Concurrent burst caused {server_errors}/{self.burst_size} HTTP 500 server errors or database deadlocks."
+                f"Concurrent burst caused {server_errors}/{self.burst_size} HTTP 5xx database deadlock / lock contention errors."
             )
 
         details = {

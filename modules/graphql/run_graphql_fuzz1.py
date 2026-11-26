@@ -14,6 +14,7 @@ import asyncio
 import csv
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sys
@@ -22,6 +23,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -303,11 +306,11 @@ def generate_builtin_graphql_payloads(target_id: str, schema_file: Optional[Path
                     if any(cmd_arg in arg_names for cmd_arg in ("cmd", "arg", "command")):
                         arg_key = next(a for a in arg_names if a in ("cmd", "arg", "command"))
                         payloads.append(GraphQLPayload(
-                            query=f"query {{ {name}({arg_key}: \"id; echo DVGA_MARKER\") }}",
+                            query=f"query {{ {name}({arg_key}: \"id; echo CMD_INJ_PROBE_9F4A\") }}",
                             attack_type="COMMAND_INJECTION",
-                            payload_value="id; echo DVGA_MARKER",
+                            payload_value="id; echo CMD_INJ_PROBE_9F4A",
                             owasp_category="API8:2023",
-                            expected_signal=["uid=", "gid=", "DVGA_MARKER"],
+                            expected_signal=["uid=", "gid=", "CMD_INJ_PROBE_9F4A"],
                             target_app=target_id,
                             operation="query",
                         ))
@@ -901,8 +904,8 @@ def write_results(
                         fp = str(row.get("fingerprint", "")).strip()
                         if fp:
                             existing_csv_fps.add(fp)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Could not read existing GraphQL CSV findings at %s: %s", csv_path, exc)
 
     new_findings = [f for f in findings if f.fingerprint not in existing_csv_fps]
 
@@ -926,10 +929,11 @@ def write_results(
                             record = json.loads(line)
                             if record.get("confirmed") is True and record.get("fingerprint"):
                                 existing_ndjson_fps.add(str(record["fingerprint"]).strip())
-                        except Exception:
+                        except Exception as exc:
+                            logger.debug("Skipping malformed NDJSON line in %s: %s", ndjson_path, exc)
                             continue
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Could not read existing GraphQL NDJSON findings at %s: %s", ndjson_path, exc)
         missing_ndjson = [f for f in findings if f.fingerprint not in existing_ndjson_fps]
         if missing_ndjson:
             with ndjson_path.open("a", encoding="utf-8") as output:
@@ -1039,8 +1043,8 @@ def execute_graphql_scan(
         if schema_path is None and target is not None and target.schema_source:
             try:
                 schema_path = tm.resolve_source(target.schema_source)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Could not resolve GraphQL schema_source '%s': %s", target.schema_source, exc)
         payloads = generate_builtin_graphql_payloads(tid, schema_path)
         print(f"[INFO] Built-in GraphQL Engine: generated {len(payloads)} security test cases.")
     total_payloads = len(payloads)

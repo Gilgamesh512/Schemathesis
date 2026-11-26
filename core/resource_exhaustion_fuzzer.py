@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import json
+import logging
 import time
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -19,6 +20,8 @@ import httpx
 from pydantic import BaseModel, Field
 
 from .evidence import Evidence, Finding, content_hash, redact_headers, stable_finding_id
+
+logger = logging.getLogger(__name__)
 
 
 class ResourceProbeResult(BaseModel):
@@ -143,7 +146,8 @@ class ResourceExhaustionFuzzer:
                     f"ReDoS probe triggered HTTP Timeout (> {self.timeout}s). "
                     "Server CPU likely hung in catastrophic backtracking loop."
                 )
-            except Exception:
+            except Exception as exc:
+                logger.debug("ReDoS probe failed on %s %s (%s): %s", method, clean_ep, param_name, exc)
                 continue
 
             if is_vuln:

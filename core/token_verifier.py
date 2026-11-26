@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 from datetime import datetime, timezone
 import json
+import logging
 import time
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -17,6 +18,8 @@ import httpx
 from pydantic import BaseModel, Field
 
 from .evidence import Evidence, Finding, content_hash, redact_headers, stable_finding_id
+
+logger = logging.getLogger(__name__)
 
 
 def b64url_decode(segment: str) -> bytes:
@@ -155,8 +158,8 @@ class TokenVerifier:
                 # If endpoint responds with success without credentials, it is a public endpoint
                 if unauth_resp.status_code in (200, 201, 204):
                     return []
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Unauthenticated auth-challenge probe failed on %s %s: %s", method, clean_ep, exc)
 
         probes = self.generate_verification_probes(valid_auth_header)
         findings: list[Finding] = []
@@ -213,7 +216,8 @@ class TokenVerifier:
                         fingerprint=content_hash(f"{method}|{clean_ep}|{probe_name}"),
                     )
                     findings.append(finding)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Token verification probe '%s' failed on %s %s: %s", probe_name, method, clean_ep, exc)
                 continue
 
         return findings

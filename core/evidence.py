@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import asyncio
 import random
@@ -12,6 +13,8 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator
+
+logger = logging.getLogger(__name__)
 
 
 class CircuitBreakerTrippedError(RuntimeError):
@@ -180,8 +183,8 @@ def sanitize_body(body: Any) -> Any:
             raw = json.dumps(body, ensure_ascii=False)
             masked = PiiDetector.mask_text(raw)
             return json.loads(masked)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Body sanitization skipped due to error: %s", exc)
     return body
 
 

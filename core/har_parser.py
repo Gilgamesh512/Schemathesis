@@ -9,11 +9,14 @@ Addresses static spec-only blindness and strict DTO validation barriers:
 from __future__ import annotations
 
 import json
+import logging
 import re
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 BROWSER_IGNORE_HEADERS = {
     "host",
@@ -238,16 +241,16 @@ def parse_har_file(har_path: str | Path, target_host: str | None = None) -> Seed
                     parsed_json = json.loads(text_content)
                     body_json = parsed_json
                     _extract_params_from_object(parsed_json, corpus)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Skipping non-JSON HAR body on %s %s: %s", method, path, exc)
             elif "application/x-www-form-urlencoded" in mime_type:
                 try:
                     form_dict = urllib.parse.parse_qs(text_content, keep_blank_values=True)
                     for fk, fvs in form_dict.items():
                         if fvs:
                             corpus.add_param_seed(fk, fvs[0])
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Skipping malformed form-urlencoded HAR body on %s %s: %s", method, path, exc)
 
         # 5. Record request seed
         seed_obj = HARSeed(

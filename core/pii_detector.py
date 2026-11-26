@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -23,6 +24,8 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 from .evidence import Evidence, Finding, content_hash, stable_finding_id
+
+logger = logging.getLogger(__name__)
 
 
 def calculate_shannon_entropy(data: str) -> float:
@@ -149,6 +152,20 @@ class PiiDetector:
     # High-entropy generic secret pattern (base64/hex/alphanumeric tokens)
     HIGH_ENTROPY_TOKEN_REGEX = re.compile(r"\b[A-Za-z0-9_\-]{24,80}\b")
 
+    # Context keywords required for generic high-entropy secrets and VN CCCD
+    _SECRET_CONTEXT_RE = re.compile(
+        r"(?i)(?:secret|token|apikey|api_key|access_key|secret_key|private_key|auth|password|passwd|pwd|credential|bearer|signing|hmac|client_secret|session_key|session_id|jwt)[\w\.\-]*[\"']?\s*[:=]\s*[\"']?$"
+    )
+    _NON_SECRET_CONTEXT_RE = re.compile(
+        r"(?i)(?:cursor|next_page|page_token|etag|trace_id|request_id|correlation_id|span_id|s3_key|object_key|checksum|sha256|sha1|md5|digest|upload_id|bucket|filename|path|url|uri|href)[\"']?\s*[:=]\s*[\"']?$"
+    )
+    _CCCD_CONTEXT_RE = re.compile(
+        r"(?i)(?:cccd|cmnd|citizen|national_id|id_card|idcard|identity|so_cccd|can_cuoc|personal_id|kyc)[\w\.\-]*[\"']?\s*[:=]\s*[\"']?$"
+    )
+    _NON_CCCD_CONTEXT_RE = re.compile(
+        r"(?i)(?:order|transaction|tx|invoice|tracking|reference|ref|payment|shipment|phone|mobile|tel|account|zip|postal)[\w\.\-]*[\"']?\s*[:=]\s*[\"']?$"
+    )
+
     # Maximum response body size scanned in bytes (2MB) to prevent ReDoS / memory exhaustion
     MAX_BODY_SCAN_BYTES = 2 * 1024 * 1024
 
@@ -172,9 +189,31 @@ class PiiDetector:
                             "confidence": float(entry.get("confidence", 0.90)),
                             "mask_func": lambda m, rep=replacement: rep,
                         })
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to load custom PII rules from %s: %s", rules_path, exc)
         return custom_list
+
+    @classmethod
+    def _has_cccd_context(cls, text: str, start_pos: int) -> bool:
+        prefix = text[max(0, start_pos - 60):start_pos]
+        if cls._NON_CCCD_CONTEXT_RE.search(prefix):
+            return False
+        return bool(cls._CCCD_CONTEXT_RE.search(prefix))
+
+    @classmethod
+    def _has_secret_context(cls, text: str, start_pos: int, end_pos: int, candidate: str) -> bool:
+        prefix = text[max(0, start_pos - 60):start_pos]
+        if cls._NON_SECRET_CONTEXT_RE.search(prefix):
+            return False
+        # Skip path segments or URL query fragments unless explicitly in a secret key assignment
+        if start_pos > 0 and text[start_pos - 1] == "/" and not cls._SECRET_CONTEXT_RE.search(prefix):
+            return False
+        if not cls._SECRET_CONTEXT_RE.search(prefix) and not re.search(r"(?i)bearer\s+$", prefix):
+            return False
+        # Ignore pure lowercase/uppercase hex hashes of standard lengths unless explicitly named secret/key/token
+        if re.fullmatch(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", candidate):
+            return bool(re.search(r"(?i)(?:secret|token|apikey|api_key|access_key|private|hmac|signing)", prefix))
+        return True
 
     @classmethod
     def scan(cls, text: str) -> PiiScanResult:
@@ -197,6 +236,8 @@ class PiiDetector:
             conf = pattern["confidence"]
 
             for m in regex.finditer(inspection_text):
+                if cat == "GOV_ID" and "CCCD" in p_name and not cls._has_cccd_context(inspection_text, m.start()):
+                    continue
                 matched_str = m.group(0)
                 # Keep preview concise
                 preview = matched_str[:40] + ("..." if len(matched_str) > 40 else "")
@@ -226,7 +267,7 @@ class PiiDetector:
                 ))
                 counts["Valid Credit Card (Luhn Verified)"] = counts.get("Valid Credit Card (Luhn Verified)", 0) + 1
 
-        # 3. High-Entropy Secret Detection (> 4.5 bits entropy for random secrets)
+        # 3. High-Entropy Secret Detection (> 4.5 bits entropy + explicit secret key context)
         # Exclude already matched regions to prevent double-counting
         matched_spans = {(m.start_pos, m.end_pos) for m in matches}
         for m in cls.HIGH_ENTROPY_TOKEN_REGEX.finditer(inspection_text):
@@ -235,8 +276,10 @@ class PiiDetector:
             if any(s[0] <= span[0] and span[1] <= s[1] for s in matched_spans):
                 continue
             cand_token = m.group(0)
-            # Ignore standard UUIDs, lowercase hex hashes, or repetitive patterns
+            # Ignore standard UUIDs
             if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", cand_token, re.IGNORECASE):
+                continue
+            if not cls._has_secret_context(inspection_text, m.start(), m.end(), cand_token):
                 continue
             entropy = calculate_shannon_entropy(cand_token)
             if entropy >= 4.5:
@@ -245,7 +288,7 @@ class PiiDetector:
                     category="HIGH_ENTROPY_SECRET",
                     pattern_name="High-Entropy Random Secret Key",
                     preview=preview,
-                    confidence=0.88,
+                    confidence=0.80,
                     start_pos=m.start(),
                     end_pos=m.end(),
                 ))
@@ -310,10 +353,14 @@ class PiiDetector:
         if not scan_res.has_pii:
             return None
 
-        # Determine highest severity
+        # Determine highest severity & confirmation (heuristic-only high-entropy stays candidate)
         high_risk_cats = {"SECRET_KEY", "CREDENTIAL", "PASSWORD_HASH", "CREDIT_CARD", "CLOUD_KEY"}
+        deterministic_cats = {m.category for m in scan_res.matches if m.category != "HIGH_ENTROPY_SECRET"}
         has_critical = any(m.category in high_risk_cats for m in scan_res.matches)
-        severity = "critical" if has_critical else "high"
+        heuristic_only = not deterministic_cats
+        severity = "critical" if has_critical else ("medium" if heuristic_only else "high")
+        is_confirmed = not heuristic_only
+        confidence = 0.75 if heuristic_only else 0.95
 
         detected_types = list(scan_res.counts.keys())
         summary_desc = ", ".join(f"{k} (x{v})" for k, v in scan_res.counts.items())
@@ -344,8 +391,8 @@ class PiiDetector:
                 endpoint=clean_ep,
             ),
             severity=severity,
-            confidence=0.95,
-            confirmed=True,
-            lifecycle="confirmed",
+            confidence=confidence,
+            confirmed=is_confirmed,
+            lifecycle="confirmed" if is_confirmed else "candidate",
             fingerprint=content_hash(f"{method}|{clean_ep}|PII_LEAK|{','.join(sorted(detected_types))}"),
         )

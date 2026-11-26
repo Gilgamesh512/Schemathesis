@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from pathlib import Path
 import ssl
@@ -13,6 +14,8 @@ import sys
 from typing import Sequence
 import urllib.error
 import urllib.request
+
+logger = logging.getLogger(__name__)
 
 try:
     from core.alerting import send_webhook_alert
@@ -39,8 +42,8 @@ def _get_python_command() -> list[str]:
             res = subprocess.run(["py", "-3.12", "-c", "import schemathesis"], capture_output=True, check=False)
             if res.returncode == 0:
                 return ["py", "-3.12"]
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("py -3.12 probe failed: %s", exc)
 
     return [sys.executable]
 

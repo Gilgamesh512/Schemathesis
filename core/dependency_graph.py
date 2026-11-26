@@ -40,6 +40,7 @@ class ConsumerCandidate(BaseModel):
     method: str
     summary: str = ""
     required_params: list[str] = Field(default_factory=list)
+    is_public: bool = False
 
 
 class ApiDependencyGraph:
@@ -91,11 +92,13 @@ class ApiDependencyGraph:
                 # 1. Evaluate as Consumer if endpoint takes an identifiable path parameter
                 consumer_params = [p for p in path_params if any(cand in p.lower() for cand in ID_PARAM_CANDIDATES) or p]
                 if consumer_params and method in {"get", "put", "patch", "delete"}:
+                    is_public = op.get("security") == []
                     self.consumers.append(ConsumerCandidate(
                         endpoint=path,
                         method=method.upper(),
                         summary=summary,
                         required_params=consumer_params,
+                        is_public=is_public,
                     ))
 
                 # 2. Evaluate as Producer if endpoint is a state-changing creation endpoint (POST)
@@ -170,6 +173,8 @@ class ApiDependencyGraph:
             prod_root = prod.endpoint.strip("/").split("/")[0]
 
             for cons in self.consumers:
+                if cons.is_public and cons.method == "GET":
+                    continue
                 cons_root = cons.endpoint.strip("/").split("/")[0]
                 # Match by path domain similarity (e.g. /users and /users/{id})
                 is_domain_match = prod_root == cons_root
@@ -197,6 +202,7 @@ class ApiDependencyGraph:
                         body=prod.request_body_sample,
                         extract={var_name: field_match},
                         expected_status=[200, 201, 204],
+                        auth_user="user1",
                         description="Provision initial resource entity as primary user",
                     ))
 

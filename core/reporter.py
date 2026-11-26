@@ -37,8 +37,8 @@ def compute_tamper_signature(content: str, secret_key: Optional[str] = None) -> 
 try:
     if sys.stdout and hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
+except (AttributeError, OSError) as exc:
+    logger.debug("stdout UTF-8 reconfigure skipped: %s", exc)
 
 # OWASP API Security Top 10 (2023) Metadata & Remediation Guidance
 OWASP_METADATA = {
@@ -136,8 +136,8 @@ class SecurityReporter:
                         findings.append(self._normalize_finding(record))
                     except json.JSONDecodeError:
                         continue
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to read NDJSON findings from %s: %s", ndjson_path, exc)
 
         if not findings and csv_path.exists() and csv_path.stat().st_size > 0:
             try:
@@ -147,8 +147,8 @@ class SecurityReporter:
                         if run_id and row.get("run_id") != run_id:
                             continue
                         findings.append(self._normalize_finding(dict(row)))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to read CSV findings from %s: %s", csv_path, exc)
 
         if limit is not None and limit > 0:
             findings = findings[-limit:]
@@ -184,8 +184,8 @@ class SecurityReporter:
         if isinstance(payload, str):
             try:
                 payload = json.loads(payload)
-            except Exception:
-                pass
+            except (json.JSONDecodeError, TypeError):
+                logger.debug("Leaving non-JSON payload string unparsed during report normalization.")
 
         evidence = raw.get("evidence")
         if isinstance(evidence, dict):
@@ -388,13 +388,13 @@ class SecurityReporter:
         latest_path = self.results_dir / "latest_report.html"
         try:
             shutil.copy2(report_path, latest_path)
-        except Exception:
-            pass
+        except OSError as exc:
+            logger.warning("Failed to update %s: %s", latest_path, exc)
 
         try:
             self.generate_sarif_report(findings, target_info)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to generate paired SARIF report: %s", exc)
 
         return report_path
 
@@ -424,8 +424,8 @@ class SecurityReporter:
         canonical_sarif = self.results_dir / "vulnerabilities.sarif"
         try:
             shutil.copy2(sarif_path, canonical_sarif)
-        except Exception:
-            pass
+        except OSError as exc:
+            logger.warning("Failed to update %s: %s", canonical_sarif, exc)
 
         return sarif_path
 

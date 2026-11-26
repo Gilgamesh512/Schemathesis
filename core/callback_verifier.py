@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import json
+import logging
 import re
 import socket
 import time
@@ -19,6 +20,8 @@ import httpx
 from pydantic import BaseModel, Field
 
 from .evidence import Evidence, Finding, content_hash, redact_headers, stable_finding_id
+
+logger = logging.getLogger(__name__)
 
 
 CALLBACK_PARAM_NAMES = {
@@ -70,8 +73,8 @@ class LocalCallbackListener:
                     socket.gethostbyname(candidate)
                     reported_host = candidate
                     break
-                except Exception:
-                    pass
+                except OSError:
+                    continue
             if not reported_host:
                 reported_host = "127.0.0.1"
 
@@ -124,14 +127,14 @@ class LocalCallbackListener:
             )
             writer.write(response)
             await writer.drain()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Loopback callback listener client handling error: %s", exc)
         finally:
             try:
                 writer.close()
                 await writer.wait_closed()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Loopback callback listener socket close error: %s", exc)
 
     def check_hit(self, token: str) -> Optional[CallbackEvent]:
         """Check if a specific canary token was hit."""
@@ -202,8 +205,8 @@ class CallbackVerifier:
                         method=first.get("method") or "GET",
                         headers=first.get("headers") or {},
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("External canary poll failed for token %s: %s", token, exc)
         return None
 
     async def verify_endpoint_url_parameter(
@@ -297,8 +300,8 @@ class CallbackVerifier:
                     lifecycle="confirmed",
                     fingerprint=content_hash(f"{method}|{clean_ep}|SSRF|{param_name}"),
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Callback SSRF verification probe failed on %s %s (%s): %s", method, clean_ep, param_name, exc)
         finally:
             if not self.external_url:
                 await listener.stop()

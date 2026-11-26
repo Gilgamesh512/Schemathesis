@@ -120,57 +120,64 @@ class GraphQLAdvancedAuditor:
             if resp.status_code == 200:
                 try:
                     data = resp.json()
-                    if isinstance(data, list) and len(data) >= batch_size // 2:
-                        result.batching_enabled = True
-                        result.batch_size_accepted = len(data)
+                    if isinstance(data, list):
+                        successful_items = [
+                            item for item in data
+                            if isinstance(item, dict)
+                            and isinstance(item.get("data"), dict)
+                            and bool(item["data"])
+                        ]
+                        if len(successful_items) >= max(2, batch_size // 2):
+                            result.batching_enabled = True
+                            result.batch_size_accepted = len(successful_items)
 
-                        finding_id = stable_finding_id(
-                            target=base_url,
-                            method="POST",
-                            endpoint=endpoint,
-                            attack_type="graphql_query_batching",
-                            parameter="batch_array",
-                        )
-                        curl_cmd = build_curl_command(
-                            method="POST",
-                            url=target_url,
-                            headers=headers,
-                            json_data=batched_payload[:3],  # Sample for cURL
-                        )
-                        now_iso = datetime.now(timezone.utc).isoformat()
-                        fp = f"gql_batching_{base_url}_{endpoint}"
+                            finding_id = stable_finding_id(
+                                target=base_url,
+                                method="POST",
+                                endpoint=endpoint,
+                                attack_type="graphql_query_batching",
+                                parameter="batch_array",
+                            )
+                            curl_cmd = build_curl_command(
+                                method="POST",
+                                url=target_url,
+                                headers=headers,
+                                json_data=batched_payload[:3],  # Sample for cURL
+                            )
+                            now_iso = datetime.now(timezone.utc).isoformat()
+                            fp = f"gql_batching_{base_url}_{endpoint}"
 
-                        finding = Finding(
-                            finding_id=finding_id,
-                            run_id=run_id,
-                            timestamp=now_iso,
-                            target_app="graphql_target",
-                            endpoint=endpoint,
-                            method="POST",
-                            tool="graphql_advanced_auditor",
-                            attack_type="GraphQL Query Batching",
-                            owasp_category="API4:2023",
-                            severity="high",
-                            status_code=resp.status_code,
-                            response_time_ms=elapsed_ms,
-                            confirmed=True,
-                            confidence=0.95,
-                            fingerprint=fp,
-                            curl_command=curl_cmd,
-                            evidence=Evidence(
+                            finding = Finding(
+                                finding_id=finding_id,
+                                run_id=run_id,
+                                timestamp=now_iso,
+                                target_app="graphql_target",
+                                endpoint=endpoint,
+                                method="POST",
+                                tool="graphql_advanced_auditor",
+                                attack_type="GraphQL Query Batching",
+                                owasp_category="API4:2023",
+                                severity="high",
                                 status_code=resp.status_code,
                                 response_time_ms=elapsed_ms,
-                                response_signal=[
-                                    f"Server accepted array of {len(data)} batched GraphQL queries in a single HTTP request",
-                                    "Rate limiting bypass / Brute-force amplification possible",
-                                ],
-                                endpoint=endpoint,
-                                payload=batched_payload[:2],
-                            ),
-                        )
-                        result.findings.append(finding)
-                except Exception:
-                    pass
+                                confirmed=True,
+                                confidence=0.95,
+                                fingerprint=fp,
+                                curl_command=curl_cmd,
+                                evidence=Evidence(
+                                    status_code=resp.status_code,
+                                    response_time_ms=elapsed_ms,
+                                    response_signal=[
+                                        f"Server executed {len(successful_items)}/{len(data)} batched GraphQL queries with valid data payloads in a single HTTP request",
+                                        "Rate limiting bypass / Brute-force amplification possible",
+                                    ],
+                                    endpoint=endpoint,
+                                    payload=batched_payload[:2],
+                                ),
+                            )
+                            result.findings.append(finding)
+                except Exception as exc:
+                    logger.debug("GraphQL batching JSON parse error: %s", exc)
         except Exception as exc:
             logger.debug("GraphQL batching probe error: %s", exc)
 
@@ -248,8 +255,8 @@ class GraphQLAdvancedAuditor:
                             ),
                         )
                         result.findings.append(finding)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("GraphQL alias overload JSON parse error: %s", exc)
         except Exception as exc:
             logger.debug("GraphQL alias overload probe error: %s", exc)
 
@@ -322,7 +329,7 @@ class GraphQLAdvancedAuditor:
                             ),
                         )
                         result.findings.append(finding)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("GraphQL introspection JSON parse error: %s", exc)
         except Exception as exc:
             logger.debug("GraphQL introspection probe error: %s", exc)

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import logging
 import os
 import re
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -67,6 +70,24 @@ REST_FUZZER = PROJECT_ROOT / "modules" / "rest" / "run_schemathesis1.py"
 GRAPHQL_FUZZER = PROJECT_ROOT / "modules" / "graphql" / "run_graphql_fuzz1.py"
 RULES = PROJECT_PATHS.config / "rules.json"
 TOKENS_FILE = PROJECT_ROOT / "tokens.env"
+logger = logging.getLogger(__name__)
+
+
+def _build_audit_headers(
+    auth_token: str | None = None,
+    custom_headers: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Merge optional custom headers and normalized auth token into a request header dict."""
+    merged: dict[str, str] = {str(k): str(v) for k, v in (custom_headers or {}).items()}
+    if auth_token:
+        normalized = normalize_auth_header(auth_token)
+        if normalized and ":" in normalized:
+            hk, _, hv = normalized.partition(":")
+            if hk.strip():
+                merged[hk.strip()] = hv.strip()
+        elif auth_token.strip():
+            merged["Authorization"] = auth_token.strip()
+    return merged
 
 
 def banner(title: str) -> None:
@@ -227,16 +248,97 @@ def run_command(label: str, command: list[str],
 _DEFAULT_RUN_COMMAND = run_command
 
 
+def _resolve_schema_ref(schema: Any, spec: dict[str, Any], depth: int = 0) -> dict[str, Any]:
+    """Resolve local OpenAPI $ref pointers with cycle protection."""
+    if not isinstance(schema, dict) or depth > 6:
+        return {}
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/"):
+        node: Any = spec
+        for part in ref[2:].split("/"):
+            if isinstance(node, dict) and part in node:
+                node = node[part]
+            else:
+                return schema
+        if isinstance(node, dict):
+            return _resolve_schema_ref(node, spec, depth + 1)
+    return schema
+
+
+def _sample_value_for_schema(schema: Any, spec: dict[str, Any], prop_name: str = "", depth: int = 0) -> Any:
+    """Synthesize a schema-conforming JSON sample value from an OpenAPI schema node."""
+    if depth > 4:
+        return {}
+    resolved = _resolve_schema_ref(schema, spec, depth)
+    if not isinstance(resolved, dict):
+        return "sample"
+    if "example" in resolved:
+        return resolved["example"]
+    if "default" in resolved:
+        return resolved["default"]
+    if isinstance(resolved.get("enum"), list) and resolved["enum"]:
+        return resolved["enum"][0]
+
+    for combiner in ("allOf", "oneOf", "anyOf"):
+        variants = resolved.get(combiner)
+        if isinstance(variants, list) and variants:
+            if combiner == "allOf":
+                merged: dict[str, Any] = {}
+                for item in variants:
+                    part = _sample_value_for_schema(item, spec, prop_name, depth + 1)
+                    if isinstance(part, dict):
+                        merged.update(part)
+                if merged:
+                    return merged
+            return _sample_value_for_schema(variants[0], spec, prop_name, depth + 1)
+
+    p_type = resolved.get("type")
+    if not p_type and "properties" in resolved:
+        p_type = "object"
+
+    if p_type == "object":
+        props = resolved.get("properties", {})
+        if not isinstance(props, dict):
+            return {}
+        return {
+            str(k): _sample_value_for_schema(v, spec, str(k), depth + 1)
+            for k, v in props.items()
+        }
+    if p_type == "array":
+        items = resolved.get("items", {})
+        return [_sample_value_for_schema(items, spec, prop_name, depth + 1)]
+    if p_type == "integer":
+        return resolved.get("minimum", 1) if isinstance(resolved.get("minimum"), int) else 1
+    if p_type == "number":
+        return resolved.get("minimum", 1.0) if isinstance(resolved.get("minimum"), (int, float)) else 1.0
+    if p_type == "boolean":
+        return True
+
+    fmt = resolved.get("format")
+    if fmt == "email":
+        return "audit@example.com"
+    if fmt == "uuid":
+        return "11111111-1111-1111-1111-111111111111"
+    if fmt == "date-time":
+        return "2026-01-01T00:00:00Z"
+    if fmt == "date":
+        return "2026-01-01"
+    if fmt in ("uri", "url"):
+        return "https://example.com/callback"
+    return f"sample_{prop_name}" if prop_name else "sample"
+
+
 def _extract_audit_targets_from_schema(
     schema_source: str | None,
     *,
     allow_remote: bool = False,
-) -> dict[str, list]:
-    """Derive endpoints, callback params, race candidates, and resource params from an OpenAPI spec."""
-    extracted: dict[str, list] = {
+) -> dict[str, Any]:
+    """Derive endpoints, callback params, race candidates/bodies, and resource params from an OpenAPI spec."""
+    extracted: dict[str, Any] = {
         "endpoints": [],
         "callback_params": [],
         "race_candidates": [],
+        "race_bodies": {},
         "resource_candidates": [],
     }
     if not schema_source:
@@ -247,7 +349,8 @@ def _extract_audit_targets_from_schema(
             allow_remote=allow_remote,
             allow_outside=True,
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning("Failed to extract audit targets from schema '%s': %s", schema_source, exc)
         return extracted
 
     paths = spec.get("paths")
@@ -268,7 +371,8 @@ def _extract_audit_targets_from_schema(
                 seen_eps.add(ep_pair)
                 extracted["endpoints"].append(ep_pair)
 
-            if ConcurrencyFuzzer is not None and ConcurrencyFuzzer.is_candidate_endpoint(path, method):
+            is_race = ConcurrencyFuzzer is not None and ConcurrencyFuzzer.is_candidate_endpoint(path, method)
+            if is_race:
                 extracted["race_candidates"].append(ep_pair)
 
             op_params = op.get("parameters") if isinstance(op.get("parameters"), list) else []
@@ -287,7 +391,13 @@ def _extract_audit_targets_from_schema(
             req_body = op.get("requestBody")
             if isinstance(req_body, dict):
                 content = req_body.get("content", {})
-                json_schema = content.get("application/json", {}).get("schema", {}) if isinstance(content, dict) else {}
+                json_media = content.get("application/json", {}) if isinstance(content, dict) else {}
+                json_schema = _resolve_schema_ref(json_media.get("schema", {}), spec) if isinstance(json_media, dict) else {}
+                if is_race and isinstance(json_media, dict):
+                    if "example" in json_media:
+                        extracted["race_bodies"][ep_pair] = json_media["example"]
+                    elif json_schema:
+                        extracted["race_bodies"][ep_pair] = _sample_value_for_schema(json_schema, spec)
                 props = json_schema.get("properties", {}) if isinstance(json_schema, dict) else {}
                 for prop_name in props:
                     if CallbackVerifier.is_callback_parameter(prop_name):
@@ -351,8 +461,8 @@ def run_target(
         try:
             for hk, hv in json.loads(extra_env["FUZZ_EXTRA_HEADERS_JSON"]).items():
                 headers[str(hk).strip()] = str(hv).strip()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Ignoring malformed FUZZ_EXTRA_HEADERS_JSON: %s", exc)
 
     user2_headers: dict[str, str] = {}
     if extra_env.get("FUZZ_AUTH_HEADER_USER2"):
@@ -476,6 +586,8 @@ def run_token_audit(
 def run_callback_audit(
     base_url: str,
     candidate_params: list[tuple[str, str, str, str]] | None = None,
+    auth_token: str | None = None,
+    custom_headers: dict[str, str] | None = None,
     proxy: str | None = None,
     insecure: bool = False,
     external_url: str | None = None,
@@ -502,6 +614,7 @@ def run_callback_audit(
         return []
 
     candidates = candidate_params
+    req_headers = _build_audit_headers(auth_token, custom_headers)
 
     all_findings: list[Finding] = []
     run_id = f"callback-audit-{uuid.uuid4().hex[:8]}"
@@ -518,6 +631,7 @@ def run_callback_audit(
                     param_location=loc,
                     base_url=base_url,
                     run_id=run_id,
+                    headers=req_headers or None,
                 )
                 if finding:
                     all_findings.append(finding)
@@ -538,6 +652,8 @@ def run_concurrency_audit(
     base_url: str,
     candidate_endpoints: list[tuple[str, str]] | None = None,
     auth_token: str | None = None,
+    custom_headers: dict[str, str] | None = None,
+    sample_bodies: dict[tuple[str, str], Any] | None = None,
     burst_size: int = 5,
     proxy: str | None = None,
     insecure: bool = False,
@@ -559,20 +675,25 @@ def run_concurrency_audit(
         return []
 
     candidates = candidate_endpoints
+    bodies_map = sample_bodies or {}
 
     all_findings: list[Finding] = []
     run_id = f"race-audit-{uuid.uuid4().hex[:8]}"
-    headers = {"Authorization": auth_token} if auth_token else {}
+    headers = _build_audit_headers(auth_token, custom_headers)
 
     async def _run():
-        for method, ep in candidates:
-            sample_body = {"coupon_code": "PROMO2026", "code": "DISCOUNT50"}
+        for entry in candidates:
+            if len(entry) >= 3:
+                method, ep, body = entry[0], entry[1], entry[2]
+            else:
+                method, ep = entry[0], entry[1]
+                body = bodies_map.get((method, ep))
             res = await fuzzer.execute_burst(
                 base_url=base_url,
                 endpoint=ep,
                 method=method,
                 headers=headers,
-                json_data=sample_body,
+                json_data=body if isinstance(body, (dict, list)) else None,
             )
             finding = fuzzer.convert_to_finding(res, target_app="dynamic_target", run_id=run_id)
             if finding:
@@ -595,6 +716,7 @@ def run_pii_audit(
     base_url: str,
     endpoints: list[tuple[str, str]] | None = None,
     auth_token: str | None = None,
+    custom_headers: dict[str, str] | None = None,
     proxy: str | None = None,
     insecure: bool = False,
 ) -> list[Finding]:
@@ -603,7 +725,7 @@ def run_pii_audit(
     target_eps = endpoints or [("GET", "/")]
     all_findings: list[Finding] = []
     run_id = f"pii-audit-{uuid.uuid4().hex[:8]}"
-    headers = {"Authorization": auth_token} if auth_token else {}
+    headers = _build_audit_headers(auth_token, custom_headers)
 
     async def _run():
         transport = httpx.AsyncHTTPTransport(proxy=proxy, verify=not insecure)
@@ -626,7 +748,8 @@ def run_pii_audit(
                     if finding:
                         all_findings.append(finding)
                         print(f"[!] CONFIRMED PII/SECRET LEAK on {method} {ep}: {finding.evidence.response_signal[0]}")
-                except Exception:
+                except Exception as exc:
+                    logger.debug("PII audit request failed on %s %s: %s", method, ep, exc)
                     continue
 
     try:
@@ -645,6 +768,7 @@ def run_header_tamper_audit(
     base_url: str,
     endpoints: list[tuple[str, str]] | None = None,
     auth_token: str | None = None,
+    custom_headers: dict[str, str] | None = None,
     proxy: str | None = None,
     insecure: bool = False,
 ) -> list[Finding]:
@@ -654,7 +778,7 @@ def run_header_tamper_audit(
     target_eps = endpoints or [("GET", "/")]
     all_findings: list[Finding] = []
     run_id = f"header-tamper-audit-{uuid.uuid4().hex[:8]}"
-    headers = {"Authorization": auth_token} if auth_token else {}
+    headers = _build_audit_headers(auth_token, custom_headers)
 
     async def _run():
         transport = httpx.AsyncHTTPTransport(proxy=proxy, verify=not insecure)
@@ -690,6 +814,7 @@ def run_resource_exhaustion_audit(
     base_url: str,
     candidate_endpoints: list[tuple[str, str, str]] | None = None,
     auth_token: str | None = None,
+    custom_headers: dict[str, str] | None = None,
     proxy: str | None = None,
     insecure: bool = False,
 ) -> list[Finding]:
@@ -703,7 +828,7 @@ def run_resource_exhaustion_audit(
     candidates = candidate_endpoints
     all_findings: list[Finding] = []
     run_id = f"resource-audit-{uuid.uuid4().hex[:8]}"
-    headers = {"Authorization": auth_token} if auth_token else {}
+    headers = _build_audit_headers(auth_token, custom_headers)
 
     async def _run():
         transport = httpx.AsyncHTTPTransport(proxy=proxy, verify=not insecure)
@@ -1056,6 +1181,8 @@ def run_dynamic_target(
             callback_findings = run_callback_audit(
                 base_url=url,
                 candidate_params=audit_targets["callback_params"] or None,
+                auth_token=auth_token,
+                custom_headers=custom_headers,
                 proxy=effective_proxy,
                 insecure=insecure,
                 external_url=callback_url,
@@ -1074,6 +1201,8 @@ def run_dynamic_target(
                 base_url=url,
                 candidate_endpoints=audit_targets["race_candidates"] or None,
                 auth_token=auth_token,
+                custom_headers=custom_headers,
+                sample_bodies=audit_targets.get("race_bodies"),
                 burst_size=concurrency_burst,
                 proxy=effective_proxy,
                 insecure=insecure,
@@ -1091,6 +1220,7 @@ def run_dynamic_target(
                 base_url=url,
                 endpoints=get_eps or audit_targets["endpoints"] or None,
                 auth_token=auth_token,
+                custom_headers=custom_headers,
                 proxy=effective_proxy,
                 insecure=insecure,
             )
@@ -1106,6 +1236,7 @@ def run_dynamic_target(
                 base_url=url,
                 endpoints=audit_targets["endpoints"][:10] or None,
                 auth_token=auth_token,
+                custom_headers=custom_headers,
                 proxy=effective_proxy,
                 insecure=insecure,
             )
@@ -1121,6 +1252,7 @@ def run_dynamic_target(
                 base_url=url,
                 candidate_endpoints=audit_targets["resource_candidates"][:10] or None,
                 auth_token=auth_token,
+                custom_headers=custom_headers,
                 proxy=effective_proxy,
                 insecure=insecure,
             )
@@ -1135,7 +1267,7 @@ def run_dynamic_target(
             gql_findings = run_graphql_advanced_audit(
                 base_url=url,
                 endpoint=settings.get("endpoint", "/graphql"),
-                headers={"Authorization": auth_token} if auth_token else {},
+                headers=_build_audit_headers(auth_token, custom_headers),
                 proxy=effective_proxy,
                 insecure=insecure,
             )
@@ -1159,13 +1291,12 @@ def run_dynamic_target(
         manifest_file = RESULTS.results_dir / "cleanup_manifest.json"
         if manifest_file.exists():
             try:
-                import json
                 m_data = json.loads(manifest_file.read_text(encoding="utf-8"))
                 tot = m_data.get("total_created_resources", 0)
                 if tot > 0:
                     print(f"[🛡️] Staging Safety: Tracked {tot} created resources in {manifest_file.name}")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Could not read cleanup manifest %s: %s", manifest_file, exc)
         return 0
     except (FileNotFoundError, KeyError, OSError, RuntimeError, ValueError) as exc:
         print(f"\n[X] Dynamic scan failed: {exc}", file=sys.stderr)
@@ -1253,13 +1384,12 @@ def run_workflow(
         manifest_file = RESULTS.results_dir / "cleanup_manifest.json"
         if manifest_file.exists():
             try:
-                import json
                 m_data = json.loads(manifest_file.read_text(encoding="utf-8"))
                 tot = m_data.get("total_created_resources", 0)
                 if tot > 0:
                     print(f"[🛡️] Staging Safety: Tracked {tot} created resources in {manifest_file.name}")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Could not read cleanup manifest %s: %s", manifest_file, exc)
 
     return 0 if report.success else 1
 
@@ -1477,13 +1607,12 @@ def main(argv: list[str] | None = None) -> int:
         manifest_file = RESULTS.results_dir / "cleanup_manifest.json"
         if manifest_file.exists():
             try:
-                import json
                 m_data = json.loads(manifest_file.read_text(encoding="utf-8"))
                 tot = m_data.get("total_created_resources", 0)
                 if tot > 0:
                     print(f"[🛡️] Staging Safety: Tracked {tot} created resources in {manifest_file.name}")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Could not read cleanup manifest %s: %s", manifest_file, exc)
 
     return 0
 

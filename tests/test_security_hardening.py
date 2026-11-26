@@ -350,3 +350,58 @@ def test_dependency_graph_skips_public_get_consumers():
     graph = ApiDependencyGraph(spec)
     assert graph.consumers[0].is_public is True
     assert graph.synthesize_workflows() == []
+
+
+# ---------------------------------------------------------------------------
+# 4. Quality Gate SARIF Severity Evaluation
+# ---------------------------------------------------------------------------
+
+def test_quality_gate_does_not_miscount_medium_warnings_as_high(tmp_path: Path):
+    import run_all
+    from core import SecurityReporter
+
+    reporter = SecurityReporter(results_dir=tmp_path)
+    findings = [
+        {
+            "finding_id": f"m-{i}",
+            "method": "GET",
+            "endpoint": f"/items/{i}",
+            "attack_type": "XSS",
+            "owasp_category": "API8:2023",
+            "severity": "medium",
+            "confirmed": False,
+            "evidence": "Unconfirmed candidate signal",
+        }
+        for i in range(4)
+    ]
+    sarif_path = reporter.generate_sarif_report(findings, output_file=tmp_path / "gate.sarif")
+
+    # 4 medium (SARIF level='warning') unconfirmed findings must NOT fail --max-critical 0 --max-high 2
+    rc = run_all.main(["gate", "--sarif", str(sarif_path), "--max-critical", "0", "--max-high", "2"])
+    assert rc == 0
+
+
+def test_quality_gate_blocks_actual_high_and_confirmed_findings(tmp_path: Path):
+    import run_all
+    from core import SecurityReporter
+
+    reporter = SecurityReporter(results_dir=tmp_path)
+    findings = [
+        {
+            "finding_id": f"h-{i}",
+            "method": "GET",
+            "endpoint": f"/admin/{i}",
+            "attack_type": "BFLA",
+            "owasp_category": "API5:2023",
+            "severity": "high",
+            "confirmed": False,
+            "evidence": "High severity anomaly",
+        }
+        for i in range(3)
+    ]
+    sarif_path = reporter.generate_sarif_report(findings, output_file=tmp_path / "gate_high.sarif")
+
+    # 3 actual high findings exceed --max-high 2 even with --allow-confirmed
+    rc = run_all.main(["gate", "--sarif", str(sarif_path), "--max-critical", "0", "--max-high", "2", "--allow-confirmed"])
+    assert rc == 1
+

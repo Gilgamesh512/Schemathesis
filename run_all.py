@@ -342,11 +342,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         crit_count = 0
         high_count = 0
+        medium_count = 0
         confirmed_count = 0
         for r in results:
-            lvl = r.get("level", "note").lower()
+            lvl = str(r.get("level", "note")).lower()
             props = r.get("properties") or {}
-            
+            sev = str(props.get("severity") or "").strip().lower()
+
             # Precise structured verification: use boolean confirmed property
             is_confirmed = bool(props.get("confirmed", False))
             if not is_confirmed:
@@ -356,14 +358,25 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             if is_confirmed:
                 confirmed_count += 1
-            if lvl == "error":
-                crit_count += 1
-            elif lvl == "warning":
-                high_count += 1
+
+            if sev:
+                if sev == "critical":
+                    crit_count += 1
+                elif sev == "high":
+                    high_count += 1
+                elif sev == "medium":
+                    medium_count += 1
+            else:
+                # Fallback for external SARIF documents without properties.severity
+                if lvl == "error":
+                    crit_count += 1
+                elif lvl == "warning":
+                    high_count += 1
 
         print(f"[i] Evaluated SARIF Findings: {len(results)} total findings")
-        print(f"    - Critical / Errors: {crit_count} (Limit: {args.max_critical})")
-        print(f"    - High / Warnings:   {high_count} (Limit: {args.max_high})")
+        print(f"    - Critical Severity:  {crit_count} (Limit: {args.max_critical})")
+        print(f"    - High Severity:      {high_count} (Limit: {args.max_high})")
+        print(f"    - Medium Severity:    {medium_count} (Informational / Non-blocking)")
         print(f"    - Confirmed Exploits: {confirmed_count} (Policy: {'Allow' if args.allow_confirmed else 'Reject any'})")
 
         gate_failed = False
@@ -388,8 +401,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "",
             "| Security Metric | Count | Allowed Limit | Gate Policy Result |",
             "| :--- | :---: | :---: | :---: |",
-            f"| 🔴 Critical Severity / Errors | **{crit_count}** | Max {args.max_critical} | {'❌ VIOLATION' if crit_count > args.max_critical else '✅ PASSED'} |",
-            f"| 🟠 High Severity / Warnings | **{high_count}** | Max {args.max_high} | {'❌ VIOLATION' if high_count > args.max_high else '✅ PASSED'} |",
+            f"| 🔴 Critical Severity | **{crit_count}** | Max {args.max_critical} | {'❌ VIOLATION' if crit_count > args.max_critical else '✅ PASSED'} |",
+            f"| 🟠 High Severity | **{high_count}** | Max {args.max_high} | {'❌ VIOLATION' if high_count > args.max_high else '✅ PASSED'} |",
+            f"| 🟡 Medium Severity | **{medium_count}** | Informational | ✅ TRACKED |",
             f"| 🎯 Confirmed Active Exploits | **{confirmed_count}** | {'Allowed' if args.allow_confirmed else '0 (Zero Tolerance)'} | {'❌ VIOLATION' if not args.allow_confirmed and confirmed_count > 0 else '✅ PASSED'} |",
             f"| 📊 Total Assessed Findings | **{len(results)}** | N/A | Evaluated |",
             "",

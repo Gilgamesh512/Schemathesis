@@ -296,7 +296,7 @@ class BolaValidator:
         if 200 <= attack_status < 300:
             return BolaVerdict(
                 outcome="rejected",
-                confidence=0.85,
+                confidence=0.10,
                 severity="info",
                 reason=(
                     f"HTTP {attack_status}; no authentication headers provided — "
@@ -308,7 +308,7 @@ class BolaValidator:
             )
         return BolaVerdict(
             outcome="rejected",
-            confidence=0.80,
+            confidence=0.10,
             severity="info",
             reason=(
                 f"HTTP {attack_status}; anonymous request — "
@@ -334,7 +334,7 @@ class BolaValidator:
         if unauth_status is not None and 200 <= unauth_status < 300:
             return BolaVerdict(
                 outcome="rejected",
-                confidence=0.85,
+                confidence=0.10,
                 severity="info",
                 reason=(
                     f"HTTP {attack_status}; unauthenticated request also returned "
@@ -372,7 +372,7 @@ class BolaValidator:
             if attack_body_str == baseline_body_str:
                 return BolaVerdict(
                     outcome="rejected",
-                    confidence=0.60,
+                    confidence=0.10,
                     severity="info",
                     reason=(
                         f"HTTP {attack_status}; single-token BOLA probe returned identical "
@@ -428,7 +428,7 @@ class BolaValidator:
         if unauth_status is not None and 200 <= unauth_status < 300:
             return BolaVerdict(
                 outcome="rejected",
-                confidence=0.90,
+                confidence=0.10,
                 severity="info",
                 reason=(
                     f"HTTP {attack_status}; unauthenticated request also returned "
@@ -477,7 +477,7 @@ class BolaValidator:
             ):
                 return BolaVerdict(
                     outcome="rejected",
-                    confidence=0.70,
+                    confidence=0.10,
                     severity="info",
                     reason=(
                         f"HTTP {attack_status}; user2 accessed own data — "

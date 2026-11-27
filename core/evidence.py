@@ -15,6 +15,8 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+from .validation_policy import normalize_validation_verdict
+
 logger = logging.getLogger(__name__)
 
 
@@ -284,6 +286,8 @@ class DetectionResult(BaseModel):
     ignored_generic_signals: list[str] = Field(default_factory=list)
     technical_signals: list[str] = Field(default_factory=list)
     new_technical_signals: list[str] = Field(default_factory=list)
+    payload_reflected: bool = False
+    reflection_only_signals: list[str] = Field(default_factory=list)
     validation_barrier: bool = False
     barrier_framework: Optional[str] = None
     barrier_details: list[str] = Field(default_factory=list)
@@ -579,6 +583,15 @@ def synthesize_observation_from_finding(finding: Finding) -> Observation:
                 differences = dict(prev["differences"])
             break
 
+    norm = normalize_validation_verdict(
+        outcome=outcome,
+        severity=finding.severity,
+        confidence=finding.confidence,
+        confirmed=finding.confirmed if outcome == "confirmed" else False,
+        has_baseline=baseline_status is not None,
+        has_independent_evidence=True,
+    )
+
     obs_id = "OBS-" + content_hash({
         "finding_id": finding.finding_id,
         "timestamp": finding.timestamp,
@@ -590,7 +603,7 @@ def synthesize_observation_from_finding(finding: Finding) -> Observation:
     return Observation(
         observation_id=obs_id,
         timestamp=finding.timestamp,
-        role="error" if outcome == "error" else "attack",
+        role="error" if norm.outcome == "error" else "attack",
         payload=finding.payload if finding.payload is not None else finding.evidence.payload,
         payload_hash=finding.evidence.payload_hash or content_hash(finding.payload),
         request_hash=finding.evidence.request_hash or content_hash({
@@ -610,13 +623,13 @@ def synthesize_observation_from_finding(finding: Finding) -> Observation:
         differences=differences,
         baseline_status_code=baseline_status,
         baseline_response_time_ms=baseline_time,
-        outcome=outcome,
-        severity=finding.severity,
-        confidence=finding.confidence,
-        validation_result=outcome,
+        outcome=norm.outcome,
+        severity=norm.severity,
+        confidence=norm.confidence,
+        validation_result=norm.outcome,
         error=(
             "; ".join(finding.evidence.response_signal)
-            if outcome == "error" and finding.evidence.response_signal
+            if norm.outcome == "error" and finding.evidence.response_signal
             else None
         ),
     )
@@ -646,10 +659,40 @@ def build_finding_from_observations(
     if not observations:
         raise ValueError("observations must contain at least one Observation")
 
-    rep = _select_representative_observation(observations)
-    lifecycle = summarize_lifecycle([o.outcome for o in observations])
+    normalized_observations: list[Observation] = []
+    for obs in observations:
+        norm = normalize_validation_verdict(
+            outcome=obs.outcome,
+            severity=obs.severity,
+            confidence=obs.confidence,
+            confirmed=(True if obs.outcome == "confirmed" else False),
+            has_baseline=True,
+            has_independent_evidence=True,
+        )
+        normalized_observations.append(
+            obs.model_copy(
+                update={
+                    "outcome": norm.outcome,
+                    "severity": norm.severity,
+                    "confidence": norm.confidence,
+                    "validation_result": "error" if norm.outcome == "error" else norm.outcome,
+                }
+            )
+        )
+
+    rep = _select_representative_observation(normalized_observations)
+    lifecycle = summarize_lifecycle([o.outcome for o in normalized_observations])
     confirmed = lifecycle == "confirmed"
-    error_count = sum(1 for o in observations if o.outcome == "error")
+    error_count = sum(1 for o in normalized_observations if o.outcome == "error")
+
+    rep_verdict = normalize_validation_verdict(
+        outcome=lifecycle,
+        severity=rep.severity,
+        confidence=rep.confidence,
+        confirmed=confirmed,
+        has_baseline=True,
+        has_independent_evidence=True,
+    )
 
     prev_obs: list[dict[str, Any]] = []
     if rep.baseline_status_code is not None:
@@ -693,17 +736,17 @@ def build_finding_from_observations(
         status_code=rep.status_code,
         response_time_ms=rep.response_time_ms,
         evidence=evidence_model,
-        severity=rep.severity,
-        confidence=rep.confidence,
-        confirmed=confirmed,
-        lifecycle=lifecycle,
+        severity=rep_verdict.severity,
+        confidence=rep_verdict.confidence,
+        confirmed=rep_verdict.confirmed,
+        lifecycle=rep_verdict.outcome,
         fingerprint=fingerprint,
         cve_matches=list(dict.fromkeys(cve_matches or [])),
         cve_match_type=cve_match_type,
         cve_confidence=cve_confidence,
         curl_command=curl_command,
-        observations=list(observations),
-        observation_count=len(observations),
+        observations=normalized_observations,
+        observation_count=len(normalized_observations),
         error_count=error_count,
     )
 

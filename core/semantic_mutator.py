@@ -164,7 +164,7 @@ class SemanticMutationEngine:
                     attack_type="SQL_INJECTION",
                     payload_value=f"{resolved_seed}' OR '1'='1",
                     owasp_category="API8:2023",
-                    expected_signal=["sql", "syntax", "postgres", "sqlite", "traceback"],
+                    expected_signal=["sql syntax", "syntax error", "postgres", "sqlite", "psql", "traceback"],
                     description=f"Live seed-anchored SQL injection probe ({resolved_seed})",
                 ))
 
@@ -185,7 +185,7 @@ class SemanticMutationEngine:
                 attack_type="SQL_INJECTION",
                 payload_value="00000000-0000-0000-0000-000000000000' OR '1'='1",
                 owasp_category="API8:2023",
-                expected_signal=["sql", "syntax", "postgres", "sqlite", "psql", "traceback"],
+                expected_signal=["sql syntax", "syntax error", "postgres", "sqlite", "psql", "traceback"],
                 description="UUID string-interpolation SQL canary probe",
             ))
             return probes
@@ -205,9 +205,9 @@ class SemanticMutationEngine:
             # SQLi: valid RFC 5322 local-part SQL canary
             probes.append(SemanticProbe(
                 attack_type="SQL_INJECTION",
-                payload_value="probe.sqli'OR'1'='1@canary.local",
+                payload_value="probe.auth'OR'1'='1@canary.local",
                 owasp_category="API8:2023",
-                expected_signal=["sql", "syntax", "sqlite", "psql", "traceback"],
+                expected_signal=["sql syntax", "syntax error", "postgres", "sqlite", "psql", "traceback"],
                 description="RFC 5322 compliant SQL injection canary email",
             ))
             # SSTI: valid email format with high-entropy template expression
@@ -274,7 +274,7 @@ class SemanticMutationEngine:
                 attack_type="SQL_INJECTION",
                 payload_value="1970-01-01' OR '1'='1",
                 owasp_category="API8:2023",
-                expected_signal=["sql", "syntax", "sqlite", "psql", "traceback"],
+                expected_signal=["sql syntax", "syntax error", "postgres", "sqlite", "psql", "traceback"],
                 description="Date-prefixed SQL injection probe",
             ))
             return probes
@@ -378,7 +378,7 @@ class SemanticMutationEngine:
                 attack_type="SQL_INJECTION",
                 payload_value="1' OR '1'='1",
                 owasp_category="API8:2023",
-                expected_signal=["sql", "syntax", "sqlite", "psql", "traceback"],
+                expected_signal=["sql syntax", "syntax error", "postgres", "sqlite", "psql", "traceback"],
                 description="Standard SQL injection canary probe",
             ),
             SemanticProbe(
@@ -420,7 +420,7 @@ class SemanticMutationEngine:
                 attack_type="NOSQL_INJECTION",
                 payload_value='{"$ne": null}',
                 owasp_category="API8:2023",
-                expected_signal=["$ne", "mongo", "bson", "syntaxerror"],
+                expected_signal=["mongo", "mongodb", "bson", "syntaxerror", "cast to objectid"],
                 description="NoSQL operator injection probe",
             ),
             SemanticProbe(

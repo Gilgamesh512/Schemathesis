@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .remediation_engine import RemediationEngine
+from .validation_policy import sanitize_confidence
 
 
 def build_sarif_document(
@@ -96,11 +97,18 @@ def build_sarif_document(
             endpoint_raw = str(f.get("endpoint", "/"))
             artifact_uri = urllib.parse.quote(endpoint_raw, safe="/:@?&=#%+")
 
+        lifecycle_val = str(
+            f.get("lifecycle") or f.get("outcome") or ("confirmed" if f.get("confirmed") else "unknown")
+        ).strip().lower()
+        confidence_val, _ = sanitize_confidence(f.get("confidence"), default=0.0)
+
         finding_props: dict[str, Any] = {
             "finding_id": f.get("finding_id", ""),
             "target_app": f.get("target_app", ""),
             "confirmed": bool(f.get("confirmed", False)),
-            "lifecycle": str(f.get("lifecycle") or ("confirmed" if f.get("confirmed") else "unknown")),
+            "lifecycle": lifecycle_val,
+            "outcome": lifecycle_val,
+            "confidence": confidence_val,
             "observation_count": int(f.get("observation_count") or 0),
             "error_count": int(f.get("error_count") or 0),
             "severity": sev,

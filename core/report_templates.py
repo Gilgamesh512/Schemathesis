@@ -8,6 +8,7 @@ from typing import Any
 
 from .curl_builder import build_curl_dual_from_finding
 from .remediation_engine import RemediationEngine
+from .validation_policy import sanitize_confidence
 
 
 def render_finding_card(
@@ -21,16 +22,30 @@ def render_finding_card(
     """Render one collapsible HTML card for a security finding."""
     sev = finding["severity"].lower()
     _, hex_color = severity_colors.get(sev, ("", "#64748b"))
-    is_confirmed = finding["confirmed"]
-    confirmed_badge = (
-        '<span class="badge badge-confirmed">CONFIRMED VULNERABILITY</span>'
-        if is_confirmed
-        else '<span class="badge badge-unconfirmed">PROBE / UNCONFIRMED</span>'
+    is_confirmed = bool(finding["confirmed"])
+    lifecycle = str(
+        finding.get("lifecycle") or finding.get("outcome") or ("confirmed" if is_confirmed else "unknown")
+    ).strip().lower()
+    confidence_val, _ = sanitize_confidence(finding.get("confidence"), default=0.0)
+    confidence_pct = int(round(confidence_val * 100))
+
+    lifecycle_badge_classes = {
+        "confirmed": ("badge-confirmed", "CONFIRMED VULNERABILITY"),
+        "candidate": ("badge-candidate", "CANDIDATE"),
+        "inconclusive": ("badge-inconclusive", "INCONCLUSIVE"),
+        "rejected": ("badge-rejected", "REJECTED"),
+        "error": ("badge-error", "ERROR"),
+    }
+    badge_cls, badge_label = lifecycle_badge_classes.get(
+        lifecycle,
+        ("badge-inconclusive", html.escape(lifecycle.upper() or "UNKNOWN")),
     )
+    confirmed_badge = f'<span class="badge {badge_cls}">{badge_label}</span>'
     sev_badge = (
         f'<span class="badge" style="background-color: {hex_color}22; '
         f'color: {hex_color}; border: 1px solid {hex_color}55;">{sev.upper()}</span>'
     )
+    confidence_badge = f'<span class="confidence-tag">Confidence: {confidence_pct}%</span>'
 
     raw_payload = finding.get("payload")
     if isinstance(raw_payload, (dict, list)):
@@ -68,7 +83,7 @@ def render_finding_card(
     ) or '<span style="color: #64748b;">None</span>'
 
     return f"""
-            <div class="finding-card severity-{sev} {'is-confirmed' if is_confirmed else ''}" data-severity="{sev}" data-confirmed="{str(is_confirmed).lower()}">
+            <div class="finding-card severity-{sev} {'is-confirmed' if is_confirmed else ''}" data-severity="{sev}" data-confirmed="{str(is_confirmed).lower()}" data-lifecycle="{html.escape(lifecycle)}">
                 <div class="finding-header" onclick="toggleDetails('{index}')">
                     <div class="finding-title">
                         <span class="method-tag method-{html.escape(finding['method'])}">{html.escape(finding['method'])}</span>
@@ -77,6 +92,7 @@ def render_finding_card(
                         {confirmed_badge}
                     </div>
                     <div class="finding-meta">
+                        {confidence_badge}
                         <span class="status-code">HTTP {finding.get('status_code') or '---'}</span>
                         <span class="latency">{finding.get('response_time_ms') or 0} ms</span>
                         <span class="expand-icon" id="icon-{index}">▼</span>
@@ -88,7 +104,8 @@ def render_finding_card(
                             <h4>Attack Details</h4>
                             <p><strong>Target App:</strong> <code>{html.escape(str(finding.get('target_app') or 'N/A'))}</code></p>
                             <p><strong>Attack Type:</strong> {html.escape(finding['attack_type'])}</p>
-                            <p><strong>Lifecycle:</strong> <code>{html.escape(str(finding.get('lifecycle') or ('confirmed' if is_confirmed else 'unknown')))}</code> (Observations: {int(finding.get('observation_count') or 0)}, Errors: {int(finding.get('error_count') or 0)})</p>
+                            <p><strong>Lifecycle:</strong> <code>{html.escape(lifecycle)}</code> (Observations: {int(finding.get('observation_count') or 0)}, Errors: {int(finding.get('error_count') or 0)})</p>
+                            <p><strong>Vulnerability Confidence:</strong> <code>{confidence_val:.2f}</code> ({confidence_pct}%)</p>
                             <p><strong>OWASP Category:</strong> {html.escape(owasp_cat)} - {html.escape(owasp_metadata.get(owasp_cat, {}).get('name', 'N/A'))}</p>
                             <p><strong>Matched CVEs:</strong> {cve_badges}</p>
                             <p><strong>Run ID:</strong> <code>{html.escape(str(finding.get('run_id') or 'N/A'))}</code></p>
@@ -338,7 +355,12 @@ def render_html_document(
             text-transform: uppercase;
         }}
         .badge-confirmed {{ background: rgba(239, 68, 68, 0.2); color: var(--critical); border: 1px solid rgba(239, 68, 68, 0.4); }}
+        .badge-candidate {{ background: rgba(234, 179, 8, 0.16); color: var(--medium); border: 1px solid rgba(234, 179, 8, 0.4); }}
+        .badge-inconclusive {{ background: rgba(56, 189, 248, 0.14); color: var(--accent); border: 1px solid rgba(56, 189, 248, 0.35); }}
+        .badge-rejected {{ background: rgba(100, 116, 139, 0.15); color: var(--text-secondary); border: 1px solid rgba(100, 116, 139, 0.3); }}
+        .badge-error {{ background: rgba(249, 115, 22, 0.18); color: var(--high); border: 1px solid rgba(249, 115, 22, 0.4); }}
         .badge-unconfirmed {{ background: rgba(100, 116, 139, 0.15); color: var(--text-secondary); }}
+        .confidence-tag {{ font-size: 12px; color: #cbd5e1; background: rgba(30, 41, 59, 0.8); padding: 2px 8px; border-radius: 9999px; border: 1px solid var(--border); }}
         .finding-meta {{ display: flex; align-items: center; gap: 14px; color: var(--text-secondary); font-size: 13px; }}
         .expand-icon {{ font-size: 10px; color: var(--text-secondary); }}
         .finding-details {{

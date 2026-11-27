@@ -136,7 +136,7 @@ class SstiValidator:
             if raw_reflected:
                 return SstiVerdict(
                     outcome="rejected",
-                    confidence=0.75,
+                    confidence=0.10,
                     severity="info",
                     reason=(
                         f"HTTP {attack_status}; template payload reflected verbatim without evaluation"
@@ -146,7 +146,7 @@ class SstiValidator:
                 )
             return SstiVerdict(
                 outcome="rejected",
-                confidence=0.15,
+                confidence=0.10,
                 severity="info",
                 reason=f"HTTP {attack_status}; expected SSTI evaluation result '{initial_expected}' not present",
                 evidence_refs=[f"http_{attack_status}"],
@@ -156,7 +156,7 @@ class SstiValidator:
         if in_baseline:
             return SstiVerdict(
                 outcome="rejected",
-                confidence=0.80,
+                confidence=0.10,
                 severity="info",
                 reason=(
                     f"HTTP {attack_status}; signal '{initial_expected}' was already present in baseline response"
@@ -199,7 +199,7 @@ class SstiValidator:
             if not sec_ok:
                 return SstiVerdict(
                     outcome="rejected",
-                    confidence=0.70,
+                    confidence=0.10,
                     severity="info",
                     reason=(
                         f"HTTP {attack_status}; initial signal '{initial_expected}' matched but "

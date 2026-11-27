@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import contextvars
 import hashlib
+import html
 import json
 import logging
 import os
@@ -27,7 +28,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, quote_plus, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,7 @@ from core import (
     ParamSchema,
     CleanupTracker,
     get_audit_headers,
+    normalize_validation_verdict,
     verify_deep_state_persistence,
 )
 
@@ -740,6 +742,126 @@ def _is_generic_or_low_entropy_signal(signal: str) -> bool:
     return False
 
 
+_MIN_REFLECTION_PAYLOAD_LEN = 4
+_TRIVIAL_REFLECTION_TOKENS = frozenset({"true", "false", "null", "none"})
+
+
+def _build_reflection_variants(payload_value: Any) -> list[str]:
+    """Return lowercased deterministic payload encodings for reflection-span matching.
+
+    Only non-trivial string payloads (len >= 4 after strip, excluding boolean/null
+    literals) are eligible so numeric/boolean/short values never mask response text.
+    """
+    if not isinstance(payload_value, str):
+        return []
+    stripped = payload_value.strip()
+    if len(stripped) < _MIN_REFLECTION_PAYLOAD_LEN or stripped.lower() in _TRIVIAL_REFLECTION_TOKENS:
+        return []
+
+    raw_variants: list[str] = [payload_value]
+    try:
+        json_utf8 = json.dumps(payload_value, ensure_ascii=False)[1:-1]
+        json_ascii = json.dumps(payload_value, ensure_ascii=True)[1:-1]
+        raw_variants.extend((json_utf8, json_ascii, json_utf8.replace("/", r"\/")))
+        # HTML-safe JSON escaping used by some serializers (\u003c, \u003e, \u0026, \u0027)
+        if any(ch in payload_value for ch in "<>&'"):
+            raw_variants.append(
+                json_utf8.replace("<", r"\u003c")
+                .replace(">", r"\u003e")
+                .replace("&", r"\u0026")
+                .replace("'", r"\u0027")
+            )
+    except (TypeError, ValueError):
+        pass
+
+    raw_variants.extend((
+        quote(payload_value, safe=""),
+        quote_plus(payload_value),
+        quote(payload_value, safe="/:"),
+        quote(payload_value, safe=":"),
+    ))
+
+    html_quoted = html.escape(payload_value, quote=True)
+    html_unquoted = html.escape(payload_value, quote=False)
+    raw_variants.extend((html_quoted, html_unquoted))
+    if "'" in payload_value:
+        raw_variants.append(html_quoted.replace("&#x27;", "&#39;"))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in raw_variants:
+        lowered = item.lower()
+        if len(lowered.strip()) >= _MIN_REFLECTION_PAYLOAD_LEN and lowered not in seen:
+            seen.add(lowered)
+            deduped.append(lowered)
+    return deduped
+
+
+def _find_reflected_spans(body_lower: str, payload_value: Any) -> list[tuple[int, int]]:
+    """Locate sorted, merged [start, end) intervals where *payload_value* is reflected."""
+    if not body_lower:
+        return []
+    variants = _build_reflection_variants(payload_value)
+    if not variants:
+        return []
+
+    spans: list[tuple[int, int]] = []
+    for variant in variants:
+        v_len = len(variant)
+        pos = 0
+        while True:
+            idx = body_lower.find(variant, pos)
+            if idx == -1:
+                break
+            spans.append((idx, idx + v_len))
+            pos = idx + v_len
+
+    if not spans:
+        return []
+
+    spans.sort()
+    merged: list[tuple[int, int]] = [spans[0]]
+    for start, end in spans[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            if end > prev_end:
+                merged[-1] = (prev_start, end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _classify_signal_against_spans(
+    body_lower: str,
+    signal: str,
+    reflected_spans: list[tuple[int, int]],
+) -> tuple[bool, bool]:
+    """Return ``(has_independent_occurrence, has_reflected_occurrence)`` for *signal*."""
+    if not body_lower or not signal:
+        return False, False
+    if not reflected_spans:
+        return (signal in body_lower), False
+
+    sig_len = len(signal)
+    pos = 0
+    has_independent = False
+    has_reflected = False
+    while True:
+        idx = body_lower.find(signal, pos)
+        if idx == -1:
+            break
+        occ_end = idx + sig_len
+        inside = any(span_start <= idx and occ_end <= span_end for span_start, span_end in reflected_spans)
+        if inside:
+            has_reflected = True
+        else:
+            has_independent = True
+            if has_reflected:
+                break
+        pos = idx + 1
+    return has_independent, has_reflected
+
+
 def detect_response(
     resp,
     payload: Payload,
@@ -753,6 +875,7 @@ def detect_response(
     body_text = resp.text or ""
     body_lower = body_text.lower()
     attack_type = payload.attack_type.strip().upper()
+    is_xss = attack_type == "XSS"
 
     has_baseline = baseline_resp is not None
     baseline_status = getattr(baseline_resp, "status_code", None) if has_baseline else None
@@ -798,9 +921,13 @@ def detect_response(
 
     cve_ids = [item["cve_id"] for item in matched_cves]
 
+    reflected_spans = _find_reflected_spans(body_lower, payload.payload_value)
+    payload_reflected = bool(reflected_spans)
+
     new_expected: list[str] = []
     preexisting_expected: list[str] = []
     ignored_generic: list[str] = []
+    reflection_only: list[str] = []
 
     for sig in expected_signals:
         if sig not in body_lower:
@@ -809,14 +936,31 @@ def detect_response(
             ignored_generic.append(sig)
         elif has_baseline and sig in baseline_text_lower:
             preexisting_expected.append(sig)
+        elif not is_xss and reflected_spans:
+            has_indep, has_refl = _classify_signal_against_spans(body_lower, sig, reflected_spans)
+            if not has_indep and has_refl:
+                if sig not in reflection_only:
+                    reflection_only.append(sig)
+            else:
+                new_expected.append(sig)
         else:
             new_expected.append(sig)
 
-    technical_hits = [s for s in technical_catalog if s in body_lower]
-    new_technical_hits = [
-        s for s in technical_hits
-        if not (has_baseline and s in baseline_text_lower)
-    ]
+    technical_hits: list[str] = []
+    new_technical_hits: list[str] = []
+    for s in technical_catalog:
+        if s not in body_lower:
+            continue
+        in_baseline = bool(has_baseline and s in baseline_text_lower)
+        if reflected_spans and not in_baseline:
+            has_indep, has_refl = _classify_signal_against_spans(body_lower, s, reflected_spans)
+            if not has_indep and has_refl:
+                if s not in reflection_only:
+                    reflection_only.append(s)
+                continue
+        technical_hits.append(s)
+        if not in_baseline:
+            new_technical_hits.append(s)
 
     for sig in dict.fromkeys(generic_signals):
         if sig not in technical_catalog and sig not in expected_signals and sig in body_lower and sig not in ignored_generic:
@@ -861,6 +1005,8 @@ def detect_response(
         ignored_generic_signals=ignored_generic,
         technical_signals=technical_hits,
         new_technical_signals=new_technical_hits,
+        payload_reflected=payload_reflected,
+        reflection_only_signals=reflection_only,
         validation_barrier=validation_barrier,
         barrier_framework=barrier_framework,
         barrier_details=barrier_details,
@@ -884,21 +1030,46 @@ def decide_validation(detection: DetectionResult, payload: Payload) -> Validatio
     def _with_refs(*refs: str) -> list[str]:
         return [r for r in refs if r]
 
+    def _decision(
+        *,
+        outcome: str,
+        confidence: float,
+        severity: str,
+        reason: str,
+        evidence_refs: list[str],
+        is_confirmed: bool = False,
+    ) -> ValidationDecision:
+        verdict = normalize_validation_verdict(
+            outcome=outcome,
+            severity=severity,
+            confidence=confidence,
+            confirmed=is_confirmed,
+            has_baseline=detection.has_baseline,
+            has_independent_evidence=False,
+        )
+        return ValidationDecision(
+            outcome=verdict.outcome,
+            confidence=verdict.confidence,
+            severity=verdict.severity,
+            reason=reason,
+            evidence_refs=evidence_refs,
+            is_candidate=(verdict.outcome == "candidate"),
+            is_confirmed=verdict.confirmed,
+        )
+
     # 1. Invalid/rejected authorization probe is not evidence of a bypass.
     if attack_type in ("BOLA", "IDOR", "BFLA", "AUTH_BYPASS") and status in (400, 401, 403, 404):
-        return ValidationDecision(
+        return _decision(
             outcome="rejected",
             confidence=0.10,
             severity="info",
             reason=f"HTTP {status}; authorization probe rejected or invalid; no bypass established",
             evidence_refs=_with_refs(f"http_{status}"),
-            is_candidate=False,
-            is_confirmed=False,
         )
 
     # 1b. BOLA/IDOR HTTP 2xx requires dedicated authorization validator — keep inconclusive here.
     if attack_type in ("BOLA", "IDOR") and 200 <= status <= 299:
-        return ValidationDecision(
+        return _decision(
             outcome="inconclusive",
             confidence=0.20,
             severity="info",
@@ -907,8 +1078,6 @@ def decide_validation(detection: DetectionResult, payload: Payload) -> Validatio
                 "requires dedicated authorization validator for disposition"
             ),
             evidence_refs=_with_refs(f"http_{status}"),
-            is_candidate=False,
-            is_confirmed=False,
         )
 
     relevant_tech = detection.new_technical_signals if detection.has_baseline else detection.technical_signals
@@ -917,7 +1086,7 @@ def decide_validation(detection: DetectionResult, payload: Payload) -> Validatio
     # while preserving meaningful new canaries or technical backend faults.
     if detection.validation_barrier:
         if detection.new_expected_signals:
-            return ValidationDecision(
+            return _decision(
                 outcome="candidate",
                 confidence=0.45 if detection.has_baseline else 0.30,
                 severity="low",
@@ -926,8 +1095,6 @@ def decide_validation(detection: DetectionResult, payload: Payload) -> Validatio
                     f"{detection.new_expected_signals[:3]}{limitation_suffix}"
                 ),
                 evidence_refs=detection.new_expected_signals[:3],
-                is_candidate=True,
-                is_confirmed=False,
             )
 
         meaningful_tech = [
@@ -936,7 +1103,7 @@ def decide_validation(detection: DetectionResult, payload: Payload) -> Validatio
             or s in ("traceback", "stack trace", "unhandled exception", "internal server error")
         ]
         if meaningful_tech:
-            return ValidationDecision(
+            return _decision(
                 outcome="candidate",
                 confidence=0.40 if detection.has_baseline else 0.30,
                 severity="low",
@@ -945,8 +1112,6 @@ def decide_validation(detection: DetectionResult, payload: Payload) -> Validatio
                     f"{meaningful_tech[:3]}{limitation_suffix}"
                 ),
                 evidence_refs=meaningful_tech[:3],
-                is_candidate=True,
-                is_confirmed=False,
             )
 
         barrier_desc = "; ".join(detection.barrier_details) if detection.barrier_details else "input rejected"
@@ -955,17 +1120,21 @@ def decide_validation(detection: DetectionResult, payload: Payload) -> Validatio
             if detection.ignored_generic_signals
             else ""
         )
-        return ValidationDecision(
+        refl_note = (
+            f"; reflection-only signals ignored: {detection.reflection_only_signals[:3]}"
+            if detection.reflection_only_signals
+            else ""
+        )
+        return _decision(
             outcome="rejected",
             confidence=0.15,
             severity="info",
-            reason=f"HTTP {status}; Schema validation barrier ({detection.barrier_framework or 'generic'}): {barrier_desc}{ignored_note}",
+            reason=f"HTTP {status}; Schema validation barrier ({detection.barrier_framework or 'generic'}): {barrier_desc}{ignored_note}{refl_note}",
             evidence_refs=_with_refs(f"validation_barrier:{detection.barrier_framework or 'generic'}"),
-            is_candidate=False,
-            is_confirmed=False,
         )
 
     # 3. Server 5xx errors warrant investigation unless baseline itself already returned 5xx with no new signals.
+    # Unconfirmed 5xx candidates are capped at medium (with meaningful technical signals) or low (generic 5xx).
     if status >= 500:
         details = detection.new_expected_signals + detection.new_technical_signals
         if (
@@ -974,7 +1143,7 @@ def decide_validation(detection: DetectionResult, payload: Payload) -> Validatio
             and detection.baseline_status_code >= 500
             and not details
         ):
-            return ValidationDecision(
+            return _decision(
                 outcome="inconclusive",
                 confidence=0.20,
                 severity="info",
@@ -983,46 +1152,53 @@ def decide_validation(detection: DetectionResult, payload: Payload) -> Validatio
                     "without new payload-specific or technical error signals"
                 ),
                 evidence_refs=[f"baseline_http_{detection.baseline_status_code}", f"http_{status}"],
-                is_candidate=False,
-                is_confirmed=False,
             )
 
-        sev = SEVERITY_BY_STATUS.get(status, "high")
-        return ValidationDecision(
+        meaningful_5xx_signals = [s for s in details if s != "internal server error"]
+        if meaningful_5xx_signals:
+            return _decision(
+                outcome="candidate",
+                confidence=0.55 if detection.has_baseline else 0.40,
+                severity="medium" if detection.has_baseline else "low",
+                reason=(
+                    f"HTTP {status}; server-error candidate with technical/payload signals: "
+                    f"{meaningful_5xx_signals[:3]}{limitation_suffix}"
+                ),
+                evidence_refs=meaningful_5xx_signals[:3],
+            )
+
+        return _decision(
             outcome="candidate",
-            confidence=0.55 if detection.has_baseline else 0.35,
-            severity=sev,
-            reason=f"HTTP {status}; server-error candidate; technical/payload signals: {details[:3]}{limitation_suffix}",
+            confidence=0.40 if detection.has_baseline else 0.30,
+            severity="low",
+            reason=(
+                f"HTTP {status}; generic server-error candidate without specific technical signals"
+                f"{limitation_suffix}"
+            ),
             evidence_refs=details[:3] or [f"http_{status}"],
-            is_candidate=True,
-            is_confirmed=False,
         )
 
     # 4. Only non-generic, high-specificity signals NOT present in baseline may raise a candidate.
     if detection.new_expected_signals:
-        return ValidationDecision(
+        return _decision(
             outcome="candidate",
             confidence=0.55 if detection.has_baseline else 0.35,
             severity="low",
             reason=f"HTTP {status}; new payload-specific signal: {detection.new_expected_signals[:3]}{limitation_suffix}",
             evidence_refs=detection.new_expected_signals[:3],
-            is_candidate=True,
-            is_confirmed=False,
         )
 
     # 5. Technical SQL error signals on SQLi probes.
     if relevant_tech and attack_type in ("SQLI", "SQL_INJECTION", "SQL INJECTION"):
-        return ValidationDecision(
+        return _decision(
             outcome="candidate",
             confidence=0.55 if detection.has_baseline else 0.35,
             severity="medium" if detection.has_baseline else "low",
             reason=f"HTTP {status}; technical SQL/error signal: {relevant_tech[:3]}{limitation_suffix}",
             evidence_refs=relevant_tech[:3],
-            is_candidate=True,
-            is_confirmed=False,
         )
 
-    # 6. Time-based blind injection latency anomaly (requires significant delta when baseline latency is known).
+    # 6. Time-based blind injection latency anomaly (single-probe remains candidate/medium; requires significant delta when baseline latency is known).
     elapsed_ms = detection.metadata.get("elapsed_ms")
     latency_delta_ms = detection.metadata.get("latency_delta_ms")
     if elapsed_ms is not None and elapsed_ms >= 3500:
@@ -1032,7 +1208,7 @@ def decide_validation(detection: DetectionResult, payload: Payload) -> Validatio
         )
         if is_time_attack:
             if detection.has_baseline and latency_delta_ms is not None and latency_delta_ms < 3500:
-                return ValidationDecision(
+                return _decision(
                     outcome="inconclusive",
                     confidence=0.20,
                     severity="info",
@@ -1041,22 +1217,18 @@ def decide_validation(detection: DetectionResult, payload: Payload) -> Validatio
                         f"(delta={latency_delta_ms}ms < 3500ms)"
                     ),
                     evidence_refs=[f"time_delta_{latency_delta_ms}ms"],
-                    is_candidate=False,
-                    is_confirmed=False,
                 )
-            return ValidationDecision(
+            return _decision(
                 outcome="candidate",
                 confidence=0.60 if detection.has_baseline else 0.40,
-                severity="high",
+                severity="medium",
                 reason=f"HTTP {status}; significant time delay observed ({elapsed_ms}ms >= 3500ms){limitation_suffix}",
                 evidence_refs=[f"time_delay_{elapsed_ms}ms"],
-                is_candidate=True,
-                is_confirmed=False,
             )
 
     # 7. Pre-existing signal already present in baseline is not evidence of injection/exploit.
     if detection.preexisting_expected_signals:
-        return ValidationDecision(
+        return _decision(
             outcome="rejected",
             confidence=0.10,
             severity="info",
@@ -1065,13 +1237,24 @@ def decide_validation(detection: DetectionResult, payload: Payload) -> Validatio
                 f"(not introduced by payload): {detection.preexisting_expected_signals[:3]}"
             ),
             evidence_refs=detection.preexisting_expected_signals[:3],
-            is_candidate=False,
-            is_confirmed=False,
+        )
+
+    # 7b. Signals appearing solely inside reflected payload input are not independent backend evidence.
+    if detection.reflection_only_signals:
+        return _decision(
+            outcome="rejected",
+            confidence=0.10,
+            severity="info",
+            reason=(
+                f"HTTP {status}; matched signal(s) appeared only inside reflected payload "
+                f"(not independent backend evidence): {detection.reflection_only_signals[:3]}{limitation_suffix}"
+            ),
+            evidence_refs=detection.reflection_only_signals[:3],
         )
 
     # 8. Generic or low-entropy keywords alone never create a candidate.
     if detection.ignored_generic_signals:
-        return ValidationDecision(
+        return _decision(
             outcome="rejected",
             confidence=0.10,
             severity="info",
@@ -1080,13 +1263,11 @@ def decide_validation(detection: DetectionResult, payload: Payload) -> Validatio
                 f"{detection.ignored_generic_signals[:3]}{limitation_suffix}"
             ),
             evidence_refs=detection.ignored_generic_signals[:3],
-            is_candidate=False,
-            is_confirmed=False,
         )
 
     # 9. Generic response/hash/status differences alone never establish vulnerability.
     if detection.response_differences:
-        return ValidationDecision(
+        return _decision(
             outcome="rejected",
             confidence=0.15,
             severity="info",
@@ -1095,18 +1276,14 @@ def decide_validation(detection: DetectionResult, payload: Payload) -> Validatio
                 f"({sorted(detection.response_differences.keys())}){limitation_suffix}"
             ),
             evidence_refs=sorted(detection.response_differences.keys()),
-            is_candidate=False,
-            is_confirmed=False,
         )
 
-    return ValidationDecision(
+    return _decision(
         outcome="rejected",
         confidence=0.10,
         severity="info",
         reason=f"HTTP {status}; no sufficiently specific vulnerability signal{limitation_suffix}",
         evidence_refs=[],
-        is_candidate=False,
-        is_confirmed=False,
     )
 
 
@@ -1480,6 +1657,7 @@ async def process_fingerprint_group(
         bola_verdict = None
         boundary_verdict = None
         ssti_verdict = None
+        mass_assignment_outcome: Optional[str] = None
 
         try:
             async def execute_baseline():
@@ -1662,11 +1840,14 @@ async def process_fingerprint_group(
                     )
                     if is_persisted:
                         confirmed = True
+                        mass_assignment_outcome = "confirmed"
                         confidence = 0.98
                         severity = "critical" if pc.payload.target_param in ("role", "is_admin", "admin") else "high"
                         evidence = f"HTTP {status_code}; {verify_msg}"
                     else:
                         confirmed = False
+                        mass_assignment_outcome = "rejected"
+                        confidence = 0.10
                         severity = "info"
                         evidence = f"HTTP {status_code}; Loopback verification unpersisted: {verify_msg}"
                 except Exception as verify_err:
@@ -1694,6 +1875,8 @@ async def process_fingerprint_group(
         elapsed_ms = result.attack.response_time_ms if result and result.attack else 0.0
         if confirmed:
             outcome = "confirmed"
+        elif mass_assignment_outcome is not None:
+            outcome = mass_assignment_outcome
         elif bola_verdict is not None and pc.payload.attack_type.upper() in ("BOLA", "IDOR"):
             outcome = bola_verdict.outcome
         elif boundary_verdict is not None and pc.payload.attack_type.upper() in ("INTEGER_OVERFLOW", "BOUNDARY_ANALYSIS"):
@@ -1704,6 +1887,34 @@ async def process_fingerprint_group(
             outcome = decision_obj.outcome
         else:
             outcome = "candidate" if result.candidate else "rejected"
+
+        has_baseline_obs = baseline_response is not None or (result is not None and result.baseline is not None)
+        has_independent_obs = bool(
+            (bola_verdict is not None and bola_verdict.outcome in ("confirmed", "candidate"))
+            or (boundary_verdict is not None and boundary_verdict.outcome in ("confirmed", "candidate"))
+            or (ssti_verdict is not None and ssti_verdict.outcome == "confirmed")
+            or mass_assignment_outcome == "confirmed"
+        )
+        has_val_ev = bool(
+            (bola_verdict is not None and bola_verdict.ownership_checked)
+            or (boundary_verdict is not None and boundary_verdict.anomaly_kind is not None)
+            or (ssti_verdict is not None and ssti_verdict.differential_verified)
+            or mass_assignment_outcome == "confirmed"
+        ) if outcome == "confirmed" else True
+
+        normalized_verdict = normalize_validation_verdict(
+            outcome=outcome,
+            severity=severity,
+            confidence=confidence,
+            confirmed=confirmed,
+            has_baseline=has_baseline_obs,
+            has_independent_evidence=has_independent_obs,
+            has_validation_evidence=has_val_ev,
+        )
+        outcome = normalized_verdict.outcome
+        confirmed = normalized_verdict.confirmed
+        severity = normalized_verdict.severity
+        confidence = normalized_verdict.confidence
 
         if cve_ids and outcome in ("candidate", "confirmed") and pc.payload.technology:
             cve_matches_acc = list(dict.fromkeys(cve_matches_acc + cve_ids))

@@ -1,0 +1,350 @@
+openapi: 3.0.3
+info:
+  title: P1.6 Deterministic Benchmark Lab API
+  version: "1.0.0"
+  description: Local deterministic API with known ground truth for DAST evaluation.
+servers:
+  - url: http://127.0.0.1:8000
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+paths:
+  /api/bola/vuln/orders/{id}:
+    get:
+      summary: Vulnerable BOLA integer order lookup
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Order detail
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          description: Unauthorized
+        "404":
+          description: Not found
+
+  /api/bola/vuln/accounts/{account_id}:
+    get:
+      summary: Vulnerable BOLA string/UUID account lookup
+      parameters:
+        - name: account_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Account detail
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          description: Unauthorized
+        "404":
+          description: Not found
+
+  /api/bola/secure/orders/{id}:
+    get:
+      summary: Secure strict ownership order lookup
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Own order detail
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden
+        "404":
+          description: Not found
+
+  /api/bola/secure/public-items/{id}:
+    get:
+      summary: Runtime public endpoint without explicit security override in spec
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Public item
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/bola/secure/open-catalog/{id}:
+    get:
+      summary: Explicitly public endpoint declaring security []
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Public catalog item
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/boundary/vuln/wraparound:
+    get:
+      summary: Vulnerable 32-bit integer wraparound
+      parameters:
+        - name: amount
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Computed total
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/boundary/vuln/products:
+    get:
+      summary: Vulnerable unbounded pagination
+      parameters:
+        - name: limit
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Product list
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/boundary/vuln/adjust:
+    post:
+      summary: Vulnerable negative business quantity
+      parameters:
+        - name: quantity
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        "201":
+          description: Stock adjusted
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/boundary/secure/products:
+    get:
+      summary: Secure clamped pagination
+      parameters:
+        - name: limit
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Clamped product list
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/boundary/secure/strict:
+    get:
+      summary: Secure strict numeric range validation
+      parameters:
+        - name: amount
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Valid amount
+          content:
+            application/json:
+              schema:
+                type: object
+        "422":
+          description: Validation barrier
+
+  /api/ssti/vuln/render:
+    get:
+      summary: Vulnerable template arithmetic renderer
+      parameters:
+        - name: tpl
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Rendered output
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/ssti/vuln/invite:
+    get:
+      summary: Vulnerable email template evaluator
+      parameters:
+        - name: email
+          in: query
+          required: true
+          schema:
+            type: string
+            format: email
+      responses:
+        "200":
+          description: Invite result
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/ssti/secure/echo:
+    get:
+      summary: Secure raw reflection without template evaluation
+      parameters:
+        - name: tpl
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Raw echo
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/ssti/secure/static-report:
+    get:
+      summary: Secure static response with coincidental numbers 49 and 77455597
+      parameters:
+        - name: tpl
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Static report
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/mass/vuln/profile:
+    get:
+      summary: Read mutable profile state
+      responses:
+        "200":
+          description: Profile state
+          content:
+            application/json:
+              schema:
+                type: object
+    put:
+      summary: Vulnerable mass assignment persisting role and is_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - display_name
+              properties:
+                display_name:
+                  type: string
+      responses:
+        "200":
+          description: Updated profile
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/mass/secure/profile:
+    get:
+      summary: Read protected profile state
+      responses:
+        "200":
+          description: Protected profile state
+          content:
+            application/json:
+              schema:
+                type: object
+    put:
+      summary: Secure profile DTO echo without persisting privileged fields
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - display_name
+              properties:
+                display_name:
+                  type: string
+      responses:
+        "200":
+          description: Echoed DTO
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/noise/secure/status:
+    get:
+      summary: Noise control endpoint returning generic JSON words and number 49
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Generic status payload
+          content:
+            application/json:
+              schema:
+                type: object

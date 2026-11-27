@@ -18,6 +18,7 @@ from typing import Any, Optional
 from .path_manager import ProjectPaths
 from .report_templates import render_html_document
 from .sarif_exporter import build_sarif_document
+from .validation_policy import sanitize_confidence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 logger = logging.getLogger(__name__)
@@ -170,15 +171,25 @@ class SecurityReporter:
 
     def _normalize_finding(self, raw: dict[str, Any]) -> dict[str, Any]:
         """Normalize finding fields across different runner versions."""
-        severity = str(raw.get("severity") or "info").lower().strip()
-        if severity not in SEVERITY_COLORS:
-            severity = "info"
-
         confirmed_raw = raw.get("confirmed")
         if isinstance(confirmed_raw, str):
             confirmed = confirmed_raw.lower() in {"true", "1", "yes"}
         else:
             confirmed = bool(confirmed_raw)
+
+        raw_lifecycle = raw.get("lifecycle") or raw.get("outcome")
+        if raw_lifecycle is not None and str(raw_lifecycle).strip():
+            lifecycle = str(raw_lifecycle).strip().lower()
+        else:
+            lifecycle = "confirmed" if confirmed else "unknown"
+
+        raw_severity = str(raw.get("severity") or "").lower().strip()
+        if lifecycle == "error" and raw_severity in {"", "unknown"}:
+            severity = "unknown"
+        elif raw_severity in SEVERITY_COLORS:
+            severity = raw_severity
+        else:
+            severity = "info"
 
         payload = raw.get("payload")
         if isinstance(payload, str):
@@ -238,7 +249,7 @@ class SecurityReporter:
         except (ValueError, TypeError):
             error_count = 0
 
-        lifecycle = str(raw.get("lifecycle") or ("confirmed" if confirmed else "unknown")).strip().lower()
+        confidence, _ = sanitize_confidence(raw.get("confidence"), default=0.0)
 
         return {
             "finding_id": str(raw.get("finding_id") or raw.get("fingerprint") or ""),
@@ -254,8 +265,10 @@ class SecurityReporter:
             "response_time_ms": response_time,
             "evidence": evidence_str,
             "severity": severity,
+            "confidence": confidence,
             "confirmed": confirmed,
             "lifecycle": lifecycle,
+            "outcome": lifecycle,
             "fingerprint": str(raw.get("fingerprint") or ""),
             "matched_cve": matched_cve,
             "curl_command": raw.get("curl_command") or "",

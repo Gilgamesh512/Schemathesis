@@ -1,6 +1,24 @@
 from __future__ import annotations
 
 from .auth_manager import AuthConfig, AuthManager
+from .benchmark_harness import (
+    AuthPreflightResult,
+    BenchmarkEvaluator,
+    ClassEvaluationMetrics,
+    CrossClassFalsePositive,
+    FindingTraceRecord,
+    GroundTruthExpectation,
+    GroundTruthManifest,
+    NoiseControlEndpoint,
+    OperationalErrorRecord,
+    SkippedPairInfo,
+    load_ground_truth_manifest,
+    normalize_endpoint,
+    normalize_vuln_class,
+    run_auth_preflight,
+    snapshot_files_integrity,
+    verify_isolation,
+)
 from .bola_validator import (
     BolaValidator,
     BolaVerdict,
@@ -146,6 +164,18 @@ from .semantic_mutator import (
 )
 from .target_manager import TargetConfig, TargetManager, TargetRegistry, target_config
 from .token_verifier import TokenInspection, TokenVerifier
+from .validation_policy import (
+    ALLOWED_SEVERITIES_BY_OUTCOME,
+    CANDIDATE_MAX_CONFIDENCE,
+    CANDIDATE_NO_BASELINE_MAX_CONFIDENCE,
+    CONFIRMED_MIN_CONFIDENCE,
+    INCONCLUSIVE_MAX_CONFIDENCE,
+    NormalizedVerdict,
+    REJECTED_MAX_CONFIDENCE,
+    VALID_OUTCOMES,
+    normalize_validation_verdict,
+    sanitize_confidence,
+)
 from .workflow_engine import (
     StepExecutionResult,
     WorkflowDefinition,
@@ -161,6 +191,22 @@ __all__ = [
     "ApiDiscoveryEngine",
     "AuthConfig",
     "AuthManager",
+    "AuthPreflightResult",
+    "BenchmarkEvaluator",
+    "ClassEvaluationMetrics",
+    "CrossClassFalsePositive",
+    "FindingTraceRecord",
+    "GroundTruthExpectation",
+    "GroundTruthManifest",
+    "NoiseControlEndpoint",
+    "OperationalErrorRecord",
+    "SkippedPairInfo",
+    "load_ground_truth_manifest",
+    "normalize_endpoint",
+    "normalize_vuln_class",
+    "run_auth_preflight",
+    "snapshot_files_integrity",
+    "verify_isolation",
     "BolaValidator",
     "BolaVerdict",
     "BoundaryValidator",
@@ -213,6 +259,16 @@ __all__ = [
     "SchemaManager",
     "TokenInspection",
     "TokenVerifier",
+    "ALLOWED_SEVERITIES_BY_OUTCOME",
+    "CANDIDATE_MAX_CONFIDENCE",
+    "CANDIDATE_NO_BASELINE_MAX_CONFIDENCE",
+    "CONFIRMED_MIN_CONFIDENCE",
+    "INCONCLUSIVE_MAX_CONFIDENCE",
+    "NormalizedVerdict",
+    "REJECTED_MAX_CONFIDENCE",
+    "VALID_OUTCOMES",
+    "normalize_validation_verdict",
+    "sanitize_confidence",
     "WorkflowDefinition",
     "WorkflowExecutionReport",
     "WorkflowRunner",

@@ -69,3 +69,37 @@ def test_generate_schema_valid_sample():
     assert "id" in sample
     assert "email" in sample
     assert "@" in sample["email"]
+
+
+def test_sqli_and_nosqli_probes_have_no_self_tainted_expected_signals():
+    from core.feedback_engine import FeedbackAnalysisResult, FeedbackAnalyzer, FieldValidationFailure
+
+    for fmt, p_type in (
+        (None, "string"),
+        ("email", "string"),
+        ("uuid", "string"),
+        ("date", "string"),
+    ):
+        schema = SemanticMutationEngine.inspect_param(
+            "field", "query", {"type": p_type, **({"format": fmt} if fmt else {})}
+        )
+        probes = SemanticMutationEngine.generate_probes(schema, seed_value="seed1")
+        for p in probes:
+            sigs = [s.lower() for s in p.expected_signal]
+            if p.attack_type == "SQL_INJECTION":
+                assert "sqli" not in str(p.payload_value).lower()
+                assert "sql" not in sigs
+                assert "syntax" not in sigs
+                assert all(sig not in str(p.payload_value).lower() for sig in sigs)
+            if p.attack_type == "NOSQL_INJECTION":
+                assert "$ne" not in sigs
+                assert all(sig not in str(p.payload_value).lower() for sig in sigs)
+
+    feedback = FeedbackAnalysisResult(
+        is_validation_error=True,
+        status_code=422,
+        failed_fields=[FieldValidationFailure(field_name="email", expected_format="email", reason="invalid email")],
+    )
+    adapted = FeedbackAnalyzer.adapt_payload({"email": "bad"}, feedback)
+    assert adapted["email"] == "probe.auth'OR'1'='1@canary.local"
+    assert "sqli" not in adapted["email"]

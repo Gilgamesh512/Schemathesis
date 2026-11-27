@@ -235,7 +235,7 @@ def test_time_based_latency_delta_evaluation():
 
     sev, cand, ev, cves = rest.evaluate_response(resp_mock, payload)
     assert cand is True
-    assert sev == "high"
+    assert sev == "medium"
     assert "significant time delay observed" in ev
 
 

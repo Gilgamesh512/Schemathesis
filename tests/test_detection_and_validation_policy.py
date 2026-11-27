@@ -428,3 +428,315 @@ def test_e2e_process_fingerprint_group_mixed_candidate_rejected_error_and_bola_i
     assert bola_findings[0].confirmed is False
     assert bola_findings[0].severity == "info"
 
+
+def test_reflected_sqli_email_and_nosqli_operator_do_not_trigger_candidates_while_real_db_errors_do():
+    from core.semantic_mutator import SemanticMutationEngine
+
+    email_schema = SemanticMutationEngine.inspect_param("email", "query", {"type": "string", "format": "email"})
+    sqli_email_probe = next(
+        p for p in SemanticMutationEngine.generate_probes(email_schema)
+        if p.attack_type == "SQL_INJECTION"
+    )
+    str_schema = SemanticMutationEngine.inspect_param("q", "query", {"type": "string"})
+    nosql_probe = next(
+        p for p in SemanticMutationEngine.generate_probes(str_schema)
+        if p.attack_type == "NOSQL_INJECTION"
+    )
+
+    sqli_payload = _make_payload(
+        attack_type="SQL_INJECTION",
+        expected_signal=sqli_email_probe.expected_signal,
+        payload_value=sqli_email_probe.payload_value,
+        endpoint="/invite",
+    )
+    nosql_payload = _make_payload(
+        attack_type="NOSQL_INJECTION",
+        expected_signal=nosql_probe.expected_signal,
+        payload_value=nosql_probe.payload_value,
+        endpoint="/search",
+    )
+
+    # 1. Ordinary HTTP 200 JSON reflection must remain rejected
+    base_email = httpx.Response(200, json={"invited": "user@example.com"})
+    echo_email = httpx.Response(200, json={"invited": str(sqli_email_probe.payload_value)})
+    det_sqli_echo, _ = rest.detect_response(echo_email, sqli_payload, baseline_resp=base_email)
+    dec_sqli_echo = rest.decide_validation(det_sqli_echo, sqli_payload)
+    assert dec_sqli_echo.outcome == "rejected"
+    assert dec_sqli_echo.is_candidate is False
+
+    base_q = httpx.Response(200, json={"rendered": "hello"})
+    echo_nosql = httpx.Response(200, json={"rendered": str(nosql_probe.payload_value)})
+    det_nosql_echo, _ = rest.detect_response(echo_nosql, nosql_payload, baseline_resp=base_q)
+    dec_nosql_echo = rest.decide_validation(det_nosql_echo, nosql_payload)
+    assert dec_nosql_echo.outcome == "rejected"
+    assert dec_nosql_echo.is_candidate is False
+
+    # 2. Realistic DB / parser error responses still raise candidates
+    real_sqli_err = httpx.Response(200, json={"error": "sqlite3.OperationalError: near \"'\": syntax error"})
+    det_sqli_real, _ = rest.detect_response(real_sqli_err, sqli_payload, baseline_resp=base_email)
+    dec_sqli_real = rest.decide_validation(det_sqli_real, sqli_payload)
+    assert dec_sqli_real.outcome == "candidate"
+    assert dec_sqli_real.is_candidate is True
+
+    real_nosql_err = httpx.Response(200, json={"error": "MongoServerError: unknown top level operator: $ne"})
+    det_nosql_real, _ = rest.detect_response(real_nosql_err, nosql_payload, baseline_resp=base_q)
+    dec_nosql_real = rest.decide_validation(det_nosql_real, nosql_payload)
+    assert dec_nosql_real.outcome == "candidate"
+    assert dec_nosql_real.is_candidate is True
+
+
+def test_p164_ssrf_reflection_verbatim_and_urlencoded_rejected_on_200_and_422():
+    from core.semantic_mutator import SemanticMutationEngine
+
+    uri_schema = SemanticMutationEngine.inspect_param("webhook_url", "query", {"type": "string", "format": "uri"})
+    ssrf_probe = next(
+        p for p in SemanticMutationEngine.generate_probes(uri_schema)
+        if p.attack_type == "SSRF" and "127.0.0.1" in str(p.payload_value)
+    )
+    payload = _make_payload(
+        attack_type="SSRF",
+        expected_signal=ssrf_probe.expected_signal,
+        payload_value=ssrf_probe.payload_value,
+        endpoint="/webhooks",
+    )
+    baseline = httpx.Response(200, json={"webhook_url": "https://example.com/hook"})
+
+    # Verbatim JSON echo in HTTP 200
+    resp_200 = httpx.Response(200, json={"webhook_url": str(ssrf_probe.payload_value)})
+    det_200, _ = rest.detect_response(resp_200, payload, baseline_resp=baseline)
+    dec_200 = rest.decide_validation(det_200, payload)
+    assert det_200.payload_reflected is True
+    assert "127.0.0.1" in det_200.reflection_only_signals
+    assert det_200.new_expected_signals == []
+    assert dec_200.outcome == "rejected"
+    assert dec_200.is_candidate is False
+    assert dec_200.severity == "info"
+
+    # URL-encoded echo in HTTP 422 validation barrier and HTTP 200
+    from urllib.parse import quote
+    encoded = quote(str(ssrf_probe.payload_value), safe="")
+    for status_code, body in (
+        (200, {"error": f"Unsupported URL: {encoded}"}),
+        (422, {"detail": [{"loc": ["query", "webhook_url"], "msg": f"Invalid URL: {encoded}", "type": "value_error"}]}),
+    ):
+        resp_enc = httpx.Response(status_code, json=body)
+        det_enc, _ = rest.detect_response(resp_enc, payload, baseline_resp=baseline)
+        dec_enc = rest.decide_validation(det_enc, payload)
+        assert det_enc.payload_reflected is True
+        assert "127.0.0.1" in det_enc.reflection_only_signals
+        assert det_enc.new_expected_signals == []
+        assert dec_enc.outcome == "rejected"
+        assert dec_enc.is_candidate is False
+
+
+def test_p164_bfla_superuser_reflection_rejected():
+    from core.semantic_mutator import SemanticMutationEngine
+
+    role_schema = SemanticMutationEngine.inspect_param(
+        "role", "query", {"type": "string", "enum": ["user", "superuser"]}
+    )
+    bfla_probe = next(
+        p for p in SemanticMutationEngine.generate_probes(role_schema)
+        if p.attack_type == "BFLA" and str(p.payload_value).lower() == "superuser"
+    )
+    payload = _make_payload(
+        attack_type="BFLA",
+        expected_signal=bfla_probe.expected_signal,
+        payload_value=bfla_probe.payload_value,
+        endpoint="/profile",
+    )
+    baseline = httpx.Response(200, json={"role": "user"})
+    echo_200 = httpx.Response(200, json={"echo": "superuser", "status": "ignored"})
+    det, _ = rest.detect_response(echo_200, payload, baseline_resp=baseline)
+    dec = rest.decide_validation(det, payload)
+    assert det.payload_reflected is True
+    assert det.reflection_only_signals == ["superuser"]
+    assert det.new_expected_signals == []
+    assert dec.outcome == "rejected"
+    assert dec.is_candidate is False
+
+
+def test_p164_technical_signal_reflection_raw_and_json_escaped_rejected():
+    baseline = httpx.Response(200, json={"query": "hello"})
+
+    # Custom payload containing technical tokens echoed raw or JSON-escaped (with quotes/backslashes)
+    raw_payload_val = '1" OR "sqlite"="1'
+    payload = _make_payload(
+        attack_type="SQL_INJECTION",
+        expected_signal=[],
+        payload_value=raw_payload_val,
+        endpoint="/search",
+    )
+    json_escaped_resp = httpx.Response(200, json={"echo": raw_payload_val})
+    for base in (baseline, None):
+        det, _ = rest.detect_response(json_escaped_resp, payload, baseline_resp=base)
+        dec = rest.decide_validation(det, payload)
+        assert det.payload_reflected is True
+        assert "sqlite" in det.reflection_only_signals
+        assert det.technical_signals == []
+        assert det.new_technical_signals == []
+        assert dec.outcome == "rejected"
+        assert dec.is_candidate is False
+
+    # HTML-escaped technical payload reflection must also stay rejected
+    html_payload = _make_payload(
+        attack_type="SQL_INJECTION",
+        expected_signal=[],
+        payload_value="1' OR 'sqlite'='1",
+        endpoint="/search",
+    )
+    resp_html_esc = httpx.Response(200, text="<div>Invalid: 1&#x27; OR &#x27;sqlite&#x27;=&#x27;1</div>")
+    det_html_esc, _ = rest.detect_response(resp_html_esc, html_payload, baseline_resp=baseline)
+    dec_html_esc = rest.decide_validation(det_html_esc, html_payload)
+    assert det_html_esc.payload_reflected is True
+    assert det_html_esc.new_technical_signals == []
+    assert dec_html_esc.outcome == "rejected"
+
+    # Validation barrier echoing a payload with traceback keyword must still stay rejected
+    tb_payload = _make_payload(
+        attack_type="SQL_INJECTION",
+        expected_signal=[],
+        payload_value="user_traceback_probe",
+        endpoint="/search",
+    )
+    resp_400 = httpx.Response(400, json={"error": "Rejected token: user_traceback_probe"})
+    det_400, _ = rest.detect_response(resp_400, tb_payload, baseline_resp=baseline)
+    dec_400 = rest.decide_validation(det_400, tb_payload)
+    assert det_400.validation_barrier is True
+    assert det_400.payload_reflected is True
+    assert "traceback" in det_400.reflection_only_signals
+    assert det_400.new_technical_signals == []
+    assert dec_400.outcome == "rejected"
+
+
+def test_p164_mixed_reflection_and_independent_evidence_preserves_candidate():
+    # 1. SSRF: echoes URL containing 127.0.0.1 AND independently reports dial error with 127.0.0.1 + connection refused
+    ssrf_val = "http://127.0.0.1:80/canary_ssrf_probe"
+    ssrf_payload = _make_payload(
+        attack_type="SSRF",
+        expected_signal=["localhost", "127.0.0.1", "connection refused"],
+        payload_value=ssrf_val,
+        endpoint="/fetch",
+    )
+    baseline = httpx.Response(200, json={"url": "https://example.com", "status": "ok"})
+    mixed_ssrf = httpx.Response(
+        200,
+        json={"url": ssrf_val, "error": "dial tcp 127.0.0.1:80: connection refused"},
+    )
+    det_ssrf, _ = rest.detect_response(mixed_ssrf, ssrf_payload, baseline_resp=baseline)
+    dec_ssrf = rest.decide_validation(det_ssrf, ssrf_payload)
+    assert det_ssrf.payload_reflected is True
+    assert "127.0.0.1" in det_ssrf.new_expected_signals
+    assert "connection refused" in det_ssrf.new_expected_signals
+    assert dec_ssrf.outcome == "candidate"
+    assert dec_ssrf.is_candidate is True
+
+    # 2. SQLi: echoes payload containing "sqlite" AND independently leaks "sqlite" / "sql syntax" error
+    sqli_val = "1' OR 'sqlite'='1"
+    sqli_payload = _make_payload(
+        attack_type="SQL_INJECTION",
+        expected_signal=[],
+        payload_value=sqli_val,
+        endpoint="/items",
+    )
+    mixed_sqli = httpx.Response(
+        200,
+        json={"input": sqli_val, "error": "sqlite3.OperationalError: near \"'\": sql syntax error"},
+    )
+    det_sqli, _ = rest.detect_response(mixed_sqli, sqli_payload, baseline_resp=baseline)
+    dec_sqli = rest.decide_validation(det_sqli, sqli_payload)
+    assert det_sqli.payload_reflected is True
+    assert "sqlite" in det_sqli.new_technical_signals
+    assert dec_sqli.outcome == "candidate"
+    assert dec_sqli.severity == "medium"
+
+    # 3. Baseline pre-existing signal stays preexisting even when also reflected
+    base_with_sig = httpx.Response(200, json={"host": "127.0.0.1"})
+    echo_with_sig = httpx.Response(200, json={"host": "127.0.0.1", "url": ssrf_val})
+    det_pre, _ = rest.detect_response(
+        echo_with_sig,
+        _make_payload(attack_type="SSRF", expected_signal=["127.0.0.1"], payload_value=ssrf_val),
+        baseline_resp=base_with_sig,
+    )
+    dec_pre = rest.decide_validation(
+        det_pre,
+        _make_payload(attack_type="SSRF", expected_signal=["127.0.0.1"], payload_value=ssrf_val),
+    )
+    assert "127.0.0.1" in det_pre.preexisting_expected_signals
+    assert det_pre.new_expected_signals == []
+    assert dec_pre.outcome == "rejected"
+
+
+def test_p164_gap_concatenation_and_primitive_payload_safety():
+    # Gap concatenation: removing "_gap_" must NOT happen and must NOT synthesize "sqlite"
+    gap_payload = _make_payload(
+        attack_type="SQL_INJECTION",
+        expected_signal=[],
+        payload_value="_gap_",
+        endpoint="/search",
+    )
+    gap_resp = httpx.Response(200, json={"msg": "sq_gap_lite"})
+    det_gap, _ = rest.detect_response(gap_resp, gap_payload, baseline_resp=httpx.Response(200, json={"msg": "ok"}))
+    dec_gap = rest.decide_validation(det_gap, gap_payload)
+    assert det_gap.payload_reflected is True
+    assert det_gap.technical_signals == []
+    assert det_gap.new_technical_signals == []
+    assert dec_gap.outcome == "rejected"
+
+    # Primitive / short payloads must never create reflection spans or mask real signals
+    for prim in (1, 0, True, False, None, "", "   ", "ab", "true", "false"):
+        prim_payload = _make_payload(
+            attack_type="SQL_INJECTION",
+            expected_signal=[],
+            payload_value=prim,
+            endpoint="/items",
+        )
+        resp_real_err = httpx.Response(200, json={"id": prim, "error": "sqlite3 error near 1"})
+        det_prim, _ = rest.detect_response(
+            resp_real_err,
+            prim_payload,
+            baseline_resp=httpx.Response(200, json={"ok": True}),
+        )
+        dec_prim = rest.decide_validation(det_prim, prim_payload)
+        assert det_prim.payload_reflected is False
+        assert "sqlite" in det_prim.new_technical_signals
+        assert dec_prim.outcome == "candidate"
+
+
+def test_p164_xss_and_ssti_behaviors_preserved():
+    # XSS reflection remains candidate in P1.6.4 (Content-Type validation belongs to P1.6.5)
+    xss_val = "<script>alert(1)</script>"
+    xss_payload = _make_payload(
+        attack_type="XSS",
+        expected_signal=[xss_val],
+        payload_value=xss_val,
+        endpoint="/echo",
+    )
+    xss_resp = httpx.Response(200, json={"rendered": f"Echo: {xss_val}"})
+    det_xss, _ = rest.detect_response(xss_resp, xss_payload, baseline_resp=httpx.Response(200, json={"rendered": "Echo: hi"}))
+    dec_xss = rest.decide_validation(det_xss, xss_payload)
+    assert det_xss.payload_reflected is True
+    assert det_xss.new_expected_signals == [xss_val]
+    assert dec_xss.outcome == "candidate"
+
+    # SSTI evaluated output is not masked, and unevaluated reflection remains rejected
+    ssti_payload = _make_payload(
+        attack_type="SSTI",
+        expected_signal=["77455597"],
+        payload_value="{{9187*8431}}",
+        endpoint="/render",
+    )
+    ssti_eval = httpx.Response(200, json={"rendered": "77455597"})
+    det_ssti, _ = rest.detect_response(ssti_eval, ssti_payload, baseline_resp=httpx.Response(200, json={"rendered": "hello"}))
+    assert det_ssti.new_expected_signals == ["77455597"]
+
+    from core.ssti_validator import SstiValidator
+    ssti_echo_verdict = SstiValidator.validate(
+        attack_status=200,
+        attack_body='{"rendered": "Echo: {{9187*8431}}"}',
+        baseline_body='{"rendered": "Echo: hello"}',
+        initial_payload="{{9187*8431}}",
+        initial_expected="77455597",
+    )
+    assert ssti_echo_verdict is not None
+    assert ssti_echo_verdict.outcome == "rejected"

@@ -195,7 +195,7 @@ class FeedbackAnalyzer:
                     # Adapt to valid UUID with canary tag
                     adapted[fname] = "00000000-0000-0000-0000-000000000001"
                 elif fmt == "email":
-                    adapted[fname] = "probe.sqli'OR'1'='1@canary.local"
+                    adapted[fname] = "probe.auth'OR'1'='1@canary.local"
                 elif fmt == "integer":
                     adapted[fname] = 1
                 elif fmt == "uri":
@@ -214,7 +214,7 @@ class FeedbackAnalyzer:
             if primary_fmt == "uuid":
                 return "00000000-0000-0000-0000-000000000001"
             if primary_fmt == "email":
-                return "probe.sqli'OR'1'='1@canary.local"
+                return "probe.auth'OR'1'='1@canary.local"
             if primary_fmt == "integer":
                 return 1
             if primary_fmt == "uri":

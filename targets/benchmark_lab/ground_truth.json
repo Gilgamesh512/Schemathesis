@@ -1,0 +1,183 @@
+{
+  "benchmark_version": "1.0.0",
+  "target_version": "1.0.0",
+  "target_app": "benchmark_lab",
+  "evaluated_classes": [
+    "BOLA",
+    "BOUNDARY",
+    "SSTI",
+    "MASS_ASSIGNMENT"
+  ],
+  "expectations": [
+    {
+      "case_id": "bola_vuln_orders",
+      "method": "GET",
+      "endpoint": "/api/bola/vuln/orders/{id}",
+      "vuln_class": "BOLA",
+      "vulnerable": true,
+      "applicable": true,
+      "expected_confirmation": true,
+      "description": "Cross-user integer order access leaks user-1 record to user-2"
+    },
+    {
+      "case_id": "bola_vuln_accounts",
+      "method": "GET",
+      "endpoint": "/api/bola/vuln/accounts/{account_id}",
+      "vuln_class": "BOLA",
+      "vulnerable": true,
+      "applicable": true,
+      "expected_confirmation": true,
+      "description": "String/UUID account lookup leaks privileged user-1/admin account to user-2"
+    },
+    {
+      "case_id": "bola_secure_orders",
+      "method": "GET",
+      "endpoint": "/api/bola/secure/orders/{id}",
+      "vuln_class": "BOLA",
+      "vulnerable": false,
+      "applicable": true,
+      "expected_confirmation": false,
+      "description": "Strict ownership check returns 403 for cross-user access"
+    },
+    {
+      "case_id": "bola_secure_public_items",
+      "method": "GET",
+      "endpoint": "/api/bola/secure/public-items/{id}",
+      "vuln_class": "BOLA",
+      "vulnerable": false,
+      "applicable": true,
+      "expected_confirmation": false,
+      "description": "Runtime public endpoint returns 200 without auth; suppressed by BolaValidator"
+    },
+    {
+      "case_id": "bola_secure_open_catalog",
+      "method": "GET",
+      "endpoint": "/api/bola/secure/open-catalog/{id}",
+      "vuln_class": "BOLA",
+      "vulnerable": false,
+      "applicable": false,
+      "exclusion_reason": "explicit_openapi_security_empty",
+      "expected_confirmation": false,
+      "description": "OpenAPI security: [] skips BOLA/IDOR probes via Test Planner"
+    },
+    {
+      "case_id": "boundary_vuln_wraparound",
+      "method": "GET",
+      "endpoint": "/api/boundary/vuln/wraparound",
+      "vuln_class": "BOUNDARY",
+      "vulnerable": true,
+      "applicable": true,
+      "expected_confirmation": true,
+      "description": "32-bit signed integer wraparound on INT32_MAX"
+    },
+    {
+      "case_id": "boundary_vuln_products",
+      "method": "GET",
+      "endpoint": "/api/boundary/vuln/products",
+      "vuln_class": "BOUNDARY",
+      "vulnerable": true,
+      "applicable": true,
+      "expected_confirmation": false,
+      "description": "Unbounded pagination accepts limit=-1 and limit=2147483647 without clamp"
+    },
+    {
+      "case_id": "boundary_vuln_adjust",
+      "method": "POST",
+      "endpoint": "/api/boundary/vuln/adjust",
+      "vuln_class": "BOUNDARY",
+      "vulnerable": true,
+      "applicable": true,
+      "expected_confirmation": false,
+      "description": "State-changing endpoint accepts and applies negative quantity"
+    },
+    {
+      "case_id": "boundary_secure_products",
+      "method": "GET",
+      "endpoint": "/api/boundary/secure/products",
+      "vuln_class": "BOUNDARY",
+      "vulnerable": false,
+      "applicable": true,
+      "expected_confirmation": false,
+      "description": "Server clamps limit into [1, 30] and reports effective_limit"
+    },
+    {
+      "case_id": "boundary_secure_strict",
+      "method": "GET",
+      "endpoint": "/api/boundary/secure/strict",
+      "vuln_class": "BOUNDARY",
+      "vulnerable": false,
+      "applicable": true,
+      "expected_confirmation": false,
+      "description": "Strict numeric validation rejects out-of-range amount with HTTP 422"
+    },
+    {
+      "case_id": "ssti_vuln_render",
+      "method": "GET",
+      "endpoint": "/api/ssti/vuln/render",
+      "vuln_class": "SSTI",
+      "vulnerable": true,
+      "applicable": true,
+      "expected_confirmation": true,
+      "description": "Arithmetic template expression evaluated safely while control stays literal"
+    },
+    {
+      "case_id": "ssti_vuln_invite",
+      "method": "GET",
+      "endpoint": "/api/ssti/vuln/invite",
+      "vuln_class": "SSTI",
+      "vulnerable": true,
+      "applicable": true,
+      "expected_confirmation": true,
+      "description": "Email local-part template arithmetic evaluated safely"
+    },
+    {
+      "case_id": "ssti_secure_echo",
+      "method": "GET",
+      "endpoint": "/api/ssti/secure/echo",
+      "vuln_class": "SSTI",
+      "vulnerable": false,
+      "applicable": true,
+      "expected_confirmation": false,
+      "description": "Raw reflection without template evaluation"
+    },
+    {
+      "case_id": "ssti_secure_static_report",
+      "method": "GET",
+      "endpoint": "/api/ssti/secure/static-report",
+      "vuln_class": "SSTI",
+      "vulnerable": false,
+      "applicable": true,
+      "expected_confirmation": false,
+      "description": "Static coincidental 49 and 77455597 present in baseline without evaluation"
+    },
+    {
+      "case_id": "mass_vuln_profile",
+      "method": "PUT",
+      "endpoint": "/api/mass/vuln/profile",
+      "vuln_class": "MASS_ASSIGNMENT",
+      "vulnerable": true,
+      "applicable": true,
+      "expected_confirmation": true,
+      "description": "PUT persists privileged role/is_admin fields verified via GET loopback"
+    },
+    {
+      "case_id": "mass_secure_profile",
+      "method": "PUT",
+      "endpoint": "/api/mass/secure/profile",
+      "vuln_class": "MASS_ASSIGNMENT",
+      "vulnerable": false,
+      "applicable": true,
+      "expected_confirmation": false,
+      "description": "PUT echoes DTO but does not persist privileged fields on GET loopback"
+    }
+  ],
+  "noise_control_endpoints": [
+    {
+      "case_id": "noise_secure_status",
+      "method": "GET",
+      "endpoint": "/api/noise/secure/status",
+      "description": "Generic JSON words (admin, user, invalid, 49, ok) without vulnerability"
+    }
+  ],
+  "cross_class_policy": "any_unexpected_positive_is_fp"
+}

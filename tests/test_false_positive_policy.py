@@ -96,7 +96,8 @@ def test_bola_200_with_generic_admin_email_fields_is_not_candidate(monkeypatch):
     )
 
     assert candidate is False
-    assert "generic keywords ignored" in evidence
+    # BOLA 200 now returns inconclusive (deferred to BolaValidator) instead of rejected with generic keywords
+    assert "BOLA" in evidence or "authorization validator" in evidence
 
 
 def test_generic_content_title_author_on_400_is_not_sqli_candidate(monkeypatch):

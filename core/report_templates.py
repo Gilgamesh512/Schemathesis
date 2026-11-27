@@ -88,6 +88,7 @@ def render_finding_card(
                             <h4>Attack Details</h4>
                             <p><strong>Target App:</strong> <code>{html.escape(str(finding.get('target_app') or 'N/A'))}</code></p>
                             <p><strong>Attack Type:</strong> {html.escape(finding['attack_type'])}</p>
+                            <p><strong>Lifecycle:</strong> <code>{html.escape(str(finding.get('lifecycle') or ('confirmed' if is_confirmed else 'unknown')))}</code> (Observations: {int(finding.get('observation_count') or 0)}, Errors: {int(finding.get('error_count') or 0)})</p>
                             <p><strong>OWASP Category:</strong> {html.escape(owasp_cat)} - {html.escape(owasp_metadata.get(owasp_cat, {}).get('name', 'N/A'))}</p>
                             <p><strong>Matched CVEs:</strong> {cve_badges}</p>
                             <p><strong>Run ID:</strong> <code>{html.escape(str(finding.get('run_id') or 'N/A'))}</code></p>

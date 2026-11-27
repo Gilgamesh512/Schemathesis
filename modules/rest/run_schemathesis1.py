@@ -46,17 +46,24 @@ from pydantic import BaseModel, Field, ValidationError
 
 from modules.security import rules_engine
 from core import (
+    CircuitBreakerTrippedError,
     ConfirmationEngine,
+    DetectionResult,
     Evidence,
     Finding,
+    LIFECYCLE_RANK,
+    Observation,
     RequestScheduler,
     ProjectPaths,
     ResultManager,
     RunState,
     SchemaManager,
+    ValidationDecision,
     DEFAULT_ERROR_SIGNALS,
     MAX_ATTEMPTS_PER_FINGERPRINT,
     SEVERITY_BY_STATUS,
+    build_curl_command,
+    build_finding_from_observations,
     content_hash,
     extract_response_elapsed_ms,
     redact_headers,
@@ -228,6 +235,75 @@ def load_targets(
     return targets
 
 
+_AUTH_ENDPOINT_SEGMENTS = frozenset({
+    "login", "signin", "sign-in", "logout", "signout", "token",
+    "refresh", "forgot-password", "reset-password", "verify-otp",
+})
+
+
+def _extract_operation_dict(operation: Any) -> dict[str, Any]:
+    """Safely extract raw OpenAPI operation dict if available (returns {} on mocks)."""
+    definition = getattr(operation, "definition", None)
+    raw = getattr(definition, "raw", None)
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(definition, dict):
+        return definition
+    return {}
+
+
+def _is_explicit_public_operation(op_raw: dict[str, Any]) -> bool:
+    """Return True when OpenAPI operation explicitly sets `security: []`."""
+    return "security" in op_raw and op_raw.get("security") == []
+
+
+def _is_mass_assignment_applicable(operation: Any, op_raw: dict[str, Any]) -> bool:
+    """Determine if Mass Assignment injection is applicable to this operation."""
+    method = str(getattr(operation, "method", "") or "").upper()
+    if method not in ("POST", "PUT", "PATCH"):
+        return False
+
+    path_segments = {
+        seg.strip().lower()
+        for seg in str(getattr(operation, "path", "") or "").split("/")
+        if seg.strip()
+    }
+
+    body_props: dict[str, Any] = {}
+    has_object_body = not op_raw  # Permissive when op_raw is absent (e.g. minimal mocks)
+    if op_raw:
+        req_body = op_raw.get("requestBody")
+        if not isinstance(req_body, dict):
+            return False
+        content = req_body.get("content")
+        if isinstance(content, dict) and content:
+            has_object_body = False
+            for media_def in content.values():
+                if not isinstance(media_def, dict):
+                    continue
+                sch = media_def.get("schema")
+                if not isinstance(sch, dict):
+                    continue
+                sch_type = str(sch.get("type") or "").lower()
+                if sch_type == "object" or isinstance(sch.get("properties"), dict):
+                    has_object_body = True
+                    if isinstance(sch.get("properties"), dict):
+                        body_props.update(sch["properties"])
+        elif "requestBody" in op_raw:
+            has_object_body = True
+
+    if not has_object_body:
+        return False
+
+    if path_segments & _AUTH_ENDPOINT_SEGMENTS:
+        # Skip auth/session endpoints unless role/is_admin is explicitly part of body schema
+        lower_props = {str(k).lower() for k in body_props}
+        if not ({"role", "is_admin"} & lower_props):
+            return False
+
+    return True
+
+
 def schema_payloads(targets: dict[str, tuple], seed_corpus: Any = None) -> list[Payload]:
     """Create built-in schema-conforming security mutation payloads from OpenAPI operations."""
     generated: list[Payload] = []
@@ -248,6 +324,9 @@ def schema_payloads(targets: dict[str, tuple], seed_corpus: Any = None) -> list[
             if not result.ok():
                 continue
             operation = result.ok()
+            op_raw = _extract_operation_dict(operation)
+            is_explicit_public = _is_explicit_public_operation(op_raw)
+
             # 1. Baseline case (schema compliance)
             generated.append(Payload(
                 endpoint=operation.path,
@@ -276,6 +355,8 @@ def schema_payloads(targets: dict[str, tuple], seed_corpus: Any = None) -> list[
                     probes = SemanticMutationEngine.generate_probes(param_schema, seed_corpus=seed_corpus)
 
                     for probe in probes:
+                        if is_explicit_public and probe.attack_type.upper() in ("BOLA", "IDOR"):
+                            continue
                         generated.append(Payload(
                             endpoint=operation.path,
                             method=operation.method,
@@ -300,6 +381,8 @@ def schema_payloads(targets: dict[str, tuple], seed_corpus: Any = None) -> list[
                 param_schema = SemanticMutationEngine.inspect_param(p_name, "path", {})
                 probes = SemanticMutationEngine.generate_probes(param_schema, seed_corpus=seed_corpus)
                 for probe in probes:
+                    if is_explicit_public and probe.attack_type.upper() in ("BOLA", "IDOR"):
+                        continue
                     generated.append(Payload(
                         endpoint=operation.path,
                         method=operation.method,
@@ -313,8 +396,8 @@ def schema_payloads(targets: dict[str, tuple], seed_corpus: Any = None) -> list[
                         target_app=target_name,
                     ))
 
-            # 3. Built-in Mass Assignment & Schema Property Injection for state-changing endpoints
-            if operation.method.upper() in ("POST", "PUT", "PATCH"):
+            # 3. Built-in Mass Assignment & Schema Property Injection for applicable state-changing endpoints
+            if _is_mass_assignment_applicable(operation, op_raw):
                 generated.append(Payload(
                     endpoint=operation.path,
                     method=operation.method,
@@ -323,7 +406,7 @@ def schema_payloads(targets: dict[str, tuple], seed_corpus: Any = None) -> list[
                     attack_type="MASS_ASSIGNMENT",
                     payload_value="admin",
                     owasp_category="API3:2023",
-                    expected_signal=["admin", "role", "success"],
+                    expected_signal=[],
                     context="schema_conformant",
                     target_app=target_name,
                 ))
@@ -335,7 +418,7 @@ def schema_payloads(targets: dict[str, tuple], seed_corpus: Any = None) -> list[
                     attack_type="MASS_ASSIGNMENT",
                     payload_value=True,
                     owasp_category="API3:2023",
-                    expected_signal=["is_admin", "true", "admin"],
+                    expected_signal=[],
                     context="schema_conformant",
                     target_app=target_name,
                 ))
@@ -443,38 +526,47 @@ def build_case(schema, op, payload: Payload, baseline_case=None):
     kwargs: dict[str, Any] = {"operation": op, "method": op.method, "path": op.path}
     loc = _normalize_location(payload.param_location)
 
-    if loc == "query":
-        values = _baseline_component(baseline_case, "query")
-        if not isinstance(values, dict):
-            values = {}
-        values[payload.target_param] = payload.payload_value
-        kwargs["query"] = values
-    elif loc == "path":
-        values = _baseline_component(baseline_case, "path_parameters")
-        if not isinstance(values, dict):
-            values = {}
+    if loc == "path":
+        values = _default_path_parameters(op)
+        base_pp = _baseline_component(baseline_case, "path_parameters")
+        if isinstance(base_pp, dict):
+            values.update({k: v for k, v in base_pp.items() if v not in (None, "")})
         values[payload.target_param] = payload.payload_value
         kwargs["path_parameters"] = values
-    elif loc in ("header", "headers"):
-        values = _baseline_component(baseline_case, "headers")
-        if not isinstance(values, dict):
-            values = {}
-        values[payload.target_param] = str(payload.payload_value)
-        kwargs["headers"] = values
-    elif loc == "body":
-        values = _baseline_component(baseline_case, "body")
-        if not isinstance(values, dict):
-            values = {}
-        values[payload.target_param] = payload.payload_value
-        kwargs["body"] = values
-    elif loc in ("cookie", "cookies"):
-        values = _baseline_component(baseline_case, "cookies")
-        if not isinstance(values, dict):
-            values = {}
-        values[payload.target_param] = str(payload.payload_value)
-        kwargs["cookies"] = values
     else:
-        raise ValueError(f"Unsupported param_location: {payload.param_location}")
+        default_pp = _default_path_parameters(op)
+        base_pp = _baseline_component(baseline_case, "path_parameters")
+        if isinstance(base_pp, dict):
+            default_pp.update({k: v for k, v in base_pp.items() if v not in (None, "")})
+        if default_pp:
+            kwargs["path_parameters"] = default_pp
+
+        if loc == "query":
+            values = _baseline_component(baseline_case, "query")
+            if not isinstance(values, dict):
+                values = {}
+            values[payload.target_param] = payload.payload_value
+            kwargs["query"] = values
+        elif loc in ("header", "headers"):
+            values = _baseline_component(baseline_case, "headers")
+            if not isinstance(values, dict):
+                values = {}
+            values[payload.target_param] = str(payload.payload_value)
+            kwargs["headers"] = values
+        elif loc == "body":
+            values = _baseline_component(baseline_case, "body")
+            if not isinstance(values, dict):
+                values = {}
+            values[payload.target_param] = payload.payload_value
+            kwargs["body"] = values
+        elif loc in ("cookie", "cookies"):
+            values = _baseline_component(baseline_case, "cookies")
+            if not isinstance(values, dict):
+                values = {}
+            values[payload.target_param] = str(payload.payload_value)
+            kwargs["cookies"] = values
+        else:
+            raise ValueError(f"Unsupported param_location: {payload.param_location}")
     try:
         return schema.make_case(**kwargs)
     except Exception as exc:
@@ -484,28 +576,93 @@ def build_case(schema, op, payload: Payload, baseline_case=None):
         raise
 
 
+def _default_path_parameters(op) -> dict[str, Any]:
+    """Build schema-valid path parameters for every {param} template in op.path."""
+    import re as _re
+
+    template_params = _re.findall(r"\{([^}]+)\}", getattr(op, "path", "") or "")
+    if not template_params:
+        return {}
+
+    param_defs: dict[str, dict[str, Any]] = {}
+    iter_params = getattr(op, "iter_parameters", None)
+    if callable(iter_params):
+        try:
+            for p in iter_params():
+                p_name = getattr(p, "name", None)
+                if p_name:
+                    raw_def = getattr(p, "definition", {})
+                    if isinstance(raw_def, dict):
+                        param_defs[p_name] = raw_def.get("schema", raw_def)
+        except Exception:
+            pass
+
+    defaults: dict[str, Any] = {}
+    for p_name in template_params:
+        p_schema = param_defs.get(p_name, {"type": "string"})
+        sample = SemanticMutationEngine.generate_schema_valid_sample(p_schema)
+        if sample in ("sample_text", "", None):
+            sample = "1"
+        defaults[p_name] = sample
+    return defaults
+
+
 def build_baseline_case(schema, op):
     """Generate a valid ordinary case from the operation schema."""
+    case = None
     strategy = getattr(op, "as_strategy", None)
     if callable(strategy):
         try:
-            return strategy().example()
+            case = strategy().example()
         except Exception as exc:
             logger.debug("Hypothesis strategy.example() failed on %s %s; falling back to make_case: %s", op.method, op.path, exc)
-    return schema.make_case(operation=op, method=op.method, path=op.path)
+
+    expected_path_params = _default_path_parameters(op)
+    if case is not None and expected_path_params:
+        existing_pp = _baseline_component(case, "path_parameters")
+        if not isinstance(existing_pp, dict) or any(
+            k not in existing_pp or existing_pp[k] in (None, "")
+            for k in expected_path_params
+        ):
+            merged_pp = dict(expected_path_params)
+            if isinstance(existing_pp, dict):
+                for k, v in existing_pp.items():
+                    if v not in (None, ""):
+                        merged_pp[k] = v
+            kwargs: dict[str, Any] = {
+                "operation": op,
+                "method": op.method,
+                "path": op.path,
+                "path_parameters": merged_pp,
+            }
+            for comp_src, comp_dst in (("query", "query"), ("headers", "headers"), ("cookies", "cookies"), ("body", "body")):
+                val = _baseline_component(case, comp_src)
+                if val is not None:
+                    kwargs[comp_dst] = val
+            return schema.make_case(**kwargs)
+
+    if case is not None:
+        return case
+
+    kwargs = {"operation": op, "method": op.method, "path": op.path}
+    if expected_path_params:
+        kwargs["path_parameters"] = expected_path_params
+    return schema.make_case(**kwargs)
 
 
 class PreparedCase:
     """Resolved payload bound to its target, base_url, baseline Case, and attack Case."""
-    __slots__ = ("fingerprint", "target_app", "base_url", "baseline_case", "case", "payload")
+    __slots__ = ("fingerprint", "target_app", "base_url", "baseline_case", "case", "payload", "schema", "operation")
 
-    def __init__(self, fingerprint, target_app, base_url, baseline_case, case, payload):
+    def __init__(self, fingerprint, target_app, base_url, baseline_case, case, payload, schema=None, operation=None):
         self.fingerprint = fingerprint
         self.target_app = target_app
         self.base_url = base_url
         self.baseline_case = baseline_case
         self.case = case
         self.payload = payload
+        self.schema = schema
+        self.operation = operation
 
 
 def prepare_cases(payloads: list[Payload], targets: dict[str, tuple]) -> list[PreparedCase]:
@@ -529,7 +686,7 @@ def prepare_cases(payloads: list[Payload], targets: dict[str, tuple]) -> list[Pr
                 name, payload.endpoint, payload.method, "",
                 payload.attack_type, payload.mutation_family,
             )
-            prepared.append(PreparedCase(fp, name, base_url, None, case, payload))
+            prepared.append(PreparedCase(fp, name, base_url, None, case, payload, schema=schema, operation=op))
             continue
 
         baseline_case = None
@@ -557,36 +714,74 @@ def prepare_cases(payloads: list[Payload], targets: dict[str, tuple]) -> list[Pr
         fp = fingerprint_of(name, payload.endpoint, payload.method,
                              payload.target_param, payload.attack_type,
                              payload.mutation_family)
-        prepared.append(PreparedCase(fp, name, base_url, baseline_case, case, payload))
+        prepared.append(PreparedCase(fp, name, base_url, baseline_case, case, payload, schema=schema, operation=op))
     return prepared
 
 
-def evaluate_response(resp, payload: Payload, rules: Optional[dict] = None
-                       ) -> tuple[str, bool, str, list[str]]:
-    """Return severity, candidate, evidence, and CVE enrichment.
+_GENERIC_NON_EVIDENCE_TOKENS = frozenset({
+    "admin", "administrator", "author", "boolean", "content", "created_at",
+    "data", "deleted", "email", "error", "errors", "exception", "false",
+    "id", "ids", "info", "invalid", "item", "items", "message", "name",
+    "negative", "null", "ok", "overflow", "password", "product", "products",
+    "required", "role", "roles", "status", "string", "success", "title",
+    "token", "true", "unhandled", "user", "username", "users", "value",
+})
 
-    Generic keywords are context only. They must not independently create
-    a candidate. Candidate status is not vulnerability confirmation.
-    """
+
+def _is_generic_or_low_entropy_signal(signal: str) -> bool:
+    """Return True if a signal is too generic or low-entropy to stand alone as evidence."""
+    norm = signal.strip().lower()
+    if not norm or len(norm) <= 2:
+        return True
+    if norm in _GENERIC_NON_EVIDENCE_TOKENS:
+        return True
+    if norm.isdigit() and len(norm) <= 3:
+        return True
+    return False
+
+
+def detect_response(
+    resp,
+    payload: Payload,
+    rules: Optional[dict] = None,
+    baseline_resp: Any = None,
+    *,
+    response_differences: Optional[dict[str, Any]] = None,
+) -> tuple[DetectionResult, list[str]]:
+    """Collect structured detection evidence comparing attack and baseline responses."""
     status = resp.status_code
-    body_lower = (resp.text or "").lower()
+    body_text = resp.text or ""
+    body_lower = body_text.lower()
     attack_type = payload.attack_type.strip().upper()
+
+    has_baseline = baseline_resp is not None
+    baseline_status = getattr(baseline_resp, "status_code", None) if has_baseline else None
+    baseline_text_lower = (getattr(baseline_resp, "text", "") or "").lower() if has_baseline else ""
+    baseline_elapsed_ms = extract_response_elapsed_ms(baseline_resp) if has_baseline else None
+    baseline_limitation = (
+        None if has_baseline
+        else "Baseline response unavailable; pre-existing content could not be ruled out"
+    )
+
+    diffs = dict(response_differences or {})
+    if has_baseline and not diffs:
+        if baseline_status is not None and baseline_status != status:
+            diffs["status_code"] = {"baseline": baseline_status, "attack": status}
+        if baseline_text_lower != body_lower:
+            diffs["body_changed"] = True
 
     expected_signals = list(dict.fromkeys(
         str(signal).strip().lower()
         for signal in payload.expected_signal
         if str(signal).strip()
     ))
-
-    # These are technical error indicators, unlike broad business words
-    # such as "admin", "success", "content", or "deleted".
-    technical_signals = [
+    technical_catalog = [
         str(signal).strip().lower()
         for signal in DEFAULT_ERROR_SIGNALS
         if str(signal).strip()
     ]
 
-    generic_signals = []
+    generic_signals: list[str] = []
     matched_cves: list[dict] = []
     if rules is not None:
         generic_signals = [
@@ -594,90 +789,337 @@ def evaluate_response(resp, payload: Payload, rules: Optional[dict] = None
             for signal in rules_engine.get_all_signals(rules)
             if str(signal).strip()
         ]
-        matched_cves = rules_engine.match_cves_by_keyword(
-            rules, payload.attack_type, payload.owasp_category,
-            payload.technology,
-        )
+        # Only match CVEs when target technology fingerprint is known; avoid guessing CVEs by keyword alone.
+        if payload.technology:
+            matched_cves = rules_engine.match_cves_by_keyword(
+                rules, payload.attack_type, payload.owasp_category,
+                payload.technology,
+            )
 
     cve_ids = [item["cve_id"] for item in matched_cves]
-    expected_hits = [s for s in expected_signals if s in body_lower]
-    technical_hits = [s for s in technical_signals if s in body_lower]
-    generic_hits = [
-        s for s in dict.fromkeys(generic_signals)
-        if s not in technical_signals and s in body_lower
+
+    new_expected: list[str] = []
+    preexisting_expected: list[str] = []
+    ignored_generic: list[str] = []
+
+    for sig in expected_signals:
+        if sig not in body_lower:
+            continue
+        if _is_generic_or_low_entropy_signal(sig):
+            ignored_generic.append(sig)
+        elif has_baseline and sig in baseline_text_lower:
+            preexisting_expected.append(sig)
+        else:
+            new_expected.append(sig)
+
+    technical_hits = [s for s in technical_catalog if s in body_lower]
+    new_technical_hits = [
+        s for s in technical_hits
+        if not (has_baseline and s in baseline_text_lower)
     ]
 
-    # An invalid/rejected authorization probe is not evidence of a bypass.
-    if attack_type in ("BOLA", "IDOR", "BFLA", "AUTH_BYPASS") and status in (
-        400, 401, 403, 404
-    ):
-        return (
-            "info", False,
-            f"HTTP {status}; authorization probe rejected or invalid; "
-            "no bypass established",
-            cve_ids,
-        )
+    for sig in dict.fromkeys(generic_signals):
+        if sig not in technical_catalog and sig not in expected_signals and sig in body_lower and sig not in ignored_generic:
+            ignored_generic.append(sig)
 
-    # Server errors warrant investigation, but do not prove exploitation.
+    validation_barrier = False
+    barrier_framework: Optional[str] = None
+    barrier_details: list[str] = []
+    if status in (400, 422):
+        resp_headers = dict(getattr(resp, "headers", {}) or {})
+        feedback = FeedbackAnalyzer.analyze_response(status, body_text, resp_headers)
+        if feedback.is_validation_error:
+            validation_barrier = True
+            barrier_framework = feedback.framework_hint
+            barrier_details = list(feedback.adaptive_recommendations[:2])
+
+    anomalies: list[str] = []
     if status >= 500:
-        severity = SEVERITY_BY_STATUS.get(status, "high")
-        details = expected_hits + technical_hits
-        return (
-            severity, True,
-            f"HTTP {status}; server-error candidate; "
-            f"technical/payload signals: {details[:3]}",
-            cve_ids,
-        )
+        anomalies.append(f"http_{status}")
+    if "status_code" in diffs:
+        anomalies.append("status_changed")
+    if "body_hash" in diffs or diffs.get("body_changed"):
+        anomalies.append("body_changed")
 
-    # Payload-specific signals can raise a candidate; they still do not
-    # establish confirmed=True. ConfirmationEngine remains authoritative.
-    if expected_hits:
-        return (
-            "medium", True,
-            f"HTTP {status}; payload-specific signal: {expected_hits[:3]}",
-            cve_ids,
-        )
-
-    # SQL-specific technical errors can be candidates even without a 5xx.
-    if technical_hits and attack_type in (
-        "SQLI", "SQL_INJECTION", "SQL INJECTION"
-    ):
-        return (
-            "medium", True,
-            f"HTTP {status}; technical SQL/error signal: {technical_hits[:3]}",
-            cve_ids,
-        )
-
-    # Time-based blind injection evaluation
     elapsed_ms = extract_response_elapsed_ms(resp)
+    latency_delta_ms: Optional[float] = None
+    if elapsed_ms is not None and baseline_elapsed_ms is not None:
+        latency_delta_ms = round(elapsed_ms - baseline_elapsed_ms, 1)
+    if elapsed_ms is not None and elapsed_ms >= 3500:
+        anomalies.append(f"time_delay_{round(elapsed_ms, 1)}ms")
 
+    detection = DetectionResult(
+        attack_type=attack_type,
+        target_endpoint=payload.endpoint,
+        has_baseline=has_baseline,
+        baseline_limitation=baseline_limitation,
+        status_code=status,
+        baseline_status_code=baseline_status,
+        response_differences=diffs,
+        new_expected_signals=new_expected,
+        preexisting_expected_signals=preexisting_expected,
+        ignored_generic_signals=ignored_generic,
+        technical_signals=technical_hits,
+        new_technical_signals=new_technical_hits,
+        validation_barrier=validation_barrier,
+        barrier_framework=barrier_framework,
+        barrier_details=barrier_details,
+        anomalies=anomalies,
+        metadata={
+            "elapsed_ms": round(elapsed_ms, 1) if elapsed_ms is not None else None,
+            "baseline_elapsed_ms": round(baseline_elapsed_ms, 1) if baseline_elapsed_ms is not None else None,
+            "latency_delta_ms": latency_delta_ms,
+            "payload_preview": str(payload.payload_value)[:120],
+        },
+    )
+    return detection, cve_ids
+
+
+def decide_validation(detection: DetectionResult, payload: Payload) -> ValidationDecision:
+    """Apply general false-positive policy over DetectionResult without specialized exploit proof."""
+    status = detection.status_code or 0
+    attack_type = detection.attack_type.upper()
+    limitation_suffix = f" ({detection.baseline_limitation})" if detection.baseline_limitation else ""
+
+    def _with_refs(*refs: str) -> list[str]:
+        return [r for r in refs if r]
+
+    # 1. Invalid/rejected authorization probe is not evidence of a bypass.
+    if attack_type in ("BOLA", "IDOR", "BFLA", "AUTH_BYPASS") and status in (400, 401, 403, 404):
+        return ValidationDecision(
+            outcome="rejected",
+            confidence=0.10,
+            severity="info",
+            reason=f"HTTP {status}; authorization probe rejected or invalid; no bypass established",
+            evidence_refs=_with_refs(f"http_{status}"),
+            is_candidate=False,
+            is_confirmed=False,
+        )
+
+    # 1b. BOLA/IDOR HTTP 2xx requires dedicated authorization validator — keep inconclusive here.
+    if attack_type in ("BOLA", "IDOR") and 200 <= status <= 299:
+        return ValidationDecision(
+            outcome="inconclusive",
+            confidence=0.20,
+            severity="info",
+            reason=(
+                f"HTTP {status}; BOLA/IDOR probe returned success; "
+                "requires dedicated authorization validator for disposition"
+            ),
+            evidence_refs=_with_refs(f"http_{status}"),
+            is_candidate=False,
+            is_confirmed=False,
+        )
+
+    relevant_tech = detection.new_technical_signals if detection.has_baseline else detection.technical_signals
+
+    # 2. HTTP 400/422 validation barrier: generic errors cannot raise a candidate,
+    # while preserving meaningful new canaries or technical backend faults.
+    if detection.validation_barrier:
+        if detection.new_expected_signals:
+            return ValidationDecision(
+                outcome="candidate",
+                confidence=0.45 if detection.has_baseline else 0.30,
+                severity="low",
+                reason=(
+                    f"HTTP {status}; new payload-specific signal inside error response: "
+                    f"{detection.new_expected_signals[:3]}{limitation_suffix}"
+                ),
+                evidence_refs=detection.new_expected_signals[:3],
+                is_candidate=True,
+                is_confirmed=False,
+            )
+
+        meaningful_tech = [
+            s for s in relevant_tech
+            if attack_type in ("SQLI", "SQL_INJECTION", "SQL INJECTION")
+            or s in ("traceback", "stack trace", "unhandled exception", "internal server error")
+        ]
+        if meaningful_tech:
+            return ValidationDecision(
+                outcome="candidate",
+                confidence=0.40 if detection.has_baseline else 0.30,
+                severity="low",
+                reason=(
+                    f"HTTP {status}; technical backend error signal inside validation response: "
+                    f"{meaningful_tech[:3]}{limitation_suffix}"
+                ),
+                evidence_refs=meaningful_tech[:3],
+                is_candidate=True,
+                is_confirmed=False,
+            )
+
+        barrier_desc = "; ".join(detection.barrier_details) if detection.barrier_details else "input rejected"
+        ignored_note = (
+            f"; generic keywords ignored as insufficient evidence: {detection.ignored_generic_signals[:3]}"
+            if detection.ignored_generic_signals
+            else ""
+        )
+        return ValidationDecision(
+            outcome="rejected",
+            confidence=0.15,
+            severity="info",
+            reason=f"HTTP {status}; Schema validation barrier ({detection.barrier_framework or 'generic'}): {barrier_desc}{ignored_note}",
+            evidence_refs=_with_refs(f"validation_barrier:{detection.barrier_framework or 'generic'}"),
+            is_candidate=False,
+            is_confirmed=False,
+        )
+
+    # 3. Server 5xx errors warrant investigation unless baseline itself already returned 5xx with no new signals.
+    if status >= 500:
+        details = detection.new_expected_signals + detection.new_technical_signals
+        if (
+            detection.has_baseline
+            and detection.baseline_status_code is not None
+            and detection.baseline_status_code >= 500
+            and not details
+        ):
+            return ValidationDecision(
+                outcome="inconclusive",
+                confidence=0.20,
+                severity="info",
+                reason=(
+                    f"HTTP {status}; baseline also returned HTTP {detection.baseline_status_code} "
+                    "without new payload-specific or technical error signals"
+                ),
+                evidence_refs=[f"baseline_http_{detection.baseline_status_code}", f"http_{status}"],
+                is_candidate=False,
+                is_confirmed=False,
+            )
+
+        sev = SEVERITY_BY_STATUS.get(status, "high")
+        return ValidationDecision(
+            outcome="candidate",
+            confidence=0.55 if detection.has_baseline else 0.35,
+            severity=sev,
+            reason=f"HTTP {status}; server-error candidate; technical/payload signals: {details[:3]}{limitation_suffix}",
+            evidence_refs=details[:3] or [f"http_{status}"],
+            is_candidate=True,
+            is_confirmed=False,
+        )
+
+    # 4. Only non-generic, high-specificity signals NOT present in baseline may raise a candidate.
+    if detection.new_expected_signals:
+        return ValidationDecision(
+            outcome="candidate",
+            confidence=0.55 if detection.has_baseline else 0.35,
+            severity="low",
+            reason=f"HTTP {status}; new payload-specific signal: {detection.new_expected_signals[:3]}{limitation_suffix}",
+            evidence_refs=detection.new_expected_signals[:3],
+            is_candidate=True,
+            is_confirmed=False,
+        )
+
+    # 5. Technical SQL error signals on SQLi probes.
+    if relevant_tech and attack_type in ("SQLI", "SQL_INJECTION", "SQL INJECTION"):
+        return ValidationDecision(
+            outcome="candidate",
+            confidence=0.55 if detection.has_baseline else 0.35,
+            severity="medium" if detection.has_baseline else "low",
+            reason=f"HTTP {status}; technical SQL/error signal: {relevant_tech[:3]}{limitation_suffix}",
+            evidence_refs=relevant_tech[:3],
+            is_candidate=True,
+            is_confirmed=False,
+        )
+
+    # 6. Time-based blind injection latency anomaly (requires significant delta when baseline latency is known).
+    elapsed_ms = detection.metadata.get("elapsed_ms")
+    latency_delta_ms = detection.metadata.get("latency_delta_ms")
     if elapsed_ms is not None and elapsed_ms >= 3500:
         is_time_attack = "TIME" in attack_type or any(
             k in str(payload.payload_value).lower()
             for k in ("sleep", "waitfor", "pg_sleep", "delay")
         )
         if is_time_attack:
-            return (
-                "high", True,
-                f"HTTP {status}; significant time delay observed ({round(elapsed_ms, 1)}ms >= 3500ms)",
-                cve_ids,
+            if detection.has_baseline and latency_delta_ms is not None and latency_delta_ms < 3500:
+                return ValidationDecision(
+                    outcome="inconclusive",
+                    confidence=0.20,
+                    severity="info",
+                    reason=(
+                        f"HTTP {status}; latency {elapsed_ms}ms >= 3500ms but baseline was also slow "
+                        f"(delta={latency_delta_ms}ms < 3500ms)"
+                    ),
+                    evidence_refs=[f"time_delta_{latency_delta_ms}ms"],
+                    is_candidate=False,
+                    is_confirmed=False,
+                )
+            return ValidationDecision(
+                outcome="candidate",
+                confidence=0.60 if detection.has_baseline else 0.40,
+                severity="high",
+                reason=f"HTTP {status}; significant time delay observed ({elapsed_ms}ms >= 3500ms){limitation_suffix}",
+                evidence_refs=[f"time_delay_{elapsed_ms}ms"],
+                is_candidate=True,
+                is_confirmed=False,
             )
 
-    # Broad rule keywords alone are weak evidence and must not create
-    # a candidate or increase severity.
-    if generic_hits:
-        return (
-            "info", False,
-            f"HTTP {status}; generic keywords ignored as insufficient "
-            f"evidence: {generic_hits[:3]}",
-            cve_ids,
+    # 7. Pre-existing signal already present in baseline is not evidence of injection/exploit.
+    if detection.preexisting_expected_signals:
+        return ValidationDecision(
+            outcome="rejected",
+            confidence=0.10,
+            severity="info",
+            reason=(
+                f"HTTP {status}; signal already present in baseline response "
+                f"(not introduced by payload): {detection.preexisting_expected_signals[:3]}"
+            ),
+            evidence_refs=detection.preexisting_expected_signals[:3],
+            is_candidate=False,
+            is_confirmed=False,
         )
 
-    return (
-        "info", False,
-        f"HTTP {status}; no sufficiently specific vulnerability signal",
-        cve_ids,
+    # 8. Generic or low-entropy keywords alone never create a candidate.
+    if detection.ignored_generic_signals:
+        return ValidationDecision(
+            outcome="rejected",
+            confidence=0.10,
+            severity="info",
+            reason=(
+                f"HTTP {status}; generic keywords ignored as insufficient evidence: "
+                f"{detection.ignored_generic_signals[:3]}{limitation_suffix}"
+            ),
+            evidence_refs=detection.ignored_generic_signals[:3],
+            is_candidate=False,
+            is_confirmed=False,
+        )
+
+    # 9. Generic response/hash/status differences alone never establish vulnerability.
+    if detection.response_differences:
+        return ValidationDecision(
+            outcome="rejected",
+            confidence=0.15,
+            severity="info",
+            reason=(
+                f"HTTP {status}; generic response difference without vulnerability evidence "
+                f"({sorted(detection.response_differences.keys())}){limitation_suffix}"
+            ),
+            evidence_refs=sorted(detection.response_differences.keys()),
+            is_candidate=False,
+            is_confirmed=False,
+        )
+
+    return ValidationDecision(
+        outcome="rejected",
+        confidence=0.10,
+        severity="info",
+        reason=f"HTTP {status}; no sufficiently specific vulnerability signal{limitation_suffix}",
+        evidence_refs=[],
+        is_candidate=False,
+        is_confirmed=False,
     )
+
+
+def evaluate_response(
+    resp,
+    payload: Payload,
+    rules: Optional[dict] = None,
+    baseline_resp: Any = None,
+) -> tuple[str, bool, str, list[str]]:
+    """Evaluate attack response (and optional baseline) via DetectionResult + ValidationDecision."""
+    detection, cve_ids = detect_response(resp, payload, rules, baseline_resp=baseline_resp)
+    decision = decide_validation(detection, payload)
+    return decision.severity, decision.is_candidate, decision.reason, cve_ids
 
 
 # --------------------------------------------------------------------------
@@ -702,31 +1144,343 @@ async def fire_case(client: "httpx.AsyncClient", case, base_url: str, headers: d
     return await client.request(**kwargs)
 
 
+_FATAL_PROGRAMMING_ERRORS = (
+    AssertionError,
+    AttributeError,
+    ImportError,
+    IndexError,
+    KeyError,
+    MemoryError,
+    NameError,
+    RecursionError,
+    SyntaxError,
+    TypeError,
+    ZeroDivisionError,
+)
+
+
+def _extract_response_body(resp_obj: Any) -> Any:
+    """Safely extract parsed JSON or raw text from an HTTP response."""
+    if resp_obj is None:
+        return None
+    try:
+        return resp_obj.json()
+    except Exception:
+        return getattr(resp_obj, "text", None)
+
+
+async def _validate_bola(
+    *,
+    client: "httpx.AsyncClient",
+    scheduler: RequestScheduler,
+    pc: PreparedCase,
+    attack_response: Any,
+    attack_status: int,
+    baseline_snapshot: Any,
+    baseline_response: Any = None,
+    user1_headers: Optional[dict],
+    user2_headers: Optional[dict],
+) -> Optional[Any]:
+    """Delegate BOLA/IDOR validation to BolaValidator, firing unauthenticated control request."""
+    from core.bola_validator import BolaValidator
+
+    # Non-2xx → let BolaValidator handle via its own early exits; 5xx → return None to delegate
+    if attack_status >= 500:
+        return None  # Let decide_validation() handle server errors generically
+
+    auth_mode = BolaValidator.detect_auth_mode(user1_headers, user2_headers)
+
+    # Fire unauthenticated control request for dual-token or single-token modes with 2xx
+    unauth_status: Optional[int] = None
+    if 200 <= attack_status < 300 and auth_mode in ("dual_token", "single_token"):
+        try:
+            unauth_resp = await scheduler.request(
+                pc.target_app,
+                lambda: fire_case(client, pc.case, pc.base_url, {}, strip_auth=True),
+            )
+            unauth_status = unauth_resp.status_code if unauth_resp is not None else None
+        except (asyncio.CancelledError, CircuitBreakerTrippedError):
+            raise
+        except Exception as exc:
+            logger.debug("Unauthenticated BOLA control check failed on %s: %s", pc.payload.endpoint, exc)
+
+    attack_body = _extract_response_body(attack_response)
+    baseline_body = _extract_response_body(baseline_response)
+
+    return BolaValidator.validate(
+        attack_status=attack_status,
+        baseline_status=baseline_snapshot.status_code if baseline_snapshot else None,
+        unauth_status=unauth_status,
+        attack_response_body=attack_body,
+        baseline_response_body=baseline_body,
+        user1_headers=user1_headers,
+        user2_headers=user2_headers,
+        resource_id=str(pc.payload.payload_value) if pc.payload.target_param else None,
+        endpoint=pc.payload.endpoint,
+        method=pc.payload.method,
+    )
+
+
+class _StaticTransportCase:
+    """Minimal Case-compatible wrapper for follow-up differential probes."""
+
+    def __init__(self, kwargs: dict[str, Any]):
+        self._kwargs = kwargs
+
+    def as_transport_kwargs(self, base_url: str = "") -> dict[str, Any]:
+        return dict(self._kwargs)
+
+
+def _replace_payload_in_obj(obj: Any, old_str: str, new_str: str) -> Any:
+    if isinstance(obj, str):
+        return obj.replace(old_str, new_str) if old_str in obj else obj
+    if isinstance(obj, dict):
+        return {k: _replace_payload_in_obj(v, old_str, new_str) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_replace_payload_in_obj(item, old_str, new_str) for item in obj]
+    return obj
+
+
+def _build_followup_case(pc: PreparedCase, new_payload_value: Any) -> Any:
+    """Build a follow-up Schemathesis/transport Case with *new_payload_value*."""
+    if pc.schema is not None and pc.operation is not None:
+        try:
+            updated_payload = pc.payload.model_copy(update={"payload_value": new_payload_value})
+            return build_case(pc.schema, pc.operation, updated_payload, pc.baseline_case)
+        except Exception as exc:
+            logger.debug("build_case failed for follow-up probe on %s: %s", pc.payload.endpoint, exc)
+
+    kwargs = pc.case.as_transport_kwargs(base_url=pc.base_url)
+    old_str = str(pc.payload.payload_value)
+    new_str = str(new_payload_value)
+    mutated = _replace_payload_in_obj(kwargs, old_str, new_str)
+    return _StaticTransportCase(mutated)
+
+
+def _build_safe_curl_for_case(
+    pc: PreparedCase,
+    headers: dict[str, Any],
+    user2_headers: Optional[dict[str, Any]] = None,
+) -> Optional[str]:
+    """Generate a secret-redacted cURL command from a PreparedCase."""
+    try:
+        kwargs = pc.case.as_transport_kwargs(base_url=pc.base_url)
+        method = str(kwargs.get("method") or pc.payload.method or "GET").upper()
+        url = str(kwargs.get("url") or f"{pc.base_url.rstrip('/')}/{pc.payload.endpoint.lstrip('/')}")
+
+        is_bola = pc.payload.attack_type.upper() in ("BOLA", "IDOR")
+        effective_auth = user2_headers if (is_bola and user2_headers) else headers
+
+        raw_headers = dict(kwargs.get("headers") or {})
+        if effective_auth:
+            raw_headers.update(effective_auth)
+
+        safe_headers: dict[str, Any] = {}
+        secret_keys = {"authorization", "cookie", "x-api-key", "x-auth-token"}
+        for hk, hv in raw_headers.items():
+            kl = str(hk).lower()
+            if kl in secret_keys:
+                if kl == "authorization" and str(hv).lower().startswith("bearer "):
+                    safe_headers[hk] = "Bearer <REDACTED>"
+                else:
+                    safe_headers[hk] = "<REDACTED>"
+            elif kl.startswith("x-schemathesis-"):
+                continue
+            else:
+                safe_headers[hk] = hv
+
+        def _clean_opt(val: Any) -> Any:
+            if val is None or type(val).__name__ == "NotSet":
+                return None
+            return val
+
+        params = _clean_opt(kwargs.get("params"))
+        json_data = _clean_opt(kwargs.get("json"))
+        data = _clean_opt(kwargs.get("data"))
+        raw_cookies = _clean_opt(kwargs.get("cookies"))
+        safe_cookies = (
+            {str(ck): "<REDACTED>" for ck in raw_cookies.keys()}
+            if isinstance(raw_cookies, dict) and raw_cookies
+            else None
+        )
+
+        return build_curl_command(
+            method=method,
+            url=url,
+            headers=safe_headers or None,
+            params=params if isinstance(params, dict) and params else None,
+            data=data,
+            json_data=json_data,
+            cookies=safe_cookies,
+        )
+    except Exception as exc:
+        logger.debug("Could not build cURL command for %s: %s", pc.payload.endpoint, exc)
+        return None
+
+
+async def _validate_ssti(
+    *,
+    client: "httpx.AsyncClient",
+    scheduler: RequestScheduler,
+    pc: PreparedCase,
+    attack_response: Any,
+    attack_status: int,
+    baseline_response: Any,
+    headers: dict[str, Any],
+) -> Optional[Any]:
+    """Delegate SSTI validation + differential confirmation to SstiValidator."""
+    from core.ssti_validator import SstiValidator, build_differential_ssti_probes
+
+    if attack_status >= 500 or attack_status in (400, 422):
+        return None
+
+    diff_probes = build_differential_ssti_probes(
+        pc.payload.payload_value,
+        pc.payload.expected_signal,
+    )
+    if diff_probes is None:
+        return None
+
+    attack_text = getattr(attack_response, "text", None)
+    baseline_text = getattr(baseline_response, "text", None) if baseline_response is not None else None
+
+    # First evaluate without follow-up requests; only re-probe if primary canary newly appeared.
+    prelim = SstiValidator.validate(
+        attack_status=attack_status,
+        attack_body=attack_text,
+        baseline_body=baseline_text,
+        initial_payload=pc.payload.payload_value,
+        initial_expected=diff_probes.initial_expected,
+    )
+    if prelim is None or prelim.outcome != "candidate":
+        return prelim
+
+    # Fire differential arithmetic probe + control literal probe
+    sec_status: Optional[int] = None
+    sec_body: Optional[str] = None
+    ctrl_status: Optional[int] = None
+    ctrl_body: Optional[str] = None
+
+    try:
+        sec_case = _build_followup_case(pc, diff_probes.secondary_payload)
+        sec_resp = await scheduler.request(
+            pc.target_app,
+            lambda: fire_case(client, sec_case, pc.base_url, headers),
+        )
+        if sec_resp is not None:
+            sec_status = sec_resp.status_code
+            sec_body = getattr(sec_resp, "text", None)
+    except (asyncio.CancelledError, CircuitBreakerTrippedError):
+        raise
+    except Exception as exc:
+        logger.debug("Differential SSTI secondary probe failed on %s: %s", pc.payload.endpoint, exc)
+
+    if sec_status is not None and 200 <= sec_status < 300:
+        try:
+            ctrl_case = _build_followup_case(pc, diff_probes.control_payload)
+            ctrl_resp = await scheduler.request(
+                pc.target_app,
+                lambda: fire_case(client, ctrl_case, pc.base_url, headers),
+            )
+            if ctrl_resp is not None:
+                ctrl_status = ctrl_resp.status_code
+                ctrl_body = getattr(ctrl_resp, "text", None)
+        except (asyncio.CancelledError, CircuitBreakerTrippedError):
+            raise
+        except Exception as exc:
+            logger.debug("Differential SSTI control probe failed on %s: %s", pc.payload.endpoint, exc)
+
+    return SstiValidator.validate(
+        attack_status=attack_status,
+        attack_body=attack_text,
+        baseline_body=baseline_text,
+        initial_payload=pc.payload.payload_value,
+        initial_expected=diff_probes.initial_expected,
+        secondary_status=sec_status,
+        secondary_body=sec_body,
+        secondary_expected=diff_probes.secondary_expected,
+        control_status=ctrl_status,
+        control_body=ctrl_body,
+    )
+
+
+def _validate_boundary(
+    *,
+    pc: PreparedCase,
+    attack_response: Any,
+    attack_status: int,
+    baseline_snapshot: Any,
+    baseline_response: Any = None,
+) -> Optional[Any]:
+    """Delegate numeric boundary / overflow HTTP 2xx validation to BoundaryValidator."""
+    from core.boundary_validator import BoundaryValidator
+
+    return BoundaryValidator.validate(
+        attack_status=attack_status,
+        baseline_status=baseline_snapshot.status_code if baseline_snapshot else None,
+        attack_body=_extract_response_body(attack_response),
+        baseline_body=_extract_response_body(baseline_response),
+        param_name=pc.payload.target_param,
+        param_location=pc.payload.param_location,
+        payload_value=pc.payload.payload_value,
+        method=pc.payload.method,
+        endpoint=pc.payload.endpoint,
+    )
+
+
 async def process_fingerprint_group(
     client: "httpx.AsyncClient", scheduler: RequestScheduler,
     fp: str, group: list[PreparedCase], headers: dict,
     rules: Optional[dict], state: RunState, rate_limit_s: float,
     user2_headers: Optional[dict] = None,
     cleanup_tracker: Optional[CleanupTracker] = None,
+    execution_errors: Optional[list[dict[str, Any]]] = None,
+    skip_from_state: bool = False,
 ) -> list[Finding]:
-    """Process one fingerprint group sequentially (stopping once confirmed or retry budget exhausted),
-    while distinct fingerprint groups execute concurrently."""
-    results: list[Finding] = []
+    """Process one fingerprint group sequentially and aggregate all probe observations into one Finding."""
     tracker = cleanup_tracker or GLOBAL_CLEANUP_TRACKER
 
-    if state.status(fp) == "confirmed":
-        return results
-    if state.attempts(fp) >= MAX_ATTEMPTS_PER_FINGERPRINT:
-        return results
-
-    for pc in group:
+    if skip_from_state:
         if state.status(fp) == "confirmed":
-            break
+            return []
         if state.attempts(fp) >= MAX_ATTEMPTS_PER_FINGERPRINT:
-            break
+            return []
+
+    observations: list[Observation] = []
+    obs_to_pc: dict[str, PreparedCase] = {}
+    cve_matches_acc: list[str] = []
+    cve_match_type = ""
+    cve_confidence = 0.0
+    rep_pc: Optional[PreparedCase] = None
+    bola_verdict = None  # Set per-probe by _validate_bola when attack_type is BOLA/IDOR
+    boundary_verdict = None  # Set per-probe by _validate_boundary for numeric boundaries
+    ssti_verdict = None  # Set per-probe by _validate_ssti for SSTI differential validation
+
+    for idx, pc in enumerate(group):
+        if rep_pc is None:
+            rep_pc = pc
 
         payload_value = pc.payload.payload_value
+        payload_hash = content_hash(payload_value)
+        request_hash = content_hash({
+            "target": pc.target_app,
+            "method": pc.payload.method,
+            "endpoint": pc.payload.endpoint,
+            "parameter": pc.payload.target_param,
+            "value": payload_value,
+        })
+        obs_timestamp = datetime.now(timezone.utc).isoformat()
+        obs_id = f"OBS-{content_hash({'fp': fp, 'idx': idx, 'req': request_hash, 'ts': obs_timestamp})}"
+
         attack_response = None
+        baseline_response = None
+        result = None
+        error_text: Optional[str] = None
+        circuit_tripped = False
+        bola_verdict = None
+        boundary_verdict = None
+        ssti_verdict = None
+
         try:
             async def execute_baseline():
                 return await scheduler.request(
@@ -745,8 +1499,16 @@ async def process_fingerprint_group(
                 )
                 return attack_response
 
-            def candidate_detector(response):
-                return evaluate_response(response, pc.payload, rules)[1]
+            cve_ids_for_probe: list[str] = []
+
+            def candidate_detector(attack_resp, baseline_resp=None):
+                nonlocal cve_ids_for_probe, baseline_response
+                baseline_response = baseline_resp
+                detection, cve_ids_for_probe = detect_response(
+                    attack_resp, pc.payload, rules, baseline_resp=baseline_resp
+                )
+                decision = decide_validation(detection, pc.payload)
+                return detection, decision
 
             result = await ConfirmationEngine().confirm(
                 candidate_detector,
@@ -754,191 +1516,267 @@ async def process_fingerprint_group(
                 execute_attack,
                 snapshot_response,
             )
-            error_text = None
-        except Exception as exc:
+        except asyncio.CancelledError:
+            raise
+        except CircuitBreakerTrippedError as cb_exc:
+            circuit_tripped = True
+            error_text = str(cb_exc) or "Circuit breaker tripped"
+            logger.warning("Circuit breaker tripped for fingerprint %s: %s", fp, error_text)
+            if execution_errors is not None:
+                execution_errors.append({
+                    "fingerprint": fp,
+                    "target": pc.target_app,
+                    "type": "circuit_breaker",
+                    "error": error_text,
+                })
+        except _FATAL_PROGRAMMING_ERRORS:
+            raise
+        except (httpx.HTTPError, TimeoutError, OSError, ValueError) as exc:
             attack_response = None
             result = None
-            error_text = str(exc)
-        if rate_limit_s:
+            error_text = f"{type(exc).__name__}: {exc}"
+
+        if rate_limit_s and not circuit_tripped:
             await asyncio.sleep(rate_limit_s)
 
         resp = attack_response
-        if resp is None or result is None:
-            severity, confirmed, evidence, cve_ids = "unknown", False, f"request error: {error_text}", []
-            status_code = None
-            confidence = 0.1
-            confirmation_differences = {}
+        if resp is None or result is None or getattr(result, "error", None):
+            err_detail = error_text or (result.error if result and getattr(result, "error", None) else "No HTTP response received")
+            observations.append(Observation(
+                observation_id=obs_id,
+                timestamp=obs_timestamp,
+                role="error",
+                payload=payload_value,
+                payload_hash=payload_hash,
+                request_hash=request_hash,
+                status_code=None,
+                response_time_ms=0.0,
+                response_headers={},
+                signals=[f"request error: {err_detail}"],
+                differences={},
+                baseline_status_code=result.baseline.status_code if result and result.baseline else None,
+                baseline_response_time_ms=result.baseline.response_time_ms if result and result.baseline else None,
+                outcome="error",
+                severity="unknown",
+                confidence=0.0,
+                validation_result="error",
+                error=err_detail,
+            ))
+            if circuit_tripped:
+                break
+            continue
+
+        detection_obj = getattr(result, "detection", None)
+        decision_obj = getattr(result, "decision", None)
+        if detection_obj is not None and decision_obj is not None:
+            severity = decision_obj.severity
+            evidence = decision_obj.reason
+            cve_ids = cve_ids_for_probe
+            confidence = decision_obj.confidence
         else:
-            severity, confirmed, evidence, cve_ids = evaluate_response(resp, pc.payload, rules)
-            status_code = resp.status_code
-            confirmed = result.confirmed
+            severity, _, evidence, cve_ids = evaluate_response(resp, pc.payload, rules)
             confidence = result.confidence
-            confirmation_differences = result.evidence
+        status_code = resp.status_code
+        confirmed = result.confirmed
+        confirmation_differences = result.evidence
 
-            # Schema validation barrier & adaptive feedback analysis
-            if status_code in (400, 422):
-                feedback = FeedbackAnalyzer.analyze_response(status_code, resp.text, dict(resp.headers))
-                if feedback.is_validation_error and feedback.failed_fields:
-                    recs_summary = "; ".join(feedback.adaptive_recommendations[:2])
-                    evidence = f"HTTP {status_code}; Schema validation barrier ({feedback.framework_hint}): {recs_summary}"
+        # BOLA / IDOR validation via dedicated BolaValidator
+        if pc.payload.attack_type.upper() in ("BOLA", "IDOR"):
+            bola_verdict = await _validate_bola(
+                client=client,
+                scheduler=scheduler,
+                pc=pc,
+                attack_response=resp,
+                attack_status=status_code,
+                baseline_snapshot=result.baseline,
+                baseline_response=baseline_response,
+                user1_headers=headers,
+                user2_headers=user2_headers,
+            )
+            if bola_verdict is not None:
+                confirmed = bola_verdict.outcome == "confirmed"
+                confidence = bola_verdict.confidence
+                severity = bola_verdict.severity
+                evidence = bola_verdict.reason
 
-            # Dual-token BOLA / IDOR cross-account verification (with public-read suppression)
-            if user2_headers and pc.payload.attack_type.upper() in ("BOLA", "IDOR"):
-                if 200 <= status_code < 300:
-                    unauth_status = None
-                    try:
-                        unauth_resp = await scheduler.request(
-                            pc.target_app,
-                            lambda: fire_case(client, pc.case, pc.base_url, {}, strip_auth=True),
-                        )
-                        unauth_status = unauth_resp.status_code
-                    except Exception as unauth_err:
-                        logger.debug("Unauthenticated BOLA control check failed on %s: %s", pc.payload.endpoint, unauth_err)
+        # Numeric Boundary / Integer Overflow validation via dedicated BoundaryValidator
+        if pc.payload.attack_type.upper() in ("INTEGER_OVERFLOW", "BOUNDARY_ANALYSIS"):
+            boundary_verdict = _validate_boundary(
+                pc=pc,
+                attack_response=resp,
+                attack_status=status_code,
+                baseline_snapshot=result.baseline,
+                baseline_response=baseline_response,
+            )
+            if boundary_verdict is not None:
+                confirmed = boundary_verdict.outcome == "confirmed"
+                confidence = boundary_verdict.confidence
+                severity = boundary_verdict.severity
+                evidence = boundary_verdict.reason
 
-                    if unauth_status is not None and 200 <= unauth_status < 300:
-                        confirmed = False
-                        confidence = 0.25
-                        severity = "info"
-                        evidence = (
-                            f"HTTP {status_code}; Unauthenticated request also returned HTTP {unauth_status} "
-                            "(public-read or unprotected endpoint; suppressed dual-user BOLA false positive)"
-                        )
-                    elif unauth_status in (401, 403):
+        # SSTI differential validation via dedicated SstiValidator
+        if pc.payload.attack_type.upper() == "SSTI":
+            ssti_verdict = await _validate_ssti(
+                client=client,
+                scheduler=scheduler,
+                pc=pc,
+                attack_response=resp,
+                attack_status=status_code,
+                baseline_response=baseline_response,
+                headers=headers,
+            )
+            if ssti_verdict is not None:
+                confirmed = ssti_verdict.outcome == "confirmed"
+                confidence = ssti_verdict.confidence
+                severity = ssti_verdict.severity
+                evidence = ssti_verdict.reason
+
+        # Deep State Loopback Verification for Mass Assignment (API3:2023)
+        if pc.payload.attack_type.upper() == "MASS_ASSIGNMENT" and status_code in (200, 201) and resp is not None:
+            loopback_url = None
+            resp_headers = dict(resp.headers)
+            loc_header = resp_headers.get("location") or resp_headers.get("Location")
+            if loc_header:
+                loopback_url = str(loc_header)
+            elif pc.payload.method.upper() in ("PUT", "PATCH"):
+                loopback_url = pc.payload.endpoint
+            else:
+                try:
+                    resp_json = resp.json()
+                    if isinstance(resp_json, dict):
+                        for id_k in ("id", "user_id", "userId", "uuid"):
+                            if id_k in resp_json and resp_json[id_k] is not None:
+                                loopback_url = f"{pc.payload.endpoint.rstrip('/')}/{resp_json[id_k]}"
+                                break
+                except Exception as exc:
+                    logger.debug("Could not parse JSON for mass-assignment loopback URL on %s: %s", pc.payload.endpoint, exc)
+
+            if loopback_url:
+                full_get_url = loopback_url if loopback_url.startswith(("http://", "https://")) else f"{pc.base_url.rstrip('/')}/{loopback_url.lstrip('/')}"
+                try:
+                    is_persisted, verify_msg = verify_deep_state_persistence(
+                        get_url=full_get_url,
+                        expected_field=pc.payload.target_param,
+                        expected_value="admin" if pc.payload.target_param in ("role", "is_admin") else payload_value,
+                        headers=headers,
+                    )
+                    if is_persisted:
                         confirmed = True
-                        confidence = 0.95
-                        severity = "high"
-                        evidence = (
-                            f"HTTP {status_code}; BOLA verified via dual-token cross-user validation "
-                            f"(unauthenticated returned HTTP {unauth_status}, secondary user accessed primary resource)"
-                        )
+                        confidence = 0.98
+                        severity = "critical" if pc.payload.target_param in ("role", "is_admin", "admin") else "high"
+                        evidence = f"HTTP {status_code}; {verify_msg}"
                     else:
                         confirmed = False
-                        confidence = min(confidence, 0.5)
-                        severity = "medium"
-                        evidence = (
-                            f"HTTP {status_code}; Secondary user succeeded but unauthenticated control returned "
-                            f"HTTP {unauth_status}; kept unconfirmed pending authorization check"
-                        )
-                elif status_code in (401, 403):
-                    confirmed = False
-                    severity = "info"
-                    evidence = f"HTTP {status_code}; Access denied as expected for secondary user (Authorization properly enforced)"
+                        severity = "info"
+                        evidence = f"HTTP {status_code}; Loopback verification unpersisted: {verify_msg}"
+                except Exception as verify_err:
+                    evidence += f" (Loopback check: {verify_err})"
 
-            # Deep State Loopback Verification for Mass Assignment (API3:2023)
-            if pc.payload.attack_type.upper() == "MASS_ASSIGNMENT" and status_code in (200, 201) and resp is not None:
-                loopback_url = None
-                resp_headers = dict(resp.headers)
-                loc_header = resp_headers.get("location") or resp_headers.get("Location")
-                if loc_header:
-                    loopback_url = str(loc_header)
-                elif pc.payload.method.upper() in ("PUT", "PATCH"):
-                    loopback_url = pc.payload.endpoint
-                else:
-                    try:
-                        resp_json = resp.json()
-                        if isinstance(resp_json, dict):
-                            for id_k in ("id", "user_id", "userId", "uuid"):
-                                if id_k in resp_json and resp_json[id_k] is not None:
-                                    loopback_url = f"{pc.payload.endpoint.rstrip('/')}/{resp_json[id_k]}"
-                                    break
-                    except Exception as exc:
-                        logger.debug("Could not parse JSON for mass-assignment loopback URL on %s: %s", pc.payload.endpoint, exc)
-
-                if loopback_url:
-                    full_get_url = loopback_url if loopback_url.startswith(("http://", "https://")) else f"{pc.base_url.rstrip('/')}/{loopback_url.lstrip('/')}"
-                    try:
-                        is_persisted, verify_msg = verify_deep_state_persistence(
-                            get_url=full_get_url,
-                            expected_field=pc.payload.target_param,
-                            expected_value="admin" if pc.payload.target_param in ("role", "is_admin") else payload_value,
-                            headers=headers,
-                        )
-                        if is_persisted:
-                            confirmed = True
-                            confidence = 0.98
-                            severity = "critical" if pc.payload.target_param in ("role", "is_admin", "admin") else "high"
-                            evidence = f"HTTP {status_code}; {verify_msg}"
-                        else:
-                            confirmed = False
-                            severity = "info"
-                            evidence = f"HTTP {status_code}; Loopback verification unpersisted: {verify_msg}"
-                    except Exception as verify_err:
-                        evidence += f" (Loopback check: {verify_err})"
-
-            # Staging Safety: Record successful mutations in CleanupTracker
-            if pc.payload.method.upper() in ("POST", "PUT", "PATCH") and status_code in (200, 201, 202, 204) and resp is not None:
+        # Staging Safety: Record successful mutations in CleanupTracker
+        if pc.payload.method.upper() in ("POST", "PUT", "PATCH") and status_code in (200, 201, 202, 204) and resp is not None:
+            try:
+                resp_data = None
                 try:
-                    resp_data = None
-                    try:
-                        resp_data = resp.json()
-                    except Exception:
-                        resp_data = resp.text
-                    tracker.record_mutation(
-                        method=pc.payload.method,
-                        target_url=pc.base_url,
-                        endpoint=pc.payload.endpoint,
-                        status_code=status_code,
-                        response_data=resp_data,
-                        response_headers=dict(resp.headers),
-                    )
-                except Exception as exc:
-                    logger.debug("CleanupTracker mutation recording failed on %s: %s", pc.payload.endpoint, exc)
-        elapsed_ms = result.attack.response_time_ms if result and result.attack else 0
+                    resp_data = resp.json()
+                except Exception:
+                    resp_data = resp.text
+                tracker.record_mutation(
+                    method=pc.payload.method,
+                    target_url=pc.base_url,
+                    endpoint=pc.payload.endpoint,
+                    status_code=status_code,
+                    response_data=resp_data,
+                    response_headers=dict(resp.headers),
+                )
+            except Exception as exc:
+                logger.debug("CleanupTracker mutation recording failed on %s: %s", pc.payload.endpoint, exc)
 
-        evidence_model = Evidence(
-            status_code=status_code,
-            response_headers=redact_headers(dict(resp.headers)) if resp is not None else {},
-            response_signal=[evidence],
-            response_time_ms=round(elapsed_ms, 1),
-            payload_hash=content_hash(payload_value),
-            request_hash=content_hash({
-                "target": pc.target_app,
-                "method": pc.payload.method,
-                "endpoint": pc.payload.endpoint,
-                "parameter": pc.payload.target_param,
-                "value": payload_value,
-            }),
-            endpoint=pc.payload.endpoint,
+        elapsed_ms = result.attack.response_time_ms if result and result.attack else 0.0
+        if confirmed:
+            outcome = "confirmed"
+        elif bola_verdict is not None and pc.payload.attack_type.upper() in ("BOLA", "IDOR"):
+            outcome = bola_verdict.outcome
+        elif boundary_verdict is not None and pc.payload.attack_type.upper() in ("INTEGER_OVERFLOW", "BOUNDARY_ANALYSIS"):
+            outcome = boundary_verdict.outcome
+        elif ssti_verdict is not None and pc.payload.attack_type.upper() == "SSTI":
+            outcome = ssti_verdict.outcome
+        elif decision_obj is not None:
+            outcome = decision_obj.outcome
+        else:
+            outcome = "candidate" if result.candidate else "rejected"
+
+        if cve_ids and outcome in ("candidate", "confirmed") and pc.payload.technology:
+            cve_matches_acc = list(dict.fromkeys(cve_matches_acc + cve_ids))
+            curr_conf = 0.94
+            if curr_conf >= cve_confidence:
+                cve_confidence = curr_conf
+                cve_match_type = "cpe"
+
+        obs_obj = Observation(
+            observation_id=obs_id,
+            timestamp=obs_timestamp,
+            role="attack",
             payload=payload_value,
-            auth_context=redact_headers(headers),
-            previous_observations=([{
-                "role": "baseline",
-                "status_code": result.baseline.status_code,
-                "response_time_ms": result.baseline.response_time_ms,
-                "differences": confirmation_differences,
-            }] if result and result.baseline else []),
-        )
-        finding = Finding(
-            finding_id=stable_finding_id(
-                pc.target_app, pc.payload.method, pc.payload.endpoint,
-                pc.payload.attack_type, pc.payload.target_param,
-            ),
-            run_id=STATE_RUN_ID.get(),
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            tool="schemathesis",
-            target_app=pc.target_app,
-            endpoint=pc.payload.endpoint,
-            method=pc.payload.method,
-            attack_type=pc.payload.attack_type,
-            owasp_category=pc.payload.owasp_category,
-            payload=pc.payload.payload_value,
+            payload_hash=payload_hash,
+            request_hash=request_hash,
             status_code=status_code,
             response_time_ms=round(elapsed_ms, 1),
-            evidence=evidence_model,
+            response_headers=redact_headers(dict(resp.headers)),
+            signals=[evidence],
+            differences=confirmation_differences,
+            baseline_status_code=result.baseline.status_code if result.baseline else None,
+            baseline_response_time_ms=result.baseline.response_time_ms if result.baseline else None,
+            outcome=outcome,
             severity=severity,
             confidence=confidence,
-            confirmed=confirmed,
-            lifecycle=("confirmed" if confirmed else
-                       ("candidate" if result and result.candidate else "rejected")),
-            fingerprint=fp,
-            cve_matches=cve_ids,
-            cve_match_type=("cpe" if pc.payload.technology else "keyword") if cve_ids else "",
-            cve_confidence=0.94 if pc.payload.technology and cve_ids else (0.2 if cve_ids else 0.0),
+            validation_result=outcome,
         )
-        results.append(finding)
-        state.record(fp, "confirmed" if confirmed else ("candidate" if result and result.candidate else "rejected"))
+        observations.append(obs_obj)
+        obs_to_pc[obs_id] = pc
 
-    return results
+        if confirmed:
+            break
+
+    if not observations or rep_pc is None:
+        return []
+
+    rep_obs = max(
+        observations,
+        key=lambda obs: (
+            LIFECYCLE_RANK.get(obs.outcome, 0),
+            obs.confidence,
+            1 if obs.status_code is not None else 0,
+        ),
+    )
+    curl_pc = obs_to_pc.get(rep_obs.observation_id, rep_pc)
+    curl_cmd = _build_safe_curl_for_case(curl_pc, headers, user2_headers=user2_headers)
+
+    finding = build_finding_from_observations(
+        finding_id=stable_finding_id(
+            rep_pc.target_app,
+            rep_pc.payload.method,
+            rep_pc.payload.endpoint,
+            rep_pc.payload.attack_type,
+            rep_pc.payload.target_param,
+        ),
+        run_id=STATE_RUN_ID.get(),
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        target_app=rep_pc.target_app,
+        endpoint=rep_pc.payload.endpoint,
+        method=rep_pc.payload.method,
+        tool="schemathesis",
+        attack_type=rep_pc.payload.attack_type,
+        owasp_category=rep_pc.payload.owasp_category,
+        fingerprint=fp,
+        observations=observations,
+        auth_context=redact_headers(headers),
+        cve_matches=cve_matches_acc,
+        cve_match_type=cve_match_type,
+        cve_confidence=cve_confidence,
+        curl_command=curl_cmd,
+    )
+    state.record(fp, finding.lifecycle)
+    return [finding]
 
 
 async def run_all(prepared: list[PreparedCase], headers: dict,
@@ -950,7 +1788,9 @@ async def run_all(prepared: list[PreparedCase], headers: dict,
                    session_keeper: Optional[Any] = None,
                    proxy_rotator: Optional[Any] = None,
                    auth_manager: Optional[Any] = None,
-                   cleanup_tracker: Optional[CleanupTracker] = None) -> list[Finding]:
+                   cleanup_tracker: Optional[CleanupTracker] = None,
+                   execution_errors: Optional[list[dict[str, Any]]] = None,
+                   skip_from_state: bool = False) -> list[Finding]:
     groups: dict[str, list[PreparedCase]] = {}
     for pc in prepared:
         groups.setdefault(pc.fingerprint, []).append(pc)
@@ -977,21 +1817,50 @@ async def run_all(prepared: list[PreparedCase], headers: dict,
     if auth_manager is not None and auth_manager.get_httpx_cert() is not None:
         client_kwargs["cert"] = auth_manager.get_httpx_cert()
 
+    fp_list = list(groups.keys())
     async with httpx.AsyncClient(**client_kwargs) as client:
         tasks = [
             process_fingerprint_group(
-                client, scheduler, fp, group, merged_headers,
+                client, scheduler, fp, groups[fp], merged_headers,
                 rules, state, rate_limit_ms / 1000,
                 user2_headers=user2_headers,
                 cleanup_tracker=cleanup_tracker,
+                execution_errors=execution_errors,
+                skip_from_state=skip_from_state,
             )
-            for fp, group in groups.items()
+            for fp in fp_list
         ]
-        grouped_results = await asyncio.gather(*tasks)
+        grouped_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     all_findings: list[Finding] = []
-    for r in grouped_results:
-        all_findings.extend(r)
+    fatal_error: Optional[BaseException] = None
+    for fp, item in zip(fp_list, grouped_results):
+        if isinstance(item, asyncio.CancelledError):
+            raise item
+        if isinstance(item, _FATAL_PROGRAMMING_ERRORS):
+            logger.exception("Fatal programming/system error in fingerprint group %s", fp, exc_info=item)
+            if execution_errors is not None:
+                execution_errors.append({
+                    "fingerprint": fp,
+                    "type": "fatal_error",
+                    "error": f"{type(item).__name__}: {item}",
+                })
+            if fatal_error is None:
+                fatal_error = item
+            continue
+        if isinstance(item, BaseException):
+            logger.error("Fingerprint group %s failed: %s", fp, item, exc_info=item)
+            if execution_errors is not None:
+                execution_errors.append({
+                    "fingerprint": fp,
+                    "type": "group_error",
+                    "error": f"{type(item).__name__}: {item}",
+                })
+            continue
+        all_findings.extend(item)
+
+    if fatal_error is not None:
+        raise fatal_error
     return all_findings
 
 
@@ -1014,6 +1883,7 @@ def execute_rest_scan(
     auth_manager: Optional[Any] = None,
     seed_corpus: Optional[Any] = None,
     cleanup_tracker: Optional[CleanupTracker] = None,
+    resume_state: bool = False,
 ) -> list[Finding]:
     """Execute REST fuzzing in-process with shared scheduler, session, and proxy hooks."""
     resolved_rules_path = PROJECT_PATHS.resolve(
@@ -1058,6 +1928,7 @@ def execute_rest_scan(
         total_prepared = len(prepared)
         total_dropped_at_prepare = total_payloads - total_prepared
 
+        execution_errors: list[dict[str, Any]] = []
         findings = asyncio.run(run_all(
             prepared,
             headers or {},
@@ -1073,9 +1944,21 @@ def execute_rest_scan(
             proxy_rotator=proxy_rotator,
             auth_manager=auth_manager,
             cleanup_tracker=tracker,
+            execution_errors=execution_errors,
+            skip_from_state=resume_state,
         ))
-        total_fired = len(findings)
-        total_skipped = total_prepared - total_fired
+        total_probes_fired = sum(max(f.observation_count, 1) for f in findings)
+        total_findings_emitted = len(findings)
+        total_probe_errors = sum(f.error_count for f in findings)
+        unique_fps = {pc.fingerprint for pc in prepared}
+        total_skipped_groups = max(0, len(unique_fps) - total_findings_emitted)
+        has_cb = any(err.get("type") == "circuit_breaker" for err in execution_errors)
+        if has_cb:
+            scan_status = "aborted_circuit_breaker"
+        elif execution_errors or total_probe_errors > 0:
+            scan_status = "completed_with_errors"
+        else:
+            scan_status = "completed"
 
         result_manager.append_findings(
             findings,
@@ -1091,8 +1974,8 @@ def execute_rest_scan(
             "targets": targets_desc,
             "total_payloads": total_payloads,
             "total_dropped_at_prepare": total_dropped_at_prepare,
-            "total_fired": total_fired,
-            "total_skipped_dedup": total_skipped,
+            "total_fired": total_probes_fired,
+            "total_skipped_dedup": total_skipped_groups,
             "total_confirmed": sum(1 for f in findings if f.confirmed),
             "llm_used": bool(payloads_path),
         }, [
@@ -1105,8 +1988,12 @@ def execute_rest_scan(
             run_id=run_id,
             metadata={
                 "tool": "schemathesis",
+                "status": scan_status,
                 "total_payloads": total_payloads,
-                "total_fired": total_fired,
+                "total_fired": total_probes_fired,
+                "total_findings": total_findings_emitted,
+                "total_probe_errors": total_probe_errors,
+                "execution_errors": execution_errors,
                 "total_confirmed": sum(1 for finding in findings if finding.confirmed),
                 "payload_mode": "custom" if payloads_path else "openapi",
             },
@@ -1122,9 +2009,11 @@ def execute_rest_scan(
         except Exception as exc:
             logger.warning("Failed to write cleanup manifest: %s", exc)
 
+        status_label = "[DONE]" if scan_status == "completed" else f"[WARNING:{scan_status.upper()}]"
         print(
-            f"[DONE] run_id={run_id} | prepared={total_prepared}/{total_payloads} "
-            f"| fired={total_fired} | skipped_dedup={total_skipped} "
+            f"{status_label} run_id={run_id} | prepared={total_prepared}/{total_payloads} "
+            f"| probes={total_probes_fired} | findings={total_findings_emitted} "
+            f"| errors={total_probe_errors + len(execution_errors)} | skipped_dedup={total_skipped_groups} "
             f"| confirmed={sum(1 for f in findings if f.confirmed)} "
             f"| log: {resolved_results_dir / 'vulnerabilities.csv'}"
         )
@@ -1176,6 +2065,11 @@ def main(argv: Optional[list[str]] = None):
     )
     ap.add_argument("--proxy", default=None, help="Upstream HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:8080)")
     ap.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification")
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip fingerprints already confirmed or at max attempts in state.json",
+    )
     args = ap.parse_args(argv)
 
     if args.spec:
@@ -1239,4 +2133,5 @@ def main(argv: Optional[list[str]] = None):
         global_rps=args.global_rps,
         proxy=args.proxy,
         insecure=args.insecure,
+        resume_state=args.resume,
     )

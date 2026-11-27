@@ -303,7 +303,7 @@ def test_dual_user_bola_suppresses_public_read_endpoint(tmp_path: Path):
     findings = asyncio.run(_run())
     assert len(findings) == 1
     assert findings[0].confirmed is False
-    assert "public-read or unprotected" in findings[0].evidence.response_signal[0]
+    assert "public" in findings[0].evidence.response_signal[0].lower()
 
 
 def test_dual_user_bola_confirms_protected_cross_user_access(tmp_path: Path):

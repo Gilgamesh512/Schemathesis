@@ -124,7 +124,7 @@ class SemanticMutationEngine:
                     attack_type="BOLA",
                     payload_value=int_seed + 1,
                     owasp_category="API1:2023",
-                    expected_signal=["admin", "user", "id", "created_at"],
+                    expected_signal=[],
                     description=f"Live seed successor BOLA probe (seed={int_seed} -> {int_seed + 1})",
                 ))
                 if int_seed > 0:
@@ -132,7 +132,7 @@ class SemanticMutationEngine:
                         attack_type="BOLA",
                         payload_value=int_seed - 1,
                         owasp_category="API1:2023",
-                        expected_signal=["admin", "user", "id", "created_at"],
+                        expected_signal=[],
                         description=f"Live seed predecessor BOLA probe (seed={int_seed} -> {int_seed - 1})",
                     ))
             elif isinstance(resolved_seed, str) and len(resolved_seed) > 0:
@@ -145,7 +145,7 @@ class SemanticMutationEngine:
                         attack_type="BOLA",
                         payload_value=mutated_uuid,
                         owasp_category="API1:2023",
-                        expected_signal=["admin", "user", "id", "created_at"],
+                        expected_signal=[],
                         description=f"Live UUID seed mutation BOLA probe ({mutated_uuid})",
                     ))
                 else:
@@ -156,7 +156,7 @@ class SemanticMutationEngine:
                         attack_type="BOLA",
                         payload_value=mutated_str,
                         owasp_category="API1:2023",
-                        expected_signal=["admin", "user", "id"],
+                        expected_signal=[],
                         description=f"Live alphanumeric seed mutation BOLA probe ({mutated_str})",
                     ))
                 # 0c. Live Seed-Anchored SQL Canary
@@ -177,7 +177,7 @@ class SemanticMutationEngine:
                 attack_type="BOLA",
                 payload_value="00000000-0000-0000-0000-000000000001",
                 owasp_category="API1:2023",
-                expected_signal=["admin", "user", "id", "created_at"],
+                expected_signal=[],
                 description="Schema-conforming UUID tampering (BOLA/IDOR)",
             ))
             # SQLi: UUID-embedded SQL canary if backend does string interpolation before cast
@@ -199,7 +199,7 @@ class SemanticMutationEngine:
                 attack_type="BOLA",
                 payload_value="admin@example.com",
                 owasp_category="API1:2023",
-                expected_signal=["admin", "role", "id"],
+                expected_signal=[],
                 description="Schema-conforming email authorization override",
             ))
             # SQLi: valid RFC 5322 local-part SQL canary
@@ -210,13 +210,13 @@ class SemanticMutationEngine:
                 expected_signal=["sql", "syntax", "sqlite", "psql", "traceback"],
                 description="RFC 5322 compliant SQL injection canary email",
             ))
-            # SSTI: valid email format with template expression
+            # SSTI: valid email format with high-entropy template expression
             probes.append(SemanticProbe(
                 attack_type="SSTI",
-                payload_value="canary.ssti.{{7*7}}@example.com",
+                payload_value="canary.ssti.{{9187*8431}}@example.com",
                 owasp_category="API8:2023",
-                expected_signal=["49"],
-                description="Schema-conforming template injection email",
+                expected_signal=["77455597"],
+                description="Schema-conforming high-entropy template injection email",
             ))
             # XSS: valid email with XSS tag in alias
             probes.append(SemanticProbe(
@@ -288,14 +288,14 @@ class SemanticMutationEngine:
                 attack_type="BOLA",
                 payload_value=1,
                 owasp_category="API1:2023",
-                expected_signal=["admin", "user", "id"],
+                expected_signal=[],
                 description="Integer ID BOLA probe (Root/Admin object)",
             ))
             probes.append(SemanticProbe(
                 attack_type="BOLA",
                 payload_value=0,
                 owasp_category="API1:2023",
-                expected_signal=["admin", "user", "id"],
+                expected_signal=[],
                 description="Integer ID BOLA probe (Zero index object)",
             ))
             probes.append(SemanticProbe(
@@ -310,14 +310,14 @@ class SemanticMutationEngine:
                 attack_type="INTEGER_OVERFLOW",
                 payload_value=2147483647,  # INT32 MAX
                 owasp_category="API4:2023",
-                expected_signal=["overflow", "exception", "traceback"],
+                expected_signal=[],
                 description="Int32 maximum boundary probe",
             ))
             probes.append(SemanticProbe(
                 attack_type="INTEGER_OVERFLOW",
                 payload_value=-1,
                 owasp_category="API4:2023",
-                expected_signal=["negative", "invalid", "unhandled"],
+                expected_signal=[],
                 description="Negative integer boundary probe",
             ))
             return probes
@@ -330,7 +330,7 @@ class SemanticMutationEngine:
                 attack_type="MASS_ASSIGNMENT",
                 payload_value=True,
                 owasp_category="API3:2023",
-                expected_signal=["true", "admin", "success"],
+                expected_signal=[],
                 description="Privilege elevation boolean probe",
             ))
             return probes
@@ -371,7 +371,7 @@ class SemanticMutationEngine:
                 attack_type="BOLA",
                 payload_value="admin",
                 owasp_category="API1:2023",
-                expected_signal=["admin", "id", "user"],
+                expected_signal=[],
                 description="String administrative identity override",
             ),
             SemanticProbe(
@@ -397,10 +397,24 @@ class SemanticMutationEngine:
             ),
             SemanticProbe(
                 attack_type="SSTI",
-                payload_value="{{7*7}}",
+                payload_value="{{9187*8431}}",
                 owasp_category="API8:2023",
-                expected_signal=["49"],
-                description="Server-Side Template Injection canary probe",
+                expected_signal=["77455597"],
+                description="High-entropy Jinja2/Twig SSTI canary probe",
+            ),
+            SemanticProbe(
+                attack_type="SSTI",
+                payload_value="${9187*8431}",
+                owasp_category="API8:2023",
+                expected_signal=["77455597"],
+                description="High-entropy EL/FreeMarker/Mako SSTI canary probe",
+            ),
+            SemanticProbe(
+                attack_type="SSTI",
+                payload_value="<%= 9187*8431 %>",
+                owasp_category="API8:2023",
+                expected_signal=["77455597"],
+                description="High-entropy ERB/EJS SSTI canary probe",
             ),
             SemanticProbe(
                 attack_type="NOSQL_INJECTION",

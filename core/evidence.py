@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -119,8 +120,19 @@ class RequestScheduler:
                 if status in (429, 403, 503) and self.proxy_rotator is not None:
                     await self.proxy_rotator.report_response(proxy_url, status)
 
-                if last_exc is not None and attempt >= self.max_retries:
-                    raise last_exc
+                if last_exc is not None:
+                    # Only retry transient transport/timeout errors; surface deterministic errors immediately.
+                    is_transient = isinstance(last_exc, (TimeoutError, ConnectionError, OSError)) or (
+                        "timeout" in type(last_exc).__name__.lower()
+                        or "connect" in type(last_exc).__name__.lower()
+                        or "transport" in type(last_exc).__name__.lower()
+                        or "network" in type(last_exc).__name__.lower()
+                        or "protocol" in type(last_exc).__name__.lower()
+                    )
+                    if not is_transient or attempt >= self.max_retries:
+                        raise last_exc
+                    await asyncio.sleep(min((2 ** attempt) * 0.5 + random.uniform(0.05, 0.25), 5.0))
+                    continue
 
                 is_throttled = status in (429, 503)
                 if not is_throttled or attempt >= self.max_retries:
@@ -230,7 +242,9 @@ def compare_responses(baseline: Any, attack: Any) -> dict[str, Any]:
 
 
 def snapshot_response(response: Any, elapsed_ms: float,
-                      graphql: bool = False) -> ResponseSnapshot:
+                      graphql: bool = False) -> Optional[ResponseSnapshot]:
+    if response is None:
+        return None
     errors: tuple[str, ...] = ()
     data_shape: tuple[str, ...] = ()
     if graphql:
@@ -255,29 +269,134 @@ def snapshot_response(response: Any, elapsed_ms: float,
     )
 
 
+class DetectionResult(BaseModel):
+    """Structured evidence gathered from comparing baseline and attack responses."""
+
+    attack_type: str
+    target_endpoint: str = ""
+    has_baseline: bool = False
+    baseline_limitation: Optional[str] = None
+    status_code: Optional[int] = None
+    baseline_status_code: Optional[int] = None
+    response_differences: dict[str, Any] = Field(default_factory=dict)
+    new_expected_signals: list[str] = Field(default_factory=list)
+    preexisting_expected_signals: list[str] = Field(default_factory=list)
+    ignored_generic_signals: list[str] = Field(default_factory=list)
+    technical_signals: list[str] = Field(default_factory=list)
+    new_technical_signals: list[str] = Field(default_factory=list)
+    validation_barrier: bool = False
+    barrier_framework: Optional[str] = None
+    barrier_details: list[str] = Field(default_factory=list)
+    anomalies: list[str] = Field(default_factory=list)
+    evidence_summary: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ValidationDecision(BaseModel):
+    """Policy verdict derived from DetectionResult without conflating evidence with severity."""
+
+    outcome: str = "rejected"  # "confirmed" | "candidate" | "rejected" | "inconclusive" | "error"
+    confidence: float = Field(default=0.1, ge=0.0, le=1.0)
+    severity: str = "info"
+    reason: str = ""
+    evidence_refs: list[str] = Field(default_factory=list)
+    is_candidate: bool = False
+    is_confirmed: bool = False
+
+
 class ConfirmationEngine:
     """Execute baseline and attack through protocol-specific async adapters."""
 
+    @staticmethod
+    def _invoke_detector(candidate, attack_response, baseline_response):
+        if not callable(candidate):
+            return candidate
+        try:
+            params = [
+                p for p in inspect.signature(candidate).parameters.values()
+                if p.kind in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+            ]
+            has_varargs = any(
+                p.kind == inspect.Parameter.VAR_POSITIONAL
+                for p in inspect.signature(candidate).parameters.values()
+            )
+            if has_varargs or len(params) >= 2:
+                return candidate(attack_response, baseline_response)
+        except (TypeError, ValueError):
+            pass
+        return candidate(attack_response)
+
     async def confirm(self, candidate, execute_baseline, execute_attack,
                       snapshot=snapshot_response) -> ConfirmationResult:
+        baseline_response = None
         baseline_snapshot = None
         if execute_baseline is not None:
             started = time.perf_counter()
             try:
-                response = await execute_baseline()
+                baseline_response = await execute_baseline()
                 baseline_snapshot = snapshot(
-                    response, (time.perf_counter() - started) * 1000,
+                    baseline_response, (time.perf_counter() - started) * 1000,
                 )
+            except (asyncio.CancelledError, CircuitBreakerTrippedError):
+                raise
             except Exception:
+                baseline_response = None
                 baseline_snapshot = None
 
         started = time.perf_counter()
-        attack_response = await execute_attack()
+        try:
+            attack_response = await execute_attack()
+        except (asyncio.CancelledError, CircuitBreakerTrippedError):
+            raise
+        except Exception as exc:
+            err_msg = str(exc) or exc.__class__.__name__
+            return ConfirmationResult(
+                False, False, 0.0, {"error": err_msg},
+                baseline_snapshot, None, error=err_msg,
+            )
+
+        if attack_response is None:
+            err_msg = "No HTTP response received"
+            return ConfirmationResult(
+                False, False, 0.0, {"error": err_msg},
+                baseline_snapshot, None, error=err_msg,
+            )
+
         attack_snapshot = snapshot(
             attack_response, (time.perf_counter() - started) * 1000,
         )
-        is_candidate = candidate(attack_response) if callable(candidate) else candidate
-        return confirmation_result(baseline_snapshot, attack_snapshot, is_candidate)
+        if attack_snapshot is None:
+            err_msg = "Could not snapshot empty attack response"
+            return ConfirmationResult(
+                False, False, 0.0, {"error": err_msg},
+                baseline_snapshot, None, error=err_msg,
+            )
+
+        detector_out = self._invoke_detector(candidate, attack_response, baseline_response)
+        detection_obj: Optional[DetectionResult] = None
+        decision_obj: Optional[ValidationDecision] = None
+        if isinstance(detector_out, tuple) and len(detector_out) == 2:
+            maybe_det, maybe_dec = detector_out
+            if isinstance(maybe_det, DetectionResult):
+                detection_obj = maybe_det
+            if isinstance(maybe_dec, ValidationDecision):
+                decision_obj = maybe_dec
+                is_candidate = decision_obj.is_candidate
+            else:
+                is_candidate = bool(maybe_dec)
+        elif isinstance(detector_out, ValidationDecision):
+            decision_obj = detector_out
+            is_candidate = decision_obj.is_candidate
+        else:
+            is_candidate = bool(detector_out)
+
+        res = confirmation_result(baseline_snapshot, attack_snapshot, is_candidate)
+        res.detection = detection_obj
+        res.decision = decision_obj
+        return res
 
 
 @dataclass
@@ -301,6 +420,9 @@ class ConfirmationResult:
     evidence: dict[str, Any]
     baseline: Optional[ResponseSnapshot]
     attack: Optional[ResponseSnapshot]
+    error: Optional[str] = None
+    detection: Optional[DetectionResult] = None
+    decision: Optional[ValidationDecision] = None
 
 
 def confirmation_result(baseline: Optional[ResponseSnapshot],
@@ -329,6 +451,55 @@ def confirmation_result(baseline: Optional[ResponseSnapshot],
     )
 
 
+LIFECYCLE_RANK: dict[str, int] = {
+    "new": 0,
+    "error": 1,
+    "rejected": 2,
+    "inconclusive": 3,
+    "candidate": 4,
+    "confirmed": 5,
+}
+
+
+class Observation(BaseModel):
+    """Single probe execution observation attached to an aggregated Finding."""
+
+    observation_id: str
+    timestamp: str
+    role: str = "attack"
+    payload: Any = None
+    payload_hash: str = ""
+    request_hash: str = ""
+    status_code: Optional[int] = None
+    response_time_ms: Optional[float] = None
+    response_headers: dict[str, Any] = Field(default_factory=dict)
+    signals: list[str] = Field(default_factory=list)
+    differences: dict[str, Any] = Field(default_factory=dict)
+    baseline_status_code: Optional[int] = None
+    baseline_response_time_ms: Optional[float] = None
+    outcome: str = "inconclusive"
+    severity: str = "info"
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    validation_result: str = "not_run"
+    error: Optional[str] = None
+
+    @field_validator("outcome", mode="before")
+    @classmethod
+    def _normalize_outcome(cls, value: Any) -> str:
+        val = str(value or "inconclusive").strip().lower()
+        if val in {"confirmed", "candidate", "inconclusive", "rejected", "error"}:
+            return val
+        return "inconclusive"
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _normalize_obs_severity(cls, value: Any) -> str:
+        sev = str(value or "info").strip().lower()
+        if sev in {"critical", "high", "medium", "low", "info", "unknown"}:
+            return sev
+        return "info"
+
+
 class Finding(BaseModel):
     finding_id: str
     run_id: str
@@ -352,6 +523,9 @@ class Finding(BaseModel):
     cve_match_type: str = ""
     cve_confidence: float = 0.0
     curl_command: Optional[str] = None
+    observations: list[Observation] = Field(default_factory=list)
+    observation_count: int = 0
+    error_count: int = 0
 
     @field_validator("severity", mode="before")
     @classmethod
@@ -360,6 +534,257 @@ class Finding(BaseModel):
         if sev in {"critical", "high", "medium", "low", "info", "unknown"}:
             return sev
         return "info"
+
+
+def summarize_lifecycle(outcomes: list[str]) -> str:
+    """Compute overall Finding lifecycle from individual Observation outcomes."""
+    if not outcomes:
+        return "new"
+    best = max(
+        (str(o).strip().lower() for o in outcomes),
+        key=lambda val: LIFECYCLE_RANK.get(val, 0),
+    )
+    return best if best in LIFECYCLE_RANK else "inconclusive"
+
+
+def _select_representative_observation(observations: list[Observation]) -> Observation:
+    """Select the highest-precedence observation to summarize top-level Finding fields."""
+    return max(
+        observations,
+        key=lambda obs: (
+            LIFECYCLE_RANK.get(obs.outcome, 0),
+            obs.confidence,
+            1 if obs.status_code is not None else 0,
+        ),
+    )
+
+
+def synthesize_observation_from_finding(finding: Finding) -> Observation:
+    """Convert a legacy Finding without observations into an equivalent Observation."""
+    if finding.confirmed:
+        outcome = "confirmed"
+    elif finding.lifecycle in LIFECYCLE_RANK and finding.lifecycle != "new":
+        outcome = finding.lifecycle
+    else:
+        outcome = "inconclusive"
+
+    baseline_status = None
+    baseline_time = None
+    differences: dict[str, Any] = {}
+    for prev in finding.evidence.previous_observations:
+        if isinstance(prev, dict) and prev.get("role") == "baseline":
+            baseline_status = prev.get("status_code")
+            baseline_time = prev.get("response_time_ms")
+            if isinstance(prev.get("differences"), dict):
+                differences = dict(prev["differences"])
+            break
+
+    obs_id = "OBS-" + content_hash({
+        "finding_id": finding.finding_id,
+        "timestamp": finding.timestamp,
+        "payload_hash": finding.evidence.payload_hash,
+        "request_hash": finding.evidence.request_hash,
+        "status_code": finding.status_code,
+        "signals": finding.evidence.response_signal,
+    })
+    return Observation(
+        observation_id=obs_id,
+        timestamp=finding.timestamp,
+        role="error" if outcome == "error" else "attack",
+        payload=finding.payload if finding.payload is not None else finding.evidence.payload,
+        payload_hash=finding.evidence.payload_hash or content_hash(finding.payload),
+        request_hash=finding.evidence.request_hash or content_hash({
+            "target": finding.target_app,
+            "method": finding.method,
+            "endpoint": finding.endpoint,
+            "payload": finding.payload,
+        }),
+        status_code=finding.status_code if finding.status_code is not None else finding.evidence.status_code,
+        response_time_ms=(
+            finding.response_time_ms
+            if finding.response_time_ms is not None
+            else finding.evidence.response_time_ms
+        ),
+        response_headers=dict(finding.evidence.response_headers),
+        signals=list(finding.evidence.response_signal),
+        differences=differences,
+        baseline_status_code=baseline_status,
+        baseline_response_time_ms=baseline_time,
+        outcome=outcome,
+        severity=finding.severity,
+        confidence=finding.confidence,
+        validation_result=outcome,
+        error=(
+            "; ".join(finding.evidence.response_signal)
+            if outcome == "error" and finding.evidence.response_signal
+            else None
+        ),
+    )
+
+
+def build_finding_from_observations(
+    *,
+    finding_id: str,
+    run_id: str,
+    timestamp: str,
+    target_app: str,
+    endpoint: str,
+    method: str,
+    tool: str,
+    attack_type: str,
+    fingerprint: str,
+    observations: list[Observation],
+    owasp_category: Optional[str] = None,
+    auth_context: Optional[dict[str, Any]] = None,
+    cve_matches: Optional[list[str]] = None,
+    cve_match_type: str = "",
+    cve_confidence: float = 0.0,
+    curl_command: Optional[str] = None,
+    extra_previous_observations: Optional[list[dict[str, Any]]] = None,
+) -> Finding:
+    """Aggregate one or more Observations into a single canonical Finding."""
+    if not observations:
+        raise ValueError("observations must contain at least one Observation")
+
+    rep = _select_representative_observation(observations)
+    lifecycle = summarize_lifecycle([o.outcome for o in observations])
+    confirmed = lifecycle == "confirmed"
+    error_count = sum(1 for o in observations if o.outcome == "error")
+
+    prev_obs: list[dict[str, Any]] = []
+    if rep.baseline_status_code is not None:
+        prev_obs.append({
+            "role": "baseline",
+            "status_code": rep.baseline_status_code,
+            "response_time_ms": rep.baseline_response_time_ms,
+            "differences": rep.differences,
+        })
+    if extra_previous_observations:
+        prev_obs.extend(extra_previous_observations)
+
+    signals = list(rep.signals)
+    if not signals and rep.error:
+        signals = [rep.error]
+
+    evidence_model = Evidence(
+        status_code=rep.status_code,
+        response_headers=dict(rep.response_headers),
+        response_signal=signals,
+        response_time_ms=rep.response_time_ms,
+        payload_hash=rep.payload_hash,
+        request_hash=rep.request_hash,
+        endpoint=endpoint,
+        payload=rep.payload,
+        auth_context=dict(auth_context or {}),
+        previous_observations=prev_obs,
+    )
+
+    return Finding(
+        finding_id=finding_id,
+        run_id=run_id,
+        timestamp=timestamp,
+        target_app=target_app,
+        endpoint=endpoint,
+        method=method,
+        tool=tool,
+        attack_type=attack_type,
+        owasp_category=owasp_category,
+        payload=rep.payload,
+        status_code=rep.status_code,
+        response_time_ms=rep.response_time_ms,
+        evidence=evidence_model,
+        severity=rep.severity,
+        confidence=rep.confidence,
+        confirmed=confirmed,
+        lifecycle=lifecycle,
+        fingerprint=fingerprint,
+        cve_matches=list(dict.fromkeys(cve_matches or [])),
+        cve_match_type=cve_match_type,
+        cve_confidence=cve_confidence,
+        curl_command=curl_command,
+        observations=list(observations),
+        observation_count=len(observations),
+        error_count=error_count,
+    )
+
+
+def merge_findings(existing: Finding, incoming: Finding) -> Finding:
+    """Merge two Findings sharing (run_id, fingerprint) without losing observations or conflicts."""
+    existing_obs = list(existing.observations) if existing.observations else [
+        synthesize_observation_from_finding(existing)
+    ]
+    incoming_obs = list(incoming.observations) if incoming.observations else [
+        synthesize_observation_from_finding(incoming)
+    ]
+
+    merged_obs: list[Observation] = []
+    seen_obs_ids: set[str] = set()
+    for obs in existing_obs + incoming_obs:
+        if obs.observation_id in seen_obs_ids:
+            continue
+        seen_obs_ids.add(obs.observation_id)
+        merged_obs.append(obs)
+
+    conflict_notes: list[dict[str, Any]] = []
+    for item in existing.evidence.previous_observations + incoming.evidence.previous_observations:
+        if isinstance(item, dict) and item.get("role") == "metadata_conflict":
+            if item not in conflict_notes:
+                conflict_notes.append(item)
+
+    conflict_fields: dict[str, dict[str, Any]] = {}
+    for field_name in ("finding_id", "target_app", "endpoint", "method", "attack_type", "owasp_category", "tool"):
+        val_a = getattr(existing, field_name)
+        val_b = getattr(incoming, field_name)
+        if val_a and val_b and str(val_a).lower() != str(val_b).lower():
+            conflict_fields[field_name] = {"existing": val_a, "incoming": val_b}
+    if conflict_fields:
+        logger.warning(
+            "Metadata conflict merging findings for fingerprint=%s run_id=%s: %s",
+            existing.fingerprint,
+            existing.run_id,
+            conflict_fields,
+        )
+        conflict_entry = {"role": "metadata_conflict", "fields": conflict_fields}
+        if conflict_entry not in conflict_notes:
+            conflict_notes.append(conflict_entry)
+
+    # Prefer the higher-precedence finding's identity/metadata if non-empty, preserving conflicts above.
+    primary = (
+        incoming
+        if LIFECYCLE_RANK.get(incoming.lifecycle, 0) > LIFECYCLE_RANK.get(existing.lifecycle, 0)
+        else existing
+    )
+    secondary = existing if primary is incoming else incoming
+
+    merged_cves = list(dict.fromkeys((existing.cve_matches or []) + (incoming.cve_matches or [])))
+    if incoming.cve_confidence >= existing.cve_confidence:
+        cve_type = incoming.cve_match_type or existing.cve_match_type
+        cve_conf = incoming.cve_confidence
+    else:
+        cve_type = existing.cve_match_type or incoming.cve_match_type
+        cve_conf = existing.cve_confidence
+
+    auth_ctx = dict(primary.evidence.auth_context or secondary.evidence.auth_context or {})
+
+    return build_finding_from_observations(
+        finding_id=primary.finding_id or secondary.finding_id,
+        run_id=primary.run_id or secondary.run_id,
+        timestamp=max(existing.timestamp, incoming.timestamp),
+        target_app=primary.target_app or secondary.target_app,
+        endpoint=primary.endpoint or secondary.endpoint,
+        method=primary.method or secondary.method,
+        tool=primary.tool or secondary.tool,
+        attack_type=primary.attack_type or secondary.attack_type,
+        owasp_category=primary.owasp_category or secondary.owasp_category,
+        fingerprint=primary.fingerprint or secondary.fingerprint,
+        observations=merged_obs,
+        auth_context=auth_ctx,
+        cve_matches=merged_cves,
+        cve_match_type=cve_type,
+        cve_confidence=cve_conf,
+        curl_command=primary.curl_command or secondary.curl_command,
+        extra_previous_observations=conflict_notes or None,
+    )
 
 
 def verify_deep_state_persistence(

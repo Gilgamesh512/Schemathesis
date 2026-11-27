@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from .evidence import LIFECYCLE_RANK
+
 DEFAULT_ERROR_SIGNALS = [
     "sql syntax",
     "syntaxerror",
@@ -99,13 +101,13 @@ class RunState:
         entry = self.data.setdefault(fp, {"attempts": 0, "status": "new"})
         entry["attempts"] += 1
 
-        current = entry.get("status", "new")
-        if current == "confirmed":
-            pass
-        elif current == "candidate" and status == "rejected":
-            pass
-        else:
-            entry["status"] = status
+        current = str(entry.get("status", "new")).strip().lower()
+        normalized_status = str(status or "new").strip().lower()
+        current_rank = LIFECYCLE_RANK.get(current, 0)
+        new_rank = LIFECYCLE_RANK.get(normalized_status, 0)
+
+        if new_rank >= current_rank:
+            entry["status"] = normalized_status
 
         entry["last_seen"] = datetime.now(timezone.utc).isoformat()
         if self.auto_save:

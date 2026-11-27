@@ -212,9 +212,33 @@ class SecurityReporter:
         except (ValueError, TypeError):
             status_code = None
 
-        matched_cve = raw.get("matched_cve") or []
+        matched_cve = raw.get("matched_cve") or raw.get("cve_matches") or []
         if isinstance(matched_cve, str):
             matched_cve = [c.strip() for c in matched_cve.split(",") if c.strip()]
+
+        observations_raw = raw.get("observations")
+        observations: list[dict[str, Any]] = []
+        if isinstance(observations_raw, list):
+            observations = [o for o in observations_raw if isinstance(o, dict)]
+        elif isinstance(observations_raw, str) and observations_raw.strip():
+            try:
+                parsed_obs = json.loads(observations_raw)
+                if isinstance(parsed_obs, list):
+                    observations = [o for o in parsed_obs if isinstance(o, dict)]
+            except (json.JSONDecodeError, TypeError):
+                observations = []
+
+        try:
+            observation_count = int(raw.get("observation_count") or len(observations) or 0)
+        except (ValueError, TypeError):
+            observation_count = len(observations)
+
+        try:
+            error_count = int(raw.get("error_count") or 0)
+        except (ValueError, TypeError):
+            error_count = 0
+
+        lifecycle = str(raw.get("lifecycle") or ("confirmed" if confirmed else "unknown")).strip().lower()
 
         return {
             "finding_id": str(raw.get("finding_id") or raw.get("fingerprint") or ""),
@@ -231,9 +255,13 @@ class SecurityReporter:
             "evidence": evidence_str,
             "severity": severity,
             "confirmed": confirmed,
+            "lifecycle": lifecycle,
             "fingerprint": str(raw.get("fingerprint") or ""),
             "matched_cve": matched_cve,
             "curl_command": raw.get("curl_command") or "",
+            "observations": observations,
+            "observation_count": observation_count,
+            "error_count": error_count,
         }
 
     def _infer_target_info(

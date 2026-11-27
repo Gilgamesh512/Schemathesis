@@ -103,3 +103,39 @@ def test_sqli_and_nosqli_probes_have_no_self_tainted_expected_signals():
     adapted = FeedbackAnalyzer.adapt_payload({"email": "bad"}, feedback)
     assert adapted["email"] == "probe.auth'OR'1'='1@canary.local"
     assert "sqli" not in adapted["email"]
+
+
+def test_parameter_name_token_boundaries_avoid_false_format_collisions():
+    # Non-date / non-URI generic string parameter names must NOT be trapped as date or uri
+    for generic_name in ("update", "candidate", "validate", "target_name", "targetName", "security", "during"):
+        schema = SemanticMutationEngine.inspect_param(generic_name, "query", {"type": "string"})
+        assert schema.format is None, f"{generic_name} should not infer format={schema.format}"
+        probes = SemanticMutationEngine.generate_probes(schema)
+        attack_types = {p.attack_type for p in probes}
+        assert {"SQL_INJECTION", "XSS", "SSTI", "PATH_TRAVERSAL", "NOSQL_INJECTION"}.issubset(attack_types)
+        assert "BOUNDARY_ANALYSIS" not in attack_types
+
+    # Direct ParamSchema construction for target_name without inspect_param must also avoid SSRF-only narrowing
+    direct_probes = SemanticMutationEngine.generate_probes(ParamSchema(name="target_name", type="string"))
+    assert {"SQL_INJECTION", "XSS", "SSTI"}.issubset({p.attack_type for p in direct_probes})
+
+    # Legitimate token-boundary names must continue to infer their semantic formats
+    for param_name, expected_fmt in (
+        ("created_date", "date"),
+        ("createdDate", "date"),
+        ("created_at", "date-time"),
+        ("updatedAt", "date-time"),
+        ("callback_url", "uri"),
+        ("redirectUri", "uri"),
+        ("webhook_url", "uri"),
+        ("target_url", "uri"),
+        ("contact_email", "email"),
+        ("user_id", "uuid"),
+        ("accountId", "uuid"),
+    ):
+        schema = SemanticMutationEngine.inspect_param(param_name, "query", {"type": "string"})
+        assert schema.format == expected_fmt
+
+    # Exact "target" parameter name still triggers SSRF probes
+    target_probes = SemanticMutationEngine.generate_probes(SemanticMutationEngine.inspect_param("target", "query", {"type": "string"}))
+    assert {p.attack_type for p in target_probes} == {"SSRF"}

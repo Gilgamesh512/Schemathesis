@@ -42,6 +42,30 @@ class SemanticProbe(BaseModel):
 class SemanticMutationEngine:
     """Produces intelligent, schema-aware security probes tailored to field specifications."""
 
+    _URI_TOKENS = frozenset({"url", "uri", "callback", "redirect", "webhook"})
+    _EMAIL_TOKENS = frozenset({"email", "mail"})
+    _UUID_TOKENS = frozenset({"uuid", "guid"})
+    _DATETIME_TOKENS = frozenset({"timestamp", "datetime"})
+    _DATETIME_PAIRS = frozenset({("created", "at"), ("updated", "at"), ("date", "time")})
+
+    @staticmethod
+    def _tokenize_param_name(name: str) -> list[str]:
+        """Split snake_case, kebab-case, and camelCase parameter names into lowercase tokens."""
+        if not name:
+            return []
+        camel_split = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+        return [tok for tok in re.split(r"[^a-z0-9]+", camel_split.lower()) if tok]
+
+    @classmethod
+    def _is_uri_param_name(cls, name: str) -> bool:
+        """Return True when parameter tokens clearly denote a URL/URI destination."""
+        tokens = cls._tokenize_param_name(name)
+        if not tokens:
+            return False
+        if set(tokens) & cls._URI_TOKENS:
+            return True
+        return tokens == ["target"]
+
     @classmethod
     def inspect_param(cls, name: str, location: str, raw_definition: Any) -> ParamSchema:
         """Extract normalized schema descriptor from an OpenAPI parameter definition."""
@@ -62,18 +86,20 @@ class SemanticMutationEngine:
         if param_format:
             param_format = str(param_format).lower()
 
-        # Heuristic detection if type is string but name suggests specific format
-        lower_name = name.lower()
+        # Heuristic detection if type is string but name tokens indicate a specific format
         if param_type == "string" and not param_format:
-            if any(k in lower_name for k in ("uuid", "guid")) or lower_name.endswith("_id"):
+            tokens = cls._tokenize_param_name(name)
+            token_set = set(tokens)
+            token_pairs = set(zip(tokens, tokens[1:]))
+            if (token_set & cls._UUID_TOKENS) or (len(tokens) >= 2 and tokens[-1] == "id"):
                 param_format = "uuid"
-            elif "email" in lower_name or "mail" in lower_name:
+            elif token_set & cls._EMAIL_TOKENS:
                 param_format = "email"
-            elif any(k in lower_name for k in ("url", "uri", "callback", "redirect", "webhook")):
+            elif token_set & cls._URI_TOKENS:
                 param_format = "uri"
-            elif any(k in lower_name for k in ("timestamp", "created_at", "updated_at", "datetime", "date_time")):
+            elif (token_set & cls._DATETIME_TOKENS) or (token_pairs & cls._DATETIME_PAIRS):
                 param_format = "date-time"
-            elif "date" in lower_name:
+            elif "date" in token_set:
                 param_format = "date"
 
         enum_vals = schema_dict.get("enum", [])
@@ -231,9 +257,7 @@ class SemanticMutationEngine:
         # -------------------------------------------------------------
         # 3. URI / URL Format
         # -------------------------------------------------------------
-        if schema.format in ("uri", "url") or any(
-            k in schema.name.lower() for k in ("url", "uri", "callback", "redirect", "webhook", "target")
-        ):
+        if schema.format in ("uri", "url") or cls._is_uri_param_name(schema.name):
             probes.append(SemanticProbe(
                 attack_type="SSRF",
                 payload_value="http://127.0.0.1:80/canary_ssrf_probe",

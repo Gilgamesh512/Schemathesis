@@ -197,6 +197,21 @@ def test_verify_deep_state_persistence(monkeypatch):
     assert persisted is False
     assert "returned HTTP 404" in msg
 
+    # 4. Type-aware boolean persistence matching
+    monkeypatch.setattr(requests, "get", lambda *a, **kw: MockResponse(200, {"user": {"is_admin": True}}))
+    persisted, _ = verify_deep_state_persistence("http://api.local/users/1", "is_admin", True)
+    assert persisted is True
+
+    for non_bool_payload in (
+        {"user": {"is_admin": False}},
+        {"user": {"is_admin": "true"}},
+        {"user": {"is_admin": 1}},
+        {"user": {"display_name": "alice"}},
+    ):
+        monkeypatch.setattr(requests, "get", lambda *a, _p=non_bool_payload, **kw: MockResponse(200, _p))
+        persisted, _ = verify_deep_state_persistence("http://api.local/users/1", "is_admin", True)
+        assert persisted is False
+
 
 def test_semantic_mutator_with_live_seed_corpus():
     from core.semantic_mutator import SemanticMutationEngine, ParamSchema

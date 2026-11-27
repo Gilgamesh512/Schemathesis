@@ -392,6 +392,87 @@ def test_mass_assignment_unpersisted_loopback_becomes_rejected_info(tmp_path: Pa
     assert "Loopback verification unpersisted" in f.evidence.response_signal[0]
 
 
+def test_mass_assignment_role_and_is_admin_persistence_e2e(tmp_path: Path, monkeypatch):
+    import requests as req_lib
+
+    class _MockGetResp:
+        def __init__(self, status_code: int, payload: dict):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def _run_case(fp: str, target_param: str, payload_val, put_echo: dict, persisted_state: dict):
+        payload = _make_payload(
+            attack_type="MASS_ASSIGNMENT",
+            method="PUT",
+            endpoint="/profile",
+            target_param=target_param,
+            param_location="body",
+            payload_value=payload_val,
+            owasp_category="API3:2023",
+        )
+        pc = rest.PreparedCase(
+            fp,
+            "norm_api",
+            "http://api.test",
+            _DummyCase("PUT", "/profile", json_body={"display": "alice"}),
+            _DummyCase("PUT", "/profile", json_body={"display": "alice", target_param: payload_val}),
+            payload,
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            if target_param in body:
+                return httpx.Response(200, json=put_echo)
+            return httpx.Response(200, json={"id": 1, "role": "user", "is_admin": False})
+
+        async def _exec():
+            state = RunState(tmp_path / f"{fp}.json")
+            scheduler = rest.RequestScheduler(max_retries=0)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                monkeypatch.setattr(req_lib, "get", lambda *a, **kw: _MockGetResp(200, persisted_state))
+                return await rest.process_fingerprint_group(
+                    client, scheduler, fp, [pc], {}, None, state, 0.0
+                )
+
+        return asyncio.run(_exec())[0]
+
+    # 1. role=admin persisted -> confirmed/critical
+    f_role = _run_case("fp-ma-role", "role", "admin", {"id": 1, "role": "admin"}, {"id": 1, "role": "admin", "is_admin": False})
+    assert f_role.lifecycle == "confirmed"
+    assert f_role.confirmed is True
+    assert f_role.severity == "critical"
+    assert f_role.confidence == 0.98
+
+    # 2. is_admin=True persisted -> confirmed/critical
+    f_true = _run_case("fp-ma-true", "is_admin", True, {"id": 1, "is_admin": True}, {"id": 1, "role": "user", "is_admin": True})
+    assert f_true.lifecycle == "confirmed"
+    assert f_true.confirmed is True
+    assert f_true.severity == "critical"
+    assert f_true.confidence == 0.98
+
+    # 3. is_admin=False -> never treated as privilege escalation even if DB has is_admin=False
+    f_false = _run_case("fp-ma-false", "is_admin", False, {"id": 1, "is_admin": False}, {"id": 1, "role": "user", "is_admin": False})
+    assert f_false.lifecycle == "rejected"
+    assert f_false.confirmed is False
+    assert f_false.severity == "info"
+    assert f_false.confidence <= 0.15
+
+    # 4. Echoed is_admin=True without persistence -> rejected
+    f_echo = _run_case("fp-ma-echo", "is_admin", True, {"id": 1, "is_admin": True}, {"id": 1, "role": "user", "is_admin": False})
+    assert f_echo.lifecycle == "rejected"
+    assert f_echo.confirmed is False
+    assert f_echo.severity == "info"
+
+    # 5. Missing field in persisted GET response -> rejected
+    f_missing = _run_case("fp-ma-missing", "is_admin", True, {"id": 1, "is_admin": True}, {"id": 1, "display": "alice"})
+    assert f_missing.lifecycle == "rejected"
+    assert f_missing.confirmed is False
+    assert f_missing.severity == "info"
+
+
 def test_bola_and_ssti_rejected_branches_have_low_vulnerability_confidence():
     bola_verdicts = [
         BolaValidator.validate(attack_status=200),

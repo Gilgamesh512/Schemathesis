@@ -2181,47 +2181,58 @@ async def process_fingerprint_group(
 
         # Deep State Loopback Verification for Mass Assignment (API3:2023)
         if pc.payload.attack_type.upper() == "MASS_ASSIGNMENT" and status_code in (200, 201) and resp is not None:
-            loopback_url = None
-            resp_headers = dict(resp.headers)
-            loc_header = resp_headers.get("location") or resp_headers.get("Location")
-            if loc_header:
-                loopback_url = str(loc_header)
-            elif pc.payload.method.upper() in ("PUT", "PATCH"):
-                loopback_url = pc.payload.endpoint
+            if pc.payload.target_param.lower() in ("is_admin", "admin") and payload_value is False:
+                confirmed = False
+                mass_assignment_outcome = "rejected"
+                confidence = 0.10
+                severity = "info"
+                evidence = (
+                    f"HTTP {status_code}; Boolean '{pc.payload.target_param}=False' "
+                    "is not a privilege escalation probe"
+                )
             else:
-                try:
-                    resp_json = resp.json()
-                    if isinstance(resp_json, dict):
-                        for id_k in ("id", "user_id", "userId", "uuid"):
-                            if id_k in resp_json and resp_json[id_k] is not None:
-                                loopback_url = f"{pc.payload.endpoint.rstrip('/')}/{resp_json[id_k]}"
-                                break
-                except Exception as exc:
-                    logger.debug("Could not parse JSON for mass-assignment loopback URL on %s: %s", pc.payload.endpoint, exc)
+                loopback_url = None
+                resp_headers = dict(resp.headers)
+                loc_header = resp_headers.get("location") or resp_headers.get("Location")
+                if loc_header:
+                    loopback_url = str(loc_header)
+                elif pc.payload.method.upper() in ("PUT", "PATCH"):
+                    loopback_url = pc.payload.endpoint
+                else:
+                    try:
+                        resp_json = resp.json()
+                        if isinstance(resp_json, dict):
+                            for id_k in ("id", "user_id", "userId", "uuid"):
+                                if id_k in resp_json and resp_json[id_k] is not None:
+                                    loopback_url = f"{pc.payload.endpoint.rstrip('/')}/{resp_json[id_k]}"
+                                    break
+                    except Exception as exc:
+                        logger.debug("Could not parse JSON for mass-assignment loopback URL on %s: %s", pc.payload.endpoint, exc)
 
-            if loopback_url:
-                full_get_url = loopback_url if loopback_url.startswith(("http://", "https://")) else f"{pc.base_url.rstrip('/')}/{loopback_url.lstrip('/')}"
-                try:
-                    is_persisted, verify_msg = verify_deep_state_persistence(
-                        get_url=full_get_url,
-                        expected_field=pc.payload.target_param,
-                        expected_value="admin" if pc.payload.target_param in ("role", "is_admin") else payload_value,
-                        headers=headers,
-                    )
-                    if is_persisted:
-                        confirmed = True
-                        mass_assignment_outcome = "confirmed"
-                        confidence = 0.98
-                        severity = "critical" if pc.payload.target_param in ("role", "is_admin", "admin") else "high"
-                        evidence = f"HTTP {status_code}; {verify_msg}"
-                    else:
-                        confirmed = False
-                        mass_assignment_outcome = "rejected"
-                        confidence = 0.10
-                        severity = "info"
-                        evidence = f"HTTP {status_code}; Loopback verification unpersisted: {verify_msg}"
-                except Exception as verify_err:
-                    evidence += f" (Loopback check: {verify_err})"
+                if loopback_url:
+                    full_get_url = loopback_url if loopback_url.startswith(("http://", "https://")) else f"{pc.base_url.rstrip('/')}/{loopback_url.lstrip('/')}"
+                    try:
+                        expected_val = "admin" if pc.payload.target_param == "role" else payload_value
+                        is_persisted, verify_msg = verify_deep_state_persistence(
+                            get_url=full_get_url,
+                            expected_field=pc.payload.target_param,
+                            expected_value=expected_val,
+                            headers=headers,
+                        )
+                        if is_persisted:
+                            confirmed = True
+                            mass_assignment_outcome = "confirmed"
+                            confidence = 0.98
+                            severity = "critical" if pc.payload.target_param in ("role", "is_admin", "admin") else "high"
+                            evidence = f"HTTP {status_code}; {verify_msg}"
+                        else:
+                            confirmed = False
+                            mass_assignment_outcome = "rejected"
+                            confidence = 0.10
+                            severity = "info"
+                            evidence = f"HTTP {status_code}; Loopback verification unpersisted: {verify_msg}"
+                    except Exception as verify_err:
+                        evidence += f" (Loopback check: {verify_err})"
 
         # Staging Safety: Record successful mutations in CleanupTracker
         if pc.payload.method.upper() in ("POST", "PUT", "PATCH") and status_code in (200, 201, 202, 204) and resp is not None:

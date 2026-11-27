@@ -861,7 +861,12 @@ def verify_deep_state_persistence(
             if isinstance(obj, dict):
                 if expected_field in obj:
                     val = obj[expected_field]
-                    if expected_value is None or str(val).lower() == str(expected_value).lower():
+                    if expected_value is None:
+                        return True
+                    if isinstance(expected_value, bool):
+                        if isinstance(val, bool) and val is expected_value:
+                            return True
+                    elif not isinstance(val, bool) and str(val).lower() == str(expected_value).lower():
                         return True
                 return any(_check_in_dict(v) for v in obj.values())
             elif isinstance(obj, list):

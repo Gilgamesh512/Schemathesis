@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Mapping
 import contextvars
+import copy
 import hashlib
 import html
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -260,6 +263,188 @@ def _is_explicit_public_operation(op_raw: dict[str, Any]) -> bool:
     return "security" in op_raw and op_raw.get("security") == []
 
 
+def _resolve_local_ref(
+    node: Any,
+    root_doc: Optional[dict[str, Any]],
+    *,
+    bundled: Optional[dict[str, Any]] = None,
+    max_depth: int = 8,
+    _seen: Optional[set[str]] = None,
+) -> tuple[Any, Optional[dict[str, Any]], set[str]]:
+    """Resolve local OpenAPI JSON Pointer `$ref` (and Schemathesis `x-bundled` refs) safely."""
+    active_bundled = bundled
+    seen = set(_seen) if _seen is not None else set()
+    current = node
+
+    for _ in range(max_depth):
+        if not isinstance(current, dict):
+            break
+        if isinstance(current.get("x-bundled"), dict):
+            active_bundled = current["x-bundled"]
+        ref = current.get("$ref")
+        if not isinstance(ref, str) or not ref.startswith("#/") or ref in seen:
+            break
+        seen.add(ref)
+
+        parts = [
+            part.replace("~1", "/").replace("~0", "~")
+            for part in ref[2:].split("/")
+        ]
+        if ref.startswith("#/x-bundled/"):
+            target: Any = active_bundled
+            parts = parts[1:]
+        else:
+            target = root_doc
+
+        if not isinstance(target, dict):
+            break
+
+        resolved_ok = True
+        for part in parts:
+            if isinstance(target, dict) and part in target:
+                target = target[part]
+            else:
+                resolved_ok = False
+                break
+        if not resolved_ok or not isinstance(target, dict):
+            break
+        current = target
+
+    return current, active_bundled, seen
+
+
+def _extract_object_body_info(
+    schema: Any,
+    root_doc: Optional[dict[str, Any]],
+    *,
+    bundled: Optional[dict[str, Any]] = None,
+    _depth: int = 0,
+    _seen_refs: Optional[frozenset[str]] = None,
+) -> tuple[bool, dict[str, Any]]:
+    """Determine if *schema* represents an object body and collect its top-level properties."""
+    if not isinstance(schema, dict) or _depth > 6:
+        return False, {}
+
+    ancestor_refs = set(_seen_refs or ())
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref in ancestor_refs:
+        return False, {}
+
+    resolved, active_bundled, seen_refs = _resolve_local_ref(
+        schema,
+        root_doc,
+        bundled=bundled,
+        _seen=ancestor_refs,
+    )
+    if not isinstance(resolved, dict):
+        return False, {}
+
+    merged_props: dict[str, Any] = {}
+    raw_type = resolved.get("type")
+    if isinstance(raw_type, list):
+        is_object_type = any(str(item).strip().lower() == "object" for item in raw_type)
+    else:
+        is_object_type = str(raw_type or "").strip().lower() == "object"
+
+    props = resolved.get("properties")
+    has_object = is_object_type or isinstance(props, dict)
+    if isinstance(props, dict):
+        merged_props.update(props)
+
+    next_seen = frozenset(seen_refs)
+    for combiner in ("allOf", "oneOf", "anyOf"):
+        variants = resolved.get(combiner)
+        if not isinstance(variants, list):
+            continue
+        for item in variants:
+            item_is_obj, item_props = _extract_object_body_info(
+                item,
+                root_doc,
+                bundled=active_bundled,
+                _depth=_depth + 1,
+                _seen_refs=next_seen,
+            )
+            if item_is_obj:
+                has_object = True
+                merged_props.update(item_props)
+
+    return has_object, merged_props
+
+
+def _extract_request_body_schemas(
+    operation: Any,
+    op_raw: dict[str, Any],
+) -> tuple[Optional[dict[str, Any]], list[tuple[str, dict[str, Any], Optional[dict[str, Any]]]]]:
+    """Extract `(media_type, schema_dict, x_bundled)` entries for OpenAPI 3.x and Swagger 2.0."""
+    schema_obj = getattr(operation, "schema", None)
+    raw_schema_doc = getattr(schema_obj, "raw_schema", None)
+    root_doc = raw_schema_doc if isinstance(raw_schema_doc, dict) else None
+
+    entries: list[tuple[str, dict[str, Any], Optional[dict[str, Any]]]] = []
+
+    op_body = getattr(operation, "body", None)
+    if op_body is not None and type(op_body).__name__ not in ("Mock", "MagicMock", "NonCallableMock"):
+        try:
+            for body_item in op_body:
+                media_type = getattr(body_item, "media_type", None)
+                raw_body_schema = getattr(body_item, "raw_schema", None)
+                if isinstance(media_type, str) and isinstance(raw_body_schema, dict):
+                    bundled = (
+                        raw_body_schema.get("x-bundled")
+                        if isinstance(raw_body_schema.get("x-bundled"), dict)
+                        else None
+                    )
+                    entries.append((media_type.lower(), raw_body_schema, bundled))
+        except TypeError:
+            pass
+
+    if not entries and op_raw:
+        req_body = op_raw.get("requestBody")
+        if isinstance(req_body, dict):
+            resolved_body, bundled, _ = _resolve_local_ref(req_body, root_doc)
+            content = resolved_body.get("content") if isinstance(resolved_body, dict) else None
+            if isinstance(content, dict):
+                for media_type, media_def in content.items():
+                    if not isinstance(media_def, dict):
+                        continue
+                    sch = media_def.get("schema")
+                    if isinstance(sch, dict):
+                        entries.append((str(media_type).lower(), sch, bundled))
+
+        params = op_raw.get("parameters")
+        if not entries and isinstance(params, list):
+            consumes = op_raw.get("consumes")
+            if not isinstance(consumes, list) or not consumes:
+                consumes = root_doc.get("consumes") if isinstance(root_doc, dict) else None
+            media_types = (
+                [str(mt).lower() for mt in consumes if isinstance(mt, str) and mt.strip()]
+                if isinstance(consumes, list) and consumes
+                else ["application/json"]
+            )
+            if not media_types:
+                media_types = ["application/json"]
+            for param in params:
+                resolved_param, bundled, _ = _resolve_local_ref(param, root_doc)
+                if not isinstance(resolved_param, dict):
+                    continue
+                if str(resolved_param.get("in") or "").lower() != "body":
+                    continue
+                sch = resolved_param.get("schema")
+                if isinstance(sch, dict):
+                    for media_type in media_types:
+                        entries.append((media_type, sch, bundled))
+
+    return root_doc, entries
+
+
+def _is_supported_mass_assignment_media_type(media_type: str) -> bool:
+    """Return True for JSON media types currently supported by Mass Assignment body construction."""
+    essence = str(media_type or "").split(";", 1)[0].strip().lower()
+    if essence in ("application/json", "text/json"):
+        return True
+    return essence.startswith("application/") and essence.endswith("+json")
+
+
 def _is_mass_assignment_applicable(operation: Any, op_raw: dict[str, Any]) -> bool:
     """Determine if Mass Assignment injection is applicable to this operation."""
     method = str(getattr(operation, "method", "") or "").upper()
@@ -273,27 +458,19 @@ def _is_mass_assignment_applicable(operation: Any, op_raw: dict[str, Any]) -> bo
     }
 
     body_props: dict[str, Any] = {}
-    has_object_body = not op_raw  # Permissive when op_raw is absent (e.g. minimal mocks)
-    if op_raw:
-        req_body = op_raw.get("requestBody")
-        if not isinstance(req_body, dict):
-            return False
-        content = req_body.get("content")
-        if isinstance(content, dict) and content:
-            has_object_body = False
-            for media_def in content.values():
-                if not isinstance(media_def, dict):
-                    continue
-                sch = media_def.get("schema")
-                if not isinstance(sch, dict):
-                    continue
-                sch_type = str(sch.get("type") or "").lower()
-                if sch_type == "object" or isinstance(sch.get("properties"), dict):
-                    has_object_body = True
-                    if isinstance(sch.get("properties"), dict):
-                        body_props.update(sch["properties"])
-        elif "requestBody" in op_raw:
-            has_object_body = True
+    root_doc, body_entries = _extract_request_body_schemas(operation, op_raw)
+    if not op_raw and not body_entries:
+        # Permissive when op_raw and operation.body are both absent (e.g. minimal mocks)
+        has_object_body = True
+    else:
+        has_object_body = False
+        for media_type, sch, bundled in body_entries:
+            if not _is_supported_mass_assignment_media_type(media_type):
+                continue
+            is_obj, props = _extract_object_body_info(sch, root_doc, bundled=bundled)
+            if is_obj:
+                has_object_body = True
+                body_props.update(props)
 
     if not has_object_body:
         return False
@@ -518,16 +695,905 @@ def _baseline_component(baseline_case, name: str):
         if type(value).__name__ == "NotSet" or getattr(value, "__class__", None).__name__ == "NotSet":
             return None
         if isinstance(value, dict):
-            return value.copy()
-        elif isinstance(value, list):
-            return list(value)
+            return copy.deepcopy(value)
+        if isinstance(value, Mapping):
+            return copy.deepcopy(dict(value))
+        if isinstance(value, list):
+            return copy.deepcopy(value)
         return value
     return None
+
+
+_BODY_GEN_FAILED = object()
+
+_SENSITIVE_EXACT_NAMES = frozenset({
+    "role", "roles", "admin", "is_admin", "isadmin",
+    "privilege", "privileges", "permission", "permissions",
+    "superuser", "is_superuser", "issuperuser",
+    "staff", "is_staff", "isstaff",
+    "root", "is_root", "isroot",
+    "access_level", "accesslevel", "auth_level", "authlevel",
+    "scope", "scopes", "tier", "user_role", "userrole", "admin_role", "adminrole",
+})
+
+_SENSITIVE_TOKENS = frozenset({
+    "admin", "privilege", "privileges", "permission", "permissions",
+    "role", "roles", "superuser",
+})
+
+_PRIVILEGED_STRING_VALUES = frozenset({
+    "admin", "administrator", "root", "superuser", "super_admin", "superadmin",
+    "system", "sysadmin", "manager", "moderator", "staff", "owner",
+    "operator", "elevated", "privileged", "all", "*", "full_access",
+})
+
+_PRIVILEGED_STRING_TOKENS = frozenset({
+    "admin", "administrator", "root", "superuser", "superadmin", "sysadmin",
+    "privileged", "elevated", "staff", "owner", "moderator", "manager",
+})
+
+_SAFE_STRING_CHOICES = ("user", "member", "viewer", "guest", "basic", "standard", "reader", "customer")
+
+_AUTH_PARAM_NAMES = frozenset({
+    "authorization", "cookie", "set-cookie", "x-api-key", "x-auth-token",
+    "proxy-authorization", "x-csrftoken", "x-xsrf-token",
+})
+
+
+def _tokenize_field_name(name: str) -> list[str]:
+    if not name:
+        return []
+    camel_split = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(name))
+    return [tok for tok in re.split(r"[^a-z0-9]+", camel_split.lower()) if tok]
+
+
+def _is_sensitive_privilege_field(name: str) -> bool:
+    norm = str(name or "").strip().lower()
+    if not norm:
+        return False
+    if norm in _SENSITIVE_EXACT_NAMES:
+        return True
+    tokens = set(_tokenize_field_name(norm))
+    return bool(tokens & _SENSITIVE_TOKENS)
+
+
+def _is_privileged_string_value(value: str) -> bool:
+    norm = str(value or "").strip().lower()
+    if not norm:
+        return False
+    if norm in _PRIVILEGED_STRING_VALUES:
+        return True
+    if any(marker in norm for marker in ("manage_", "write_", ":admin", "*:", ":*")):
+        return True
+    tokens = set(_tokenize_field_name(norm))
+    return bool(tokens & _PRIVILEGED_STRING_TOKENS)
+
+
+def _select_json_body_entry(
+    operation: Any,
+    op_raw: Optional[dict[str, Any]] = None,
+) -> tuple[
+    Optional[dict[str, Any]],
+    list[tuple[str, dict[str, Any], Optional[dict[str, Any]]]],
+    Optional[tuple[str, dict[str, Any], Optional[dict[str, Any]]]],
+]:
+    """Return `(root_doc, all_body_entries, selected_json_entry)` preferring `application/json`."""
+    resolved_raw = op_raw if op_raw is not None else _extract_operation_dict(operation)
+    root_doc, entries = _extract_request_body_schemas(operation, resolved_raw)
+    supported = [entry for entry in entries if _is_supported_mass_assignment_media_type(entry[0])]
+    if not supported:
+        return root_doc, entries, None
+
+    for entry in supported:
+        if entry[0].split(";", 1)[0].strip().lower() == "application/json":
+            return root_doc, entries, entry
+    return root_doc, entries, supported[0]
+
+
+def _is_request_body_required(
+    operation: Any,
+    op_raw: dict[str, Any],
+    root_doc: Optional[dict[str, Any]],
+    body_schema: dict[str, Any],
+    *,
+    bundled: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Return True if the operation or body schema requires body fields."""
+    if op_raw:
+        req_body = op_raw.get("requestBody")
+        if isinstance(req_body, dict):
+            resolved_body, _, _ = _resolve_local_ref(req_body, root_doc)
+            if isinstance(resolved_body, dict) and resolved_body.get("required") is True:
+                return True
+        params = op_raw.get("parameters")
+        if isinstance(params, list):
+            for param in params:
+                resolved_param, _, _ = _resolve_local_ref(param, root_doc)
+                if isinstance(resolved_param, dict) and str(resolved_param.get("in") or "").lower() == "body":
+                    if resolved_param.get("required") is True:
+                        return True
+
+    op_body = getattr(operation, "body", None)
+    if op_body is not None and type(op_body).__name__ not in ("Mock", "MagicMock", "NonCallableMock"):
+        try:
+            for item in op_body:
+                if getattr(item, "is_required", False) is True:
+                    return True
+        except TypeError:
+            pass
+
+    _, req_keys = _collect_object_schema_shape(body_schema, root_doc, bundled=bundled)
+    return bool(req_keys)
+
+
+def _collect_object_schema_shape(
+    schema: Any,
+    root_doc: Optional[dict[str, Any]],
+    *,
+    bundled: Optional[dict[str, Any]] = None,
+    _depth: int = 0,
+    _seen_refs: Optional[frozenset[str]] = None,
+) -> tuple[Optional[dict[str, dict[str, Any]]], set[str]]:
+    """Collect flattened `(properties_map, required_keys)` for object / `allOf` schemas."""
+    if not isinstance(schema, dict) or _depth > 5:
+        return None, set()
+
+    ancestor_refs = set(_seen_refs or ())
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref in ancestor_refs:
+        return None, set()
+
+    resolved, active_bundled, seen_refs = _resolve_local_ref(
+        schema,
+        root_doc,
+        bundled=bundled,
+        _seen=ancestor_refs,
+    )
+    if not isinstance(resolved, dict):
+        return None, set()
+    unresolved_ref = resolved.get("$ref")
+    if isinstance(unresolved_ref, str):
+        return None, set()
+
+    raw_type = resolved.get("type")
+    if isinstance(raw_type, list):
+        types_lower = [str(t).strip().lower() for t in raw_type]
+        is_object_type = "object" in types_lower
+    else:
+        is_object_type = str(raw_type or "").strip().lower() == "object"
+
+    props = resolved.get("properties")
+    req_raw = resolved.get("required")
+    required_keys = {str(k) for k in req_raw} if isinstance(req_raw, list) else set()
+
+    merged_props: dict[str, dict[str, Any]] = {}
+    has_object = is_object_type or isinstance(props, dict)
+    if isinstance(props, dict):
+        for k, v in props.items():
+            if isinstance(v, dict):
+                merged_props[str(k)] = v
+
+    all_of = resolved.get("allOf")
+    if isinstance(all_of, list) and all_of:
+        next_seen = frozenset(seen_refs)
+        for item in all_of:
+            sub_props, sub_req = _collect_object_schema_shape(
+                item,
+                root_doc,
+                bundled=active_bundled,
+                _depth=_depth + 1,
+                _seen_refs=next_seen,
+            )
+            if sub_props is None:
+                return None, set()
+            has_object = True
+            merged_props.update(sub_props)
+            required_keys.update(sub_req)
+
+    if not has_object:
+        return None, set()
+    return merged_props, required_keys
+
+
+def _synthesize_string_value(
+    schema: dict[str, Any],
+    *,
+    field_name: str,
+    sensitive: bool,
+) -> Any:
+    enum_vals = schema.get("enum")
+    if isinstance(enum_vals, list) and enum_vals:
+        str_enums = [v for v in enum_vals if isinstance(v, str)]
+        if not str_enums:
+            return _BODY_GEN_FAILED
+        if sensitive:
+            non_priv = [v for v in str_enums if not _is_privileged_string_value(v)]
+            if not non_priv:
+                return _BODY_GEN_FAILED
+            for preferred in _SAFE_STRING_CHOICES:
+                for cand in non_priv:
+                    if cand.strip().lower() == preferred:
+                        return cand
+            return non_priv[0]
+        return str_enums[0]
+
+    fmt = str(schema.get("format") or "").strip().lower()
+    min_len = schema.get("minLength") if isinstance(schema.get("minLength"), int) else 0
+    max_len = schema.get("maxLength") if isinstance(schema.get("maxLength"), int) else None
+    if max_len is not None and min_len > max_len:
+        return _BODY_GEN_FAILED
+
+    if not fmt:
+        for cand_key in ("default", "example"):
+            cand = schema.get(cand_key)
+            if isinstance(cand, str):
+                if sensitive and _is_privileged_string_value(cand):
+                    continue
+                if len(cand) >= min_len and (max_len is None or len(cand) <= max_len):
+                    return cand
+
+    if fmt == "binary":
+        return _BODY_GEN_FAILED
+    if fmt == "byte":
+        base = "dGVzdA=="
+    elif fmt == "uuid":
+        base = "11111111-1111-1111-1111-111111111111"
+    elif fmt == "email":
+        base = "user@example.com"
+    elif fmt in ("uri", "url"):
+        base = "https://example.com"
+    elif fmt in ("date-time", "datetime"):
+        base = "2026-01-01T00:00:00Z"
+    elif fmt == "date":
+        base = "2026-01-01"
+    elif sensitive:
+        base = "user"
+    else:
+        base = "sample_text"
+
+    if len(base) < min_len:
+        if fmt in ("uuid", "email", "uri", "url", "date-time", "datetime", "date"):
+            return _BODY_GEN_FAILED
+        base = base + ("x" * (min_len - len(base)))
+    if max_len is not None and len(base) > max_len:
+        if fmt in ("uuid", "email", "uri", "url", "date-time", "datetime", "date"):
+            return _BODY_GEN_FAILED
+        base = base[:max_len]
+    return base
+
+
+def _synthesize_number_value(
+    schema: dict[str, Any],
+    *,
+    is_int: bool,
+    sensitive: bool,
+) -> Any:
+    enum_vals = schema.get("enum")
+    if isinstance(enum_vals, list) and enum_vals:
+        nums = [
+            v for v in enum_vals
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+            and (not is_int or isinstance(v, int))
+        ]
+        if not nums:
+            return _BODY_GEN_FAILED
+        return min(nums) if sensitive else nums[0]
+
+    raw_min = schema.get("minimum")
+    raw_max = schema.get("maximum")
+    excl_min = schema.get("exclusiveMinimum")
+    excl_max = schema.get("exclusiveMaximum")
+
+    low: Optional[float] = float(raw_min) if isinstance(raw_min, (int, float)) and not isinstance(raw_min, bool) else None
+    high: Optional[float] = float(raw_max) if isinstance(raw_max, (int, float)) and not isinstance(raw_max, bool) else None
+
+    if isinstance(excl_min, (int, float)) and not isinstance(excl_min, bool):
+        min_bound = float(math.floor(excl_min) + 1) if is_int else (float(excl_min) + 0.5)
+        low = max(low, min_bound) if low is not None else min_bound
+    if isinstance(excl_max, (int, float)) and not isinstance(excl_max, bool):
+        max_bound = float(math.ceil(excl_max) - 1) if is_int else (float(excl_max) - 0.5)
+        high = min(high, max_bound) if high is not None else max_bound
+
+    if is_int:
+        low_i = math.ceil(low) if low is not None else None
+        high_i = math.floor(high) if high is not None else None
+        if low_i is not None and high_i is not None and low_i > high_i:
+            return _BODY_GEN_FAILED
+        if not sensitive:
+            for cand_key in ("default", "example"):
+                cand = schema.get(cand_key)
+                if isinstance(cand, int) and not isinstance(cand, bool):
+                    if (low_i is None or cand >= low_i) and (high_i is None or cand <= high_i):
+                        return cand
+        if sensitive:
+            if low_i is not None:
+                return max(0, low_i) if (high_i is None or max(0, low_i) <= high_i) else low_i
+            if high_i is not None:
+                return min(0, high_i)
+            return 0
+        if low_i is not None and high_i is not None:
+            return 1 if low_i <= 1 <= high_i else low_i
+        if low_i is not None:
+            return max(1, low_i)
+        if high_i is not None:
+            return min(1, high_i)
+        return 1
+
+    if low is not None and high is not None and low > high:
+        return _BODY_GEN_FAILED
+    if not sensitive:
+        for cand_key in ("default", "example"):
+            cand = schema.get(cand_key)
+            if isinstance(cand, (int, float)) and not isinstance(cand, bool):
+                if (low is None or cand >= low) and (high is None or cand <= high):
+                    return float(cand)
+    if sensitive:
+        if low is not None:
+            return max(0.0, low) if (high is None or max(0.0, low) <= high) else low
+        if high is not None:
+            return min(0.0, high)
+        return 0.0
+    if low is not None and high is not None:
+        return 1.0 if low <= 1.0 <= high else low
+    if low is not None:
+        return max(1.0, low)
+    if high is not None:
+        return min(1.0, high)
+    return 1.0
+
+
+def _synthesize_schema_value(
+    schema: Any,
+    root_doc: Optional[dict[str, Any]],
+    *,
+    bundled: Optional[dict[str, Any]] = None,
+    field_name: str = "",
+    _depth: int = 0,
+    _seen_refs: Optional[frozenset[str]] = None,
+) -> Any:
+    """Synthesize a schema-valid JSON value with cycle/depth guards and privilege safety."""
+    if not isinstance(schema, dict) or _depth > 5:
+        return _BODY_GEN_FAILED
+
+    ancestor_refs = set(_seen_refs or ())
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref in ancestor_refs:
+        return _BODY_GEN_FAILED
+
+    resolved, active_bundled, seen_refs = _resolve_local_ref(
+        schema,
+        root_doc,
+        bundled=bundled,
+        _seen=ancestor_refs,
+    )
+    if not isinstance(resolved, dict) or isinstance(resolved.get("$ref"), str):
+        return _BODY_GEN_FAILED
+
+    sensitive = _is_sensitive_privilege_field(field_name)
+    next_seen = frozenset(seen_refs)
+
+    # Handle oneOf / anyOf deterministically by picking the first viable non-null branch
+    for combiner in ("oneOf", "anyOf"):
+        variants = resolved.get(combiner)
+        if isinstance(variants, list) and variants:
+            non_null_variants = [
+                v for v in variants
+                if not (isinstance(v, dict) and str(v.get("type") or "").strip().lower() == "null")
+            ]
+            for variant in non_null_variants or variants:
+                cand = _synthesize_schema_value(
+                    variant,
+                    root_doc,
+                    bundled=active_bundled,
+                    field_name=field_name,
+                    _depth=_depth + 1,
+                    _seen_refs=next_seen,
+                )
+                if cand is not _BODY_GEN_FAILED:
+                    return cand
+            return _BODY_GEN_FAILED
+
+    # Handle allOf composition (object merge or single scalar variant)
+    if isinstance(resolved.get("allOf"), list) and resolved["allOf"]:
+        obj_props, req_keys = _collect_object_schema_shape(
+            resolved,
+            root_doc,
+            bundled=active_bundled,
+            _depth=_depth,
+            _seen_refs=_seen_refs,
+        )
+        if obj_props is not None:
+            return _synthesize_object_from_shape(
+                obj_props,
+                req_keys,
+                root_doc,
+                bundled=active_bundled,
+                _depth=_depth,
+                _seen_refs=next_seen,
+            )
+        if len(resolved["allOf"]) == 1:
+            return _synthesize_schema_value(
+                resolved["allOf"][0],
+                root_doc,
+                bundled=active_bundled,
+                field_name=field_name,
+                _depth=_depth + 1,
+                _seen_refs=next_seen,
+            )
+        return _BODY_GEN_FAILED
+
+    raw_type = resolved.get("type")
+    if isinstance(raw_type, list):
+        candidates = [str(t).strip().lower() for t in raw_type if str(t).strip().lower() != "null"]
+        schema_type = candidates[0] if candidates else "null"
+    else:
+        schema_type = str(raw_type or "").strip().lower()
+
+    if not schema_type:
+        if isinstance(resolved.get("properties"), dict):
+            schema_type = "object"
+        elif isinstance(resolved.get("items"), dict):
+            schema_type = "array"
+        elif isinstance(resolved.get("enum"), list) and resolved["enum"]:
+            first = resolved["enum"][0]
+            if isinstance(first, bool):
+                schema_type = "boolean"
+            elif isinstance(first, int):
+                schema_type = "integer"
+            elif isinstance(first, float):
+                schema_type = "number"
+            else:
+                schema_type = "string"
+        else:
+            return _BODY_GEN_FAILED
+
+    if schema_type == "object":
+        obj_props, req_keys = _collect_object_schema_shape(
+            resolved,
+            root_doc,
+            bundled=active_bundled,
+            _depth=_depth,
+            _seen_refs=_seen_refs,
+        )
+        if obj_props is None:
+            return _BODY_GEN_FAILED
+        return _synthesize_object_from_shape(
+            obj_props,
+            req_keys,
+            root_doc,
+            bundled=active_bundled,
+            _depth=_depth,
+            _seen_refs=next_seen,
+            additional_properties=resolved.get("additionalProperties", True),
+        )
+
+    if schema_type == "array":
+        min_items = resolved.get("minItems") if isinstance(resolved.get("minItems"), int) else 0
+        if sensitive and min_items <= 0:
+            return []
+        if min_items <= 0:
+            return []
+        if min_items > 5:
+            return _BODY_GEN_FAILED
+        items_schema = resolved.get("items")
+        if not isinstance(items_schema, dict):
+            return _BODY_GEN_FAILED
+        item_val = _synthesize_schema_value(
+            items_schema,
+            root_doc,
+            bundled=active_bundled,
+            field_name=field_name,
+            _depth=_depth + 1,
+            _seen_refs=next_seen,
+        )
+        if item_val is _BODY_GEN_FAILED:
+            return _BODY_GEN_FAILED
+        return [copy.deepcopy(item_val) for _ in range(min_items)]
+
+    if schema_type == "boolean":
+        enum_vals = resolved.get("enum")
+        if isinstance(enum_vals, list) and enum_vals:
+            bool_enums = [v for v in enum_vals if isinstance(v, bool)]
+            if not bool_enums:
+                return _BODY_GEN_FAILED
+            if sensitive:
+                if False in bool_enums:
+                    return False
+                return _BODY_GEN_FAILED
+            return bool_enums[0]
+        if sensitive:
+            return False
+        for cand_key in ("default", "example"):
+            cand = resolved.get(cand_key)
+            if isinstance(cand, bool):
+                return cand
+        return False
+
+    if schema_type in ("integer", "number"):
+        return _synthesize_number_value(resolved, is_int=(schema_type == "integer"), sensitive=sensitive)
+
+    if schema_type == "string":
+        return _synthesize_string_value(resolved, field_name=field_name, sensitive=sensitive)
+
+    if schema_type == "null":
+        return None
+
+    return _BODY_GEN_FAILED
+
+
+def _synthesize_object_from_shape(
+    props: dict[str, dict[str, Any]],
+    required_keys: set[str],
+    root_doc: Optional[dict[str, Any]],
+    *,
+    bundled: Optional[dict[str, Any]] = None,
+    _depth: int = 0,
+    _seen_refs: Optional[frozenset[str]] = None,
+    additional_properties: Any = True,
+) -> Any:
+    obj: dict[str, Any] = {}
+
+    for req_key in sorted(required_keys):
+        if req_key in props:
+            val = _synthesize_schema_value(
+                props[req_key],
+                root_doc,
+                bundled=bundled,
+                field_name=req_key,
+                _depth=_depth + 1,
+                _seen_refs=_seen_refs,
+            )
+            if val is _BODY_GEN_FAILED:
+                return _BODY_GEN_FAILED
+            obj[req_key] = val
+        else:
+            if additional_properties is False or _is_sensitive_privilege_field(req_key):
+                return _BODY_GEN_FAILED
+            obj[req_key] = "sample_text"
+
+    optional_budget = 4
+    for prop_name, prop_schema in props.items():
+        if prop_name in obj:
+            continue
+        if len(obj) >= len(required_keys) + optional_budget:
+            break
+        if _is_sensitive_privilege_field(prop_name):
+            continue
+        val = _synthesize_schema_value(
+            prop_schema,
+            root_doc,
+            bundled=bundled,
+            field_name=prop_name,
+            _depth=_depth + 1,
+            _seen_refs=_seen_refs,
+        )
+        if val is not _BODY_GEN_FAILED:
+            obj[prop_name] = val
+
+    return obj
+
+
+def _is_explicit_non_object_schema(
+    schema: Any,
+    root_doc: Optional[dict[str, Any]],
+    *,
+    bundled: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Return True only when *schema* resolves cleanly to a non-object JSON type."""
+    if not isinstance(schema, dict):
+        return False
+    resolved, _, _ = _resolve_local_ref(schema, root_doc, bundled=bundled)
+    if not isinstance(resolved, dict) or isinstance(resolved.get("$ref"), str):
+        return False
+    if isinstance(resolved.get("properties"), dict):
+        return False
+    raw_type = resolved.get("type")
+    if isinstance(raw_type, list):
+        types_lower = {str(t).strip().lower() for t in raw_type}
+        return bool(types_lower) and "object" not in types_lower
+    t_str = str(raw_type or "").strip().lower()
+    return t_str in ("array", "string", "integer", "number", "boolean", "null")
+
+
+def _build_safe_json_body_sample(
+    schema: dict[str, Any],
+    root_doc: Optional[dict[str, Any]],
+    *,
+    bundled: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
+    """Synthesize a safe, schema-valid JSON object body or return None on failure."""
+    val = _synthesize_schema_value(schema, root_doc, bundled=bundled, field_name="", _depth=0)
+    if val is _BODY_GEN_FAILED or not isinstance(val, dict):
+        return None
+    return val
+
+
+def _resolve_sanitize_object_shape(
+    schema: Any,
+    root_doc: Optional[dict[str, Any]],
+    *,
+    bundled: Optional[dict[str, Any]] = None,
+    _seen_refs: Optional[frozenset[str]] = None,
+    body_keys: Optional[set[str]] = None,
+) -> tuple[dict[str, dict[str, Any]], set[str], Optional[dict[str, Any]], frozenset[str], bool]:
+    """Resolve object properties and required keys for sanitization.
+
+    Returns ``(obj_props, req_keys, active_bundled, next_seen, is_ambiguous)``.
+    For ``oneOf``/``anyOf`` with multiple non-null object variants, only selects a branch
+    when exactly one variant satisfies ``v_req <= body_keys <= v_props.keys()``;
+    otherwise returns ``is_ambiguous=True`` with conservative empty ``obj_props`` and the
+    union of required keys from candidate variants so required sensitive fields fail closed.
+    """
+    if not isinstance(schema, dict):
+        return {}, set(), bundled, _seen_refs or frozenset(), False
+
+    ancestor_refs = set(_seen_refs or ())
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref in ancestor_refs:
+        return {}, set(), bundled, frozenset(ancestor_refs), False
+
+    resolved, active_bundled, seen_refs = _resolve_local_ref(
+        schema,
+        root_doc,
+        bundled=bundled,
+        _seen=ancestor_refs,
+    )
+    next_seen = frozenset(seen_refs)
+    if not isinstance(resolved, dict) or isinstance(resolved.get("$ref"), str):
+        return {}, set(), active_bundled, next_seen, False
+
+    collected_props, collected_req = _collect_object_schema_shape(
+        resolved,
+        root_doc,
+        bundled=active_bundled,
+        _seen_refs=_seen_refs,
+    )
+    if collected_props is not None:
+        return collected_props, collected_req, active_bundled, next_seen, False
+
+    variant_shapes: list[tuple[dict[str, dict[str, Any]], set[str]]] = []
+    for combiner in ("oneOf", "anyOf"):
+        variants = resolved.get(combiner)
+        if not isinstance(variants, list):
+            continue
+        for variant in variants:
+            if isinstance(variant, dict) and str(variant.get("type") or "").strip().lower() == "null":
+                continue
+            v_props, v_req = _collect_object_schema_shape(
+                variant,
+                root_doc,
+                bundled=active_bundled,
+                _seen_refs=next_seen,
+            )
+            if v_props is not None:
+                variant_shapes.append((v_props, v_req))
+
+    if len(variant_shapes) == 1:
+        v_props, v_req = variant_shapes[0]
+        return v_props, v_req, active_bundled, next_seen, False
+
+    if len(variant_shapes) > 1:
+        compatible: list[tuple[dict[str, dict[str, Any]], set[str]]] = []
+        if body_keys is not None:
+            for v_props, v_req in variant_shapes:
+                if v_req.issubset(body_keys) and body_keys.issubset(set(v_props.keys())):
+                    compatible.append((v_props, v_req))
+        if len(compatible) == 1:
+            v_props, v_req = compatible[0]
+            return v_props, v_req, active_bundled, next_seen, False
+
+        req_source = compatible if compatible else variant_shapes
+        ambiguous_req: set[str] = set()
+        for _, v_req in req_source:
+            ambiguous_req.update(v_req)
+        return {}, ambiguous_req, active_bundled, next_seen, True
+
+    return {}, set(), active_bundled, next_seen, False
+
+
+def _sanitize_strategy_body(
+    body: Any,
+    schema: Optional[dict[str, Any]],
+    root_doc: Optional[dict[str, Any]],
+    *,
+    bundled: Optional[dict[str, Any]] = None,
+    _depth: int = 0,
+    _seen_refs: Optional[frozenset[str]] = None,
+    max_depth: int = 12,
+) -> Any:
+    """Recursively sanitize sensitive privilege fields across dicts and lists without mutating *body*.
+
+    Returns ``None`` (fail closed) if a required or unverifiable sensitive field has no safe
+    value or nesting exceeds ``max_depth``.
+    """
+    if isinstance(body, Mapping):
+        if _depth > max_depth:
+            return None
+
+        obj_props, req_keys, active_bundled, next_seen, is_ambiguous = _resolve_sanitize_object_shape(
+            schema,
+            root_doc,
+            bundled=bundled,
+            _seen_refs=_seen_refs,
+            body_keys={str(k) for k in body.keys()},
+        )
+
+        sanitized: dict[str, Any] = {}
+        for raw_key, val in body.items():
+            key = str(raw_key)
+            if _is_sensitive_privilege_field(key):
+                prop_schema = obj_props.get(key)
+                if isinstance(prop_schema, dict):
+                    safe_val = _synthesize_schema_value(
+                        prop_schema,
+                        root_doc,
+                        bundled=active_bundled,
+                        field_name=key,
+                        _seen_refs=next_seen,
+                    )
+                    if safe_val is _BODY_GEN_FAILED:
+                        if key in req_keys:
+                            return None
+                        continue
+                    sanitized[key] = safe_val
+                else:
+                    if key in req_keys:
+                        return None
+                    if is_ambiguous:
+                        # Ambiguous oneOf/anyOf optional sensitive field: omit rather than inject branch-unsafe values
+                        continue
+                    if isinstance(val, bool):
+                        sanitized[key] = False
+                    elif isinstance(val, list):
+                        sanitized[key] = []
+                    elif isinstance(val, (int, float)):
+                        if obj_props:
+                            continue
+                        # No schema context for sensitive numeric field: fail closed instead of preserving or guessing
+                        return None
+                    elif isinstance(val, Mapping):
+                        cleaned_nested = _sanitize_strategy_body(
+                            val,
+                            None,
+                            root_doc,
+                            bundled=active_bundled,
+                            _depth=_depth + 1,
+                            _seen_refs=None,
+                            max_depth=max_depth,
+                        )
+                        if cleaned_nested is None:
+                            return None
+                        sanitized[key] = cleaned_nested
+                    elif isinstance(val, str) and _is_privileged_string_value(val):
+                        if obj_props:
+                            continue
+                        sanitized[key] = "user"
+                    else:
+                        sanitized[key] = copy.deepcopy(val)
+            elif isinstance(val, (Mapping, list)):
+                child_schema = obj_props.get(key)
+                # Reset _seen_refs at data container boundary so recursive schemas (e.g. Node -> children -> Node)
+                # preserve schema context on child nodes while _depth bounds recursion.
+                cleaned_child = _sanitize_strategy_body(
+                    val,
+                    child_schema,
+                    root_doc,
+                    bundled=active_bundled,
+                    _depth=_depth + 1,
+                    _seen_refs=None,
+                    max_depth=max_depth,
+                )
+                if cleaned_child is None:
+                    return None
+                sanitized[key] = cleaned_child
+            else:
+                sanitized[key] = copy.deepcopy(val)
+        return sanitized
+
+    if isinstance(body, list):
+        if _depth > max_depth:
+            return None
+
+        items_schema: Optional[dict[str, Any]] = None
+        active_bundled = bundled
+        if isinstance(schema, dict):
+            ancestor_refs = set(_seen_refs or ())
+            ref = schema.get("$ref")
+            if not (isinstance(ref, str) and ref in ancestor_refs):
+                resolved, active_bundled, _ = _resolve_local_ref(
+                    schema,
+                    root_doc,
+                    bundled=bundled,
+                    _seen=ancestor_refs,
+                )
+                if isinstance(resolved, dict) and not isinstance(resolved.get("$ref"), str):
+                    raw_items = resolved.get("items")
+                    if isinstance(raw_items, dict):
+                        items_schema = raw_items
+
+        sanitized_list: list[Any] = []
+        for elem in body:
+            if isinstance(elem, (Mapping, list)):
+                cleaned_elem = _sanitize_strategy_body(
+                    elem,
+                    items_schema,
+                    root_doc,
+                    bundled=active_bundled,
+                    _depth=_depth + 1,
+                    _seen_refs=None,
+                    max_depth=max_depth,
+                )
+                if cleaned_elem is None:
+                    return None
+                sanitized_list.append(cleaned_elem)
+            else:
+                sanitized_list.append(copy.deepcopy(elem))
+        return sanitized_list
+
+    return copy.deepcopy(body)
+
+
+def _default_required_non_auth_params(op, root_doc: Optional[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, str]]:
+    """Build safe values for required non-auth query and header parameters."""
+    query_defaults: dict[str, Any] = {}
+    header_defaults: dict[str, str] = {}
+
+    iter_params = getattr(op, "iter_parameters", None)
+    if not callable(iter_params) or type(op).__name__ in ("Mock", "MagicMock", "NonCallableMock"):
+        return query_defaults, header_defaults
+
+    try:
+        params_iter = list(iter_params())
+    except Exception:
+        return query_defaults, header_defaults
+
+    for p in params_iter:
+        p_name = getattr(p, "name", None)
+        if not isinstance(p_name, str) or not p_name:
+            continue
+        loc = _normalize_location(getattr(p, "location", ""))
+        if loc not in ("query", "header", "headers"):
+            continue
+
+        raw_def = getattr(p, "definition", {})
+        p_def = raw_def if isinstance(raw_def, dict) else {}
+        p_def, bundled, _ = _resolve_local_ref(p_def, root_doc)
+        if not isinstance(p_def, dict):
+            p_def = {}
+
+        # Never synthesize auth/security/cookie credentials
+        if (
+            p_name.strip().lower() in _AUTH_PARAM_NAMES
+            or "x-original-security-type" in p_def
+        ):
+            continue
+
+        is_req = getattr(p, "is_required", None)
+        if not isinstance(is_req, bool):
+            is_req = bool(p_def.get("required", False))
+        if not is_req:
+            continue
+
+        p_schema = p_def.get("schema") if isinstance(p_def.get("schema"), dict) else p_def
+        val = _synthesize_schema_value(p_schema, root_doc, bundled=bundled, field_name=p_name)
+        if val is _BODY_GEN_FAILED or val is None or isinstance(val, (dict, list)):
+            raise ValueError(f"Cannot safely synthesize required non-auth {loc} parameter '{p_name}'")
+
+        if loc == "query":
+            query_defaults[p_name] = val
+        else:
+            if isinstance(val, bool):
+                header_defaults[p_name] = "true" if val else "false"
+            else:
+                header_defaults[p_name] = str(val)
+
+    return query_defaults, header_defaults
 
 
 def build_case(schema, op, payload: Payload, baseline_case=None):
     kwargs: dict[str, Any] = {"operation": op, "method": op.method, "path": op.path}
     loc = _normalize_location(payload.param_location)
+    root_doc, body_entries, selected_json_entry = _select_json_body_entry(op)
 
     if loc == "path":
         values = _default_path_parameters(op)
@@ -544,38 +1610,79 @@ def build_case(schema, op, payload: Payload, baseline_case=None):
         if default_pp:
             kwargs["path_parameters"] = default_pp
 
+        base_query = _baseline_component(baseline_case, "query")
+        base_headers = _baseline_component(baseline_case, "headers")
+        base_cookies = _baseline_component(baseline_case, "cookies")
+        if isinstance(base_query, dict) and base_query:
+            kwargs["query"] = base_query
+        if isinstance(base_headers, dict) and base_headers:
+            kwargs["headers"] = base_headers
+        if isinstance(base_cookies, dict) and base_cookies:
+            kwargs["cookies"] = base_cookies
+
         if loc == "query":
-            values = _baseline_component(baseline_case, "query")
-            if not isinstance(values, dict):
-                values = {}
+            values = base_query if isinstance(base_query, dict) else {}
             values[payload.target_param] = payload.payload_value
             kwargs["query"] = values
         elif loc in ("header", "headers"):
-            values = _baseline_component(baseline_case, "headers")
-            if not isinstance(values, dict):
-                values = {}
+            values = base_headers if isinstance(base_headers, dict) else {}
             values[payload.target_param] = str(payload.payload_value)
             kwargs["headers"] = values
         elif loc == "body":
+            if body_entries and selected_json_entry is None:
+                raise ValueError(
+                    f"No supported JSON media type declared for body payload on {op.method} {op.path}"
+                )
+
             values = _baseline_component(baseline_case, "body")
             if not isinstance(values, dict):
-                values = {}
+                if selected_json_entry is not None:
+                    op_raw = _extract_operation_dict(op)
+                    _, body_schema, bundled = selected_json_entry
+                    body_required = _is_request_body_required(
+                        op, op_raw, root_doc, body_schema, bundled=bundled
+                    )
+                    synthesized = _build_safe_json_body_sample(body_schema, root_doc, bundled=bundled)
+                    if synthesized is None:
+                        if body_required or not _is_explicit_non_object_schema(
+                            body_schema, root_doc, bundled=bundled
+                        ):
+                            raise ValueError(
+                                f"Cannot build body attack case for {op.method} {op.path}: "
+                                "valid baseline body could not be synthesized"
+                            )
+                        values = {}
+                    else:
+                        values = synthesized
+                else:
+                    values = {}
+
             values[payload.target_param] = payload.payload_value
             kwargs["body"] = values
+
+            if selected_json_entry is not None:
+                kwargs["media_type"] = selected_json_entry[0]
+            else:
+                base_mt = getattr(baseline_case, "media_type", None) if baseline_case is not None else None
+                if isinstance(base_mt, str) and _is_supported_mass_assignment_media_type(base_mt):
+                    kwargs["media_type"] = base_mt
         elif loc in ("cookie", "cookies"):
-            values = _baseline_component(baseline_case, "cookies")
-            if not isinstance(values, dict):
-                values = {}
+            values = base_cookies if isinstance(base_cookies, dict) else {}
             values[payload.target_param] = str(payload.payload_value)
             kwargs["cookies"] = values
         else:
             raise ValueError(f"Unsupported param_location: {payload.param_location}")
+
     try:
         return schema.make_case(**kwargs)
     except Exception as exc:
         if "media type" in str(exc).lower() and "media_type" not in kwargs:
-            kwargs["media_type"] = "application/json"
-            return schema.make_case(**kwargs)
+            if selected_json_entry is not None:
+                kwargs["media_type"] = selected_json_entry[0]
+                return schema.make_case(**kwargs)
+            if not body_entries:
+                kwargs["media_type"] = "application/json"
+                return schema.make_case(**kwargs)
         raise
 
 
@@ -612,6 +1719,10 @@ def _default_path_parameters(op) -> dict[str, Any]:
 
 def build_baseline_case(schema, op):
     """Generate a valid ordinary case from the operation schema."""
+    op_raw = _extract_operation_dict(op)
+    root_doc, body_entries, selected_json_entry = _select_json_body_entry(op, op_raw)
+    expected_path_params = _default_path_parameters(op)
+
     case = None
     strategy = getattr(op, "as_strategy", None)
     if callable(strategy):
@@ -620,36 +1731,93 @@ def build_baseline_case(schema, op):
         except Exception as exc:
             logger.debug("Hypothesis strategy.example() failed on %s %s; falling back to make_case: %s", op.method, op.path, exc)
 
-    expected_path_params = _default_path_parameters(op)
-    if case is not None and expected_path_params:
+    if case is not None:
+        base_body = _baseline_component(case, "body")
+        sanitized_body = base_body
+        body_changed = False
+
+        if isinstance(base_body, dict) and selected_json_entry is not None:
+            _, body_schema, bundled = selected_json_entry
+            sanitized_body = _sanitize_strategy_body(base_body, body_schema, root_doc, bundled=bundled)
+            if sanitized_body is None:
+                raise ValueError(
+                    f"Cannot build safe non-privileged baseline body for {op.method} {op.path}"
+                )
+            body_changed = sanitized_body != base_body
+        elif base_body is None and selected_json_entry is not None:
+            _, body_schema, bundled = selected_json_entry
+            synthesized = _build_safe_json_body_sample(body_schema, root_doc, bundled=bundled)
+            if synthesized is None:
+                if _is_request_body_required(op, op_raw, root_doc, body_schema, bundled=bundled) and not _is_explicit_non_object_schema(body_schema, root_doc, bundled=bundled):
+                    raise ValueError(
+                        f"Cannot synthesize safe JSON baseline body for {op.method} {op.path}"
+                    )
+            else:
+                sanitized_body = synthesized
+                body_changed = True
+
         existing_pp = _baseline_component(case, "path_parameters")
-        if not isinstance(existing_pp, dict) or any(
-            k not in existing_pp or existing_pp[k] in (None, "")
-            for k in expected_path_params
-        ):
+        pp_missing = bool(
+            expected_path_params
+            and (
+                not isinstance(existing_pp, dict)
+                or any(k not in existing_pp or existing_pp[k] in (None, "") for k in expected_path_params)
+            )
+        )
+        if not pp_missing and not body_changed:
+            return case
+
+        kwargs: dict[str, Any] = {
+            "operation": op,
+            "method": op.method,
+            "path": op.path,
+        }
+        if expected_path_params:
             merged_pp = dict(expected_path_params)
             if isinstance(existing_pp, dict):
                 for k, v in existing_pp.items():
                     if v not in (None, ""):
                         merged_pp[k] = v
-            kwargs: dict[str, Any] = {
-                "operation": op,
-                "method": op.method,
-                "path": op.path,
-                "path_parameters": merged_pp,
-            }
-            for comp_src, comp_dst in (("query", "query"), ("headers", "headers"), ("cookies", "cookies"), ("body", "body")):
-                val = _baseline_component(case, comp_src)
-                if val is not None:
-                    kwargs[comp_dst] = val
-            return schema.make_case(**kwargs)
+            kwargs["path_parameters"] = merged_pp
+        elif isinstance(existing_pp, dict) and existing_pp:
+            kwargs["path_parameters"] = existing_pp
 
-    if case is not None:
-        return case
+        for comp_src, comp_dst in (("query", "query"), ("headers", "headers"), ("cookies", "cookies")):
+            val = _baseline_component(case, comp_src)
+            if val is not None:
+                kwargs[comp_dst] = val
 
-    kwargs = {"operation": op, "method": op.method, "path": op.path}
+        if sanitized_body is not None:
+            kwargs["body"] = sanitized_body
+            case_mt = getattr(case, "media_type", None)
+            if isinstance(case_mt, str) and _is_supported_mass_assignment_media_type(case_mt):
+                kwargs["media_type"] = case_mt
+            elif selected_json_entry is not None:
+                kwargs["media_type"] = selected_json_entry[0]
+        return schema.make_case(**kwargs)
+
+    kwargs: dict[str, Any] = {"operation": op, "method": op.method, "path": op.path}
     if expected_path_params:
         kwargs["path_parameters"] = expected_path_params
+
+    req_query, req_headers = _default_required_non_auth_params(op, root_doc)
+    if req_query:
+        kwargs["query"] = req_query
+    if req_headers:
+        kwargs["headers"] = req_headers
+
+    if selected_json_entry is not None:
+        selected_mt, body_schema, bundled = selected_json_entry
+        body_sample = _build_safe_json_body_sample(body_schema, root_doc, bundled=bundled)
+        if body_sample is None:
+            if _is_request_body_required(op, op_raw, root_doc, body_schema, bundled=bundled) and not _is_explicit_non_object_schema(body_schema, root_doc, bundled=bundled):
+                raise ValueError(
+                    f"Cannot synthesize safe JSON baseline body for {op.method} {op.path}"
+                )
+        else:
+            kwargs["body"] = body_sample
+            kwargs["media_type"] = selected_mt
+
     return schema.make_case(**kwargs)
 
 

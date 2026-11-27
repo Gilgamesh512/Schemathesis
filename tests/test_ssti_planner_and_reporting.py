@@ -264,7 +264,11 @@ def test_cve_not_attached_without_technology_or_when_rejected(tmp_path: Path):
         technology=None,
     )
     det_no_tech, cves_no_tech = rest.detect_response(
-        httpx.Response(200, text="<script>alert(1)</script>"),
+        httpx.Response(
+            200,
+            text="<html><body><script>alert(1)</script></body></html>",
+            headers={"Content-Type": "text/html; charset=utf-8"},
+        ),
         payload_no_tech,
         rules=rules,
     )

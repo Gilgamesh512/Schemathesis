@@ -150,15 +150,16 @@ def test_generic_response_differences_alone_never_establish_vulnerability():
 
 
 def test_confirmation_engine_passes_baseline_and_attack_and_distinguishes_preexisting_content():
-    canary = "unique-canary-token-98765"
+    # Under P1.6.5, XSS candidates require an executable HTML context rather than JSON reflection.
+    canary = "<script>xss_canary_98765</script>"
     payload = _make_payload(attack_type="XSS", expected_signal=[canary], payload_value=canary)
 
-    async def _run(baseline_body: dict, attack_body: dict):
+    async def _run(baseline_html: str, attack_html: str):
         async def exec_base():
-            return httpx.Response(200, json=baseline_body)
+            return httpx.Response(200, text=baseline_html, headers={"Content-Type": "text/html; charset=utf-8"})
 
         async def exec_att():
-            return httpx.Response(200, json=attack_body)
+            return httpx.Response(200, text=attack_html, headers={"Content-Type": "text/html; charset=utf-8"})
 
         def detector(attack_resp, baseline_resp=None):
             det, _ = rest.detect_response(attack_resp, payload, baseline_resp=baseline_resp)
@@ -168,7 +169,7 @@ def test_confirmation_engine_passes_baseline_and_attack_and_distinguishes_preexi
         return await ConfirmationEngine().confirm(detector, exec_base, exec_att, snapshot_response)
 
     # Case 1: Canary was ALREADY present in baseline -> preexisting -> rejected
-    res_pre = asyncio.run(_run({"existing": canary}, {"existing": canary, "extra": 1}))
+    res_pre = asyncio.run(_run(f"<html><body>{canary}</body></html>", f"<html><body>{canary}<p>1</p></body></html>"))
     assert res_pre.detection is not None
     assert res_pre.decision is not None
     assert res_pre.detection.has_baseline is True
@@ -178,8 +179,8 @@ def test_confirmation_engine_passes_baseline_and_attack_and_distinguishes_preexi
     assert res_pre.confirmed is False
     assert res_pre.decision.outcome == "rejected"
 
-    # Case 2: Canary is genuinely NEW compared to baseline -> candidate (low severity, not auto-medium)
-    res_new = asyncio.run(_run({"existing": "clean"}, {"reflected": canary}))
+    # Case 2: Canary is genuinely NEW in HTML body compared to baseline -> candidate (low severity, not auto-medium)
+    res_new = asyncio.run(_run("<html><body>clean</body></html>", f"<html><body>{canary}</body></html>"))
     assert res_new.detection is not None
     assert res_new.decision is not None
     assert res_new.detection.new_expected_signals == [canary]
@@ -191,9 +192,13 @@ def test_confirmation_engine_passes_baseline_and_attack_and_distinguishes_preexi
 
 
 def test_missing_baseline_is_explicitly_recorded_as_evidence_limitation():
-    canary = "unique-canary-token-54321"
+    canary = "<script>xss_canary_54321</script>"
     payload = _make_payload(attack_type="XSS", expected_signal=[canary], payload_value=canary)
-    attack = httpx.Response(200, json={"reflected": canary})
+    attack = httpx.Response(
+        200,
+        text=f"<html><body>{canary}</body></html>",
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
 
     detection, _ = rest.detect_response(attack, payload, baseline_resp=None)
     decision = rest.decide_validation(detection, payload)
@@ -351,9 +356,9 @@ def test_non_sqli_meaningful_signal_inside_400_422_surfaces_as_candidate():
 
 
 def test_e2e_process_fingerprint_group_mixed_candidate_rejected_error_and_bola_inconclusive(tmp_path: Path):
-    # 1. Mixed candidate + rejected + error -> candidate
+    # 1. Mixed candidate + rejected + error -> candidate (HTML response for valid XSS context)
     fp = "fp-e2e-mixed"
-    canary = "xss-canary-xyz-991"
+    canary = "<script>xss_canary_991</script>"
     group = [
         rest.PreparedCase(
             fp, "test_api", "http://api.test",
@@ -380,8 +385,16 @@ def test_e2e_process_fingerprint_group_mixed_candidate_rejected_error_and_bola_i
         if q == "boom":
             raise httpx.ReadTimeout("timeout", request=request)
         if q == canary:
-            return httpx.Response(200, json={"echo": canary})
-        return httpx.Response(200, json={"echo": "normal"})
+            return httpx.Response(
+                200,
+                text=f"<html><body>{canary}</body></html>",
+                headers={"Content-Type": "text/html; charset=utf-8"},
+            )
+        return httpx.Response(
+            200,
+            text="<html><body>normal</body></html>",
+            headers={"Content-Type": "text/html; charset=utf-8"},
+        )
 
     async def _run():
         state = RunState(tmp_path / "state.json")
@@ -704,7 +717,7 @@ def test_p164_gap_concatenation_and_primitive_payload_safety():
 
 
 def test_p164_xss_and_ssti_behaviors_preserved():
-    # XSS reflection remains candidate in P1.6.4 (Content-Type validation belongs to P1.6.5)
+    # Under P1.6.5, XSS reflection in application/json is rejected while unencoded HTML reflection is candidate
     xss_val = "<script>alert(1)</script>"
     xss_payload = _make_payload(
         attack_type="XSS",
@@ -712,12 +725,31 @@ def test_p164_xss_and_ssti_behaviors_preserved():
         payload_value=xss_val,
         endpoint="/echo",
     )
-    xss_resp = httpx.Response(200, json={"rendered": f"Echo: {xss_val}"})
-    det_xss, _ = rest.detect_response(xss_resp, xss_payload, baseline_resp=httpx.Response(200, json={"rendered": "Echo: hi"}))
-    dec_xss = rest.decide_validation(det_xss, xss_payload)
-    assert det_xss.payload_reflected is True
-    assert det_xss.new_expected_signals == [xss_val]
-    assert dec_xss.outcome == "candidate"
+    xss_json_resp = httpx.Response(200, json={"rendered": f"Echo: {xss_val}"})
+    det_xss_json, _ = rest.detect_response(
+        xss_json_resp, xss_payload, baseline_resp=httpx.Response(200, json={"rendered": "Echo: hi"})
+    )
+    dec_xss_json = rest.decide_validation(det_xss_json, xss_payload)
+    assert det_xss_json.payload_reflected is True
+    assert det_xss_json.metadata.get("xss_context") == "json_reflection"
+    assert det_xss_json.new_expected_signals == []
+    assert dec_xss_json.outcome == "rejected"
+
+    xss_html_resp = httpx.Response(
+        200,
+        text=f"<html><body>Echo: {xss_val}</body></html>",
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+    det_xss_html, _ = rest.detect_response(
+        xss_html_resp,
+        xss_payload,
+        baseline_resp=httpx.Response(200, text="<html><body>Echo: hi</body></html>", headers={"Content-Type": "text/html"}),
+    )
+    dec_xss_html = rest.decide_validation(det_xss_html, xss_payload)
+    assert det_xss_html.metadata.get("xss_context") == "html_text"
+    assert det_xss_html.new_expected_signals == [xss_val]
+    assert dec_xss_html.outcome == "candidate"
+    assert dec_xss_html.is_confirmed is False
 
     # SSTI evaluated output is not masked, and unevaluated reflection remains rejected
     ssti_payload = _make_payload(
@@ -740,3 +772,328 @@ def test_p164_xss_and_ssti_behaviors_preserved():
     )
     assert ssti_echo_verdict is not None
     assert ssti_echo_verdict.outcome == "rejected"
+
+
+def test_p165_xss_json_reflection_raw_escaped_and_mime_params_rejected(tmp_path: Path):
+    xss_val = "<script>alert(1)</script>"
+    email_xss_val = "probe+<script>alert(1)</script>@example.com"
+    base_json = httpx.Response(200, json={"rendered": "hello"})
+
+    for payload_val, ct, body_text, status_code in (
+        (xss_val, "application/json", json.dumps({"rendered": f"Echo: {xss_val}"}), 200),
+        (xss_val, "application/json; charset=utf-8", json.dumps({"rendered": xss_val}), 200),
+        (email_xss_val, "application/problem+json; charset=utf-8", json.dumps({"invited": email_xss_val}), 200),
+        (xss_val, "application/json", json.dumps({"escaped": xss_val.replace("<", r"\u003c").replace(">", r"\u003e")}), 200),
+        (xss_val, "application/json", json.dumps({"detail": [{"loc": ["query", "q"], "msg": f"Invalid: {xss_val}", "type": "value_error"}]}), 422),
+    ):
+        payload = _make_payload(attack_type="XSS", expected_signal=[xss_val], payload_value=payload_val, endpoint="/echo")
+        resp = httpx.Response(status_code, text=body_text, headers={"Content-Type": ct})
+        det, _ = rest.detect_response(resp, payload, baseline_resp=base_json)
+        dec = rest.decide_validation(det, payload)
+        assert det.new_expected_signals == []
+        assert dec.outcome == "rejected"
+        assert dec.is_candidate is False
+        assert dec.is_confirmed is False
+        assert dec.severity == "info"
+
+    # Full E2E pipeline check: process_fingerprint_group + RunState must NOT promote JSON XSS reflection
+    fp = "fp-p165-json-xss"
+    pc = rest.PreparedCase(
+        fp,
+        "test_api",
+        "http://api.test",
+        _DummyCase("/echo", {"tpl": "hello"}),
+        _DummyCase("/echo", {"tpl": xss_val}),
+        _make_payload(attack_type="XSS", expected_signal=[xss_val], payload_value=xss_val, endpoint="/echo"),
+    )
+
+    def json_handler(request: httpx.Request) -> httpx.Response:
+        q = request.url.params.get("tpl", "")
+        return httpx.Response(200, json={"rendered": f"Echo: {q}"})
+
+    async def _run():
+        state = RunState(tmp_path / "state_p165.json")
+        scheduler = rest.RequestScheduler(max_retries=0)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(json_handler)) as client:
+            return await rest.process_fingerprint_group(client, scheduler, fp, [pc], {}, None, state, 0.0)
+
+    findings = asyncio.run(_run())
+    assert len(findings) == 1
+    assert findings[0].lifecycle == "rejected"
+    assert findings[0].confirmed is False
+    assert findings[0].severity == "info"
+    assert findings[0].confidence <= 0.15
+
+
+def test_p165_xss_html_contexts_escaped_mixed_and_ambiguous():
+    base_html = httpx.Response(200, text="<html><body>hello</body></html>", headers={"Content-Type": "text/html"})
+
+    # Scenario B: HTML text context (unencoded markup -> candidate/low, never confirmed; plain text -> rejected)
+    xss_val = "<script>alert(1)</script>"
+    p_html = _make_payload(attack_type="XSS", expected_signal=[xss_val], payload_value=xss_val, endpoint="/page")
+    resp_html_text = httpx.Response(
+        200,
+        text=f"<html><body><div>Hello {xss_val}</div></body></html>",
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+    det_text, _ = rest.detect_response(resp_html_text, p_html, baseline_resp=base_html)
+    dec_text = rest.decide_validation(det_text, p_html)
+    assert det_text.metadata.get("xss_context") == "html_text"
+    assert dec_text.outcome == "candidate"
+    assert dec_text.severity == "low"
+    assert dec_text.is_confirmed is False
+
+    p_plain = _make_payload(attack_type="XSS", expected_signal=["plain_token_xyz"], payload_value="plain_token_xyz")
+    resp_plain = httpx.Response(
+        200,
+        text="<html><body><div>Hello plain_token_xyz</div></body></html>",
+        headers={"Content-Type": "text/html"},
+    )
+    det_plain, _ = rest.detect_response(resp_plain, p_plain, baseline_resp=base_html)
+    dec_plain = rest.decide_validation(det_plain, p_plain)
+    assert det_plain.metadata.get("xss_context") == "html_text_plain"
+    assert dec_plain.outcome == "rejected"
+
+    # Scenario C: HTML-escaped reflection -> rejected; mixed escaped + raw -> candidate
+    resp_escaped = httpx.Response(
+        200,
+        text="<html><body><div>Hello &lt;script&gt;alert(1)&lt;/script&gt;</div></body></html>",
+        headers={"Content-Type": "text/html"},
+    )
+    det_esc, _ = rest.detect_response(resp_escaped, p_html, baseline_resp=base_html)
+    dec_esc = rest.decide_validation(det_esc, p_html)
+    assert det_esc.metadata.get("xss_context") == "html_escaped"
+    assert det_esc.new_expected_signals == []
+    assert dec_esc.outcome == "rejected"
+
+    p_inner_sig = _make_payload(attack_type="XSS", expected_signal=["alert(1)"], payload_value=xss_val)
+    det_esc_inner, _ = rest.detect_response(resp_escaped, p_inner_sig, baseline_resp=base_html)
+    dec_esc_inner = rest.decide_validation(det_esc_inner, p_inner_sig)
+    assert det_esc_inner.metadata.get("xss_context") == "html_escaped"
+    assert dec_esc_inner.outcome == "rejected"
+
+    resp_mixed = httpx.Response(
+        200,
+        text=f"<html><body><span>&lt;script&gt;alert(1)&lt;/script&gt;</span><div>{xss_val}</div></body></html>",
+        headers={"Content-Type": "text/html"},
+    )
+    det_mix, _ = rest.detect_response(resp_mixed, p_html, baseline_resp=base_html)
+    dec_mix = rest.decide_validation(det_mix, p_html)
+    assert det_mix.metadata.get("xss_context") == "html_text"
+    assert dec_mix.outcome == "candidate"
+    assert dec_mix.is_confirmed is False
+
+    # Scenario D: HTML attribute breakout, safe quoted attribute, JS context, and ambiguous tag context
+    attr_payload_val = '" onmouseover="alert(1)'
+    p_attr = _make_payload(attack_type="XSS", expected_signal=[attr_payload_val], payload_value=attr_payload_val)
+    resp_attr_exec = httpx.Response(
+        200,
+        text=f'<html><body><input type="text" value="{attr_payload_val}"></body></html>',
+        headers={"Content-Type": "application/xhtml+xml; charset=utf-8"},
+    )
+    det_attr, _ = rest.detect_response(resp_attr_exec, p_attr, baseline_resp=base_html)
+    dec_attr = rest.decide_validation(det_attr, p_attr)
+    assert det_attr.metadata.get("xss_context") == "html_attribute"
+    assert dec_attr.outcome == "candidate"
+    assert dec_attr.is_confirmed is False
+
+    p_attr_safe = _make_payload(attack_type="XSS", expected_signal=["safe_attr_val"], payload_value="safe_attr_val")
+    resp_attr_safe = httpx.Response(
+        200,
+        text='<html><body><input type="text" value="safe_attr_val"></body></html>',
+        headers={"Content-Type": "text/html"},
+    )
+    det_attr_safe, _ = rest.detect_response(resp_attr_safe, p_attr_safe, baseline_resp=base_html)
+    dec_attr_safe = rest.decide_validation(det_attr_safe, p_attr_safe)
+    assert det_attr_safe.metadata.get("xss_context") == "html_attribute_quoted"
+    assert dec_attr_safe.outcome == "inconclusive"
+    assert dec_attr_safe.is_candidate is False
+
+    js_payload_val = "a';alert(1);//"
+    p_js = _make_payload(attack_type="XSS", expected_signal=[js_payload_val], payload_value=js_payload_val)
+    resp_js = httpx.Response(
+        200,
+        text=f"<html><body><script>var q = '{js_payload_val}';</script></body></html>",
+        headers={"Content-Type": "text/html"},
+    )
+    det_js, _ = rest.detect_response(resp_js, p_js, baseline_resp=base_html)
+    dec_js = rest.decide_validation(det_js, p_js)
+    assert det_js.metadata.get("xss_context") == "html_js_context"
+    assert dec_js.outcome == "candidate"
+    assert dec_js.is_confirmed is False
+
+    p_ambig = _make_payload(attack_type="XSS", expected_signal=["ambig_tok_99"], payload_value="ambig_tok_99")
+    resp_ambig = httpx.Response(
+        200,
+        text="<html><body><div data-raw ambig_tok_99>ok</div></body></html>",
+        headers={"Content-Type": "text/html"},
+    )
+    det_ambig, _ = rest.detect_response(resp_ambig, p_ambig, baseline_resp=base_html)
+    dec_ambig = rest.decide_validation(det_ambig, p_ambig)
+    assert det_ambig.metadata.get("xss_context") == "unknown"
+    assert dec_ambig.outcome == "inconclusive"
+    assert dec_ambig.is_candidate is False
+
+
+def test_p165_xss_unknown_content_type_mismatch_baseline_and_independent_evidence():
+    xss_val = "<script>alert(1)</script>"
+    p_xss = _make_payload(attack_type="XSS", expected_signal=[xss_val], payload_value=xss_val)
+    base_clean = httpx.Response(200, text="clean", headers={"Content-Type": "text/plain"})
+
+    # Scenario E: missing, malformed, and text/plain Content-Type never become candidate/confirmed
+    for hdrs, body, expected_outcome in (
+        ({}, f"<!DOCTYPE html><html><body>{xss_val}</body></html>", "inconclusive"),
+        ({"Content-Type": "malformed-mime;;;"}, f"<div>{xss_val}</div>", "inconclusive"),
+        ({"Content-Type": "text/plain; charset=utf-8"}, xss_val, "rejected"),
+    ):
+        resp_e = httpx.Response(200, text=body, headers=hdrs)
+        det_e, _ = rest.detect_response(resp_e, p_xss, baseline_resp=base_clean)
+        dec_e = rest.decide_validation(det_e, p_xss)
+        assert dec_e.outcome == expected_outcome
+        assert dec_e.is_candidate is False
+        assert dec_e.is_confirmed is False
+
+    # Scenario F: Header / body mismatch -> inconclusive, never candidate or confirmed
+    mismatch_json_hdr = httpx.Response(
+        200,
+        text=f"<html><body><p>Echo: {xss_val}</p></body></html>",
+        headers={"Content-Type": "application/json"},
+    )
+    det_m1, _ = rest.detect_response(mismatch_json_hdr, p_xss, baseline_resp=base_clean)
+    dec_m1 = rest.decide_validation(det_m1, p_xss)
+    assert det_m1.metadata.get("content_type_mismatch") == "json_header_html_body"
+    assert dec_m1.outcome == "inconclusive"
+    assert dec_m1.is_candidate is False
+    assert dec_m1.is_confirmed is False
+
+    mismatch_html_hdr = httpx.Response(
+        200,
+        text=json.dumps({"echo": xss_val}),
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+    det_m2, _ = rest.detect_response(mismatch_html_hdr, p_xss, baseline_resp=base_clean)
+    dec_m2 = rest.decide_validation(det_m2, p_xss)
+    assert det_m2.metadata.get("content_type_mismatch") == "html_header_json_body"
+    assert dec_m2.outcome == "inconclusive"
+    assert dec_m2.is_candidate is False
+    assert dec_m2.is_confirmed is False
+
+    # Scenario G: Pre-existing baseline reflection in HTML stays rejected
+    html_with_xss = httpx.Response(
+        200,
+        text=f"<html><body>{xss_val}</body></html>",
+        headers={"Content-Type": "text/html"},
+    )
+    det_base, _ = rest.detect_response(html_with_xss, p_xss, baseline_resp=html_with_xss)
+    dec_base = rest.decide_validation(det_base, p_xss)
+    assert det_base.preexisting_expected_signals == [xss_val]
+    assert det_base.new_expected_signals == []
+    assert dec_base.outcome == "rejected"
+
+    # Scenario H: JSON XSS reflection + independent backend error or non-reflected signal still detected
+    resp_indep_tech = httpx.Response(
+        500,
+        json={"echo": xss_val, "error": "Traceback (most recent call last): TemplateError"},
+    )
+    det_ind1, _ = rest.detect_response(resp_indep_tech, p_xss, baseline_resp=httpx.Response(200, json={"ok": True}))
+    dec_ind1 = rest.decide_validation(det_ind1, p_xss)
+    assert "traceback" in det_ind1.new_technical_signals
+    assert dec_ind1.outcome == "candidate"
+    assert dec_ind1.severity == "medium"
+
+    p_xss_plus = _make_payload(
+        attack_type="XSS",
+        expected_signal=[xss_val, "independent-backend-canary-8841"],
+        payload_value=xss_val,
+    )
+    resp_indep_sig = httpx.Response(
+        200,
+        json={"echo": xss_val, "leak": "independent-backend-canary-8841"},
+    )
+    det_ind2, _ = rest.detect_response(resp_indep_sig, p_xss_plus, baseline_resp=httpx.Response(200, json={"ok": True}))
+    dec_ind2 = rest.decide_validation(det_ind2, p_xss_plus)
+    assert det_ind2.new_expected_signals == ["independent-backend-canary-8841"]
+    assert xss_val in det_ind2.reflection_only_signals
+    assert dec_ind2.outcome == "candidate"
+
+
+def test_p165_quoted_attribute_with_angle_brackets_does_not_become_candidate():
+    base_html = httpx.Response(200, text="<html><body>Hello</body></html>", headers={"Content-Type": "text/html"})
+
+    # 1. Quoted attribute containing <script> without quote breakout -> inconclusive (not candidate/confirmed)
+    script_payload = "<script>alert(1)</script>"
+    p_script = _make_payload(attack_type="XSS", expected_signal=[script_payload], payload_value=script_payload)
+    resp_quoted_script = httpx.Response(
+        200,
+        text=f'<html><body><div title="{script_payload}">Hello</div></body></html>',
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+    det_qs, _ = rest.detect_response(resp_quoted_script, p_script, baseline_resp=base_html)
+    dec_qs = rest.decide_validation(det_qs, p_script)
+    assert det_qs.metadata.get("xss_context") == "html_attribute_quoted"
+    assert det_qs.new_expected_signals == []
+    assert dec_qs.outcome == "inconclusive"
+    assert dec_qs.is_candidate is False
+    assert dec_qs.is_confirmed is False
+
+    # 2. Quoted attribute containing < and > without executable context -> inconclusive
+    angle_payload = "1 < 2 > 0"
+    p_angle = _make_payload(attack_type="XSS", expected_signal=[angle_payload], payload_value=angle_payload)
+    resp_quoted_angle = httpx.Response(
+        200,
+        text=f"<html><body><div data-expr='{angle_payload}'>Hello</div></body></html>",
+        headers={"Content-Type": "text/html"},
+    )
+    det_qa, _ = rest.detect_response(resp_quoted_angle, p_angle, baseline_resp=base_html)
+    dec_qa = rest.decide_validation(det_qa, p_angle)
+    assert det_qa.metadata.get("xss_context") == "html_attribute_quoted"
+    assert det_qa.new_expected_signals == []
+    assert dec_qa.outcome == "inconclusive"
+    assert dec_qa.is_candidate is False
+    assert dec_qa.is_confirmed is False
+
+    # 3. Attribute quote breakout remains candidate (never confirmed)
+    breakout_payload = '" onmouseover="alert(1)'
+    p_brk = _make_payload(attack_type="XSS", expected_signal=[breakout_payload], payload_value=breakout_payload)
+    resp_brk = httpx.Response(
+        200,
+        text=f'<html><body><input type="text" value="{breakout_payload}"></body></html>',
+        headers={"Content-Type": "text/html"},
+    )
+    det_brk, _ = rest.detect_response(resp_brk, p_brk, baseline_resp=base_html)
+    dec_brk = rest.decide_validation(det_brk, p_brk)
+    assert det_brk.metadata.get("xss_context") == "html_attribute"
+    assert dec_brk.outcome == "candidate"
+    assert dec_brk.is_confirmed is False
+
+    # 4. HTML text-context XSS candidate remains unchanged
+    resp_html_txt = httpx.Response(
+        200,
+        text=f"<html><body><div>{script_payload}</div></body></html>",
+        headers={"Content-Type": "text/html"},
+    )
+    det_txt, _ = rest.detect_response(resp_html_txt, p_script, baseline_resp=base_html)
+    dec_txt = rest.decide_validation(det_txt, p_script)
+    assert det_txt.metadata.get("xss_context") == "html_text"
+    assert dec_txt.outcome == "candidate"
+    assert dec_txt.is_confirmed is False
+
+    # 5. JSON reflection remains rejected
+    resp_json = httpx.Response(200, json={"title": script_payload})
+    det_json, _ = rest.detect_response(resp_json, p_script, baseline_resp=httpx.Response(200, json={"title": "ok"}))
+    dec_json = rest.decide_validation(det_json, p_script)
+    assert det_json.metadata.get("xss_context") == "json_reflection"
+    assert dec_json.outcome == "rejected"
+    assert dec_json.is_candidate is False
+
+    # 6. Unknown context remains inconclusive
+    resp_unk = httpx.Response(
+        200,
+        text=f"<html><body>{script_payload}</body></html>",
+        headers={"Content-Type": "invalid-mime"},
+    )
+    det_unk, _ = rest.detect_response(resp_unk, p_script, baseline_resp=base_html)
+    dec_unk = rest.decide_validation(det_unk, p_script)
+    assert det_unk.metadata.get("xss_context") == "unknown"
+    assert dec_unk.outcome == "inconclusive"
+    assert dec_unk.is_candidate is False

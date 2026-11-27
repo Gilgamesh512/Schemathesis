@@ -58,8 +58,21 @@ def test_generic_keyword_on_success_response_is_not_enough(monkeypatch):
 
 
 def test_payload_specific_signal_creates_candidate_not_confirmation():
-    response = httpx.Response(200, json={"marker": "unique-canary-value"})
-    payload = make_payload("XSS", ["unique-canary-value"])
+    # Under P1.6.5, XSS candidates require an executable HTML context rather than JSON reflection.
+    response = httpx.Response(
+        200,
+        text="<html><body><script>alert(1)</script></body></html>",
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+    payload = rest.Payload(
+        endpoint="/api/items/{id}",
+        method="GET",
+        target_param="id",
+        param_location="path",
+        attack_type="XSS",
+        payload_value="<script>alert(1)</script>",
+        expected_signal=["<script>alert(1)</script>"],
+    )
 
     _, candidate, _, _ = rest.evaluate_response(response, payload)
 

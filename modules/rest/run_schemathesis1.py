@@ -21,6 +21,7 @@ import html
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -862,6 +863,310 @@ def _classify_signal_against_spans(
     return has_independent, has_reflected
 
 
+_MIME_TYPE_RE = re.compile(r"^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$")
+_HTML_STRUCTURE_RE = re.compile(r"<!doctype\s+html|<html[\s>]|<head[\s>]|<body[\s>]", re.IGNORECASE)
+_HTML_TAG_PAIR_RE = re.compile(
+    r"<(div|span|p|a|form|input|table|ul|ol|li|h[1-6]|title|meta|section|article|"
+    r"main|header|footer|button|label|select|textarea|iframe|svg|img)\b",
+    re.IGNORECASE,
+)
+_UNENCODED_HTML_MARKUP_RE = re.compile(r"<(?:[a-z!/])", re.IGNORECASE)
+_SCRIPT_OPEN_RE = re.compile(r"<script(?:\s[^>]*)?>", re.IGNORECASE)
+_SCRIPT_CLOSE_RE = re.compile(r"</script\s*>", re.IGNORECASE)
+_EVENT_OR_URI_ATTR_RE = re.compile(r"(?:on[a-z]+\s*=|javascript:|vbscript:|data\s*:\s*text/html)", re.IGNORECASE)
+_URI_ATTR_NAME_RE = re.compile(r"(?:^|[\s<])(href|src|action|formaction|data|poster|cite)\s*=\s*['\"]?$", re.IGNORECASE)
+
+
+def _parse_content_type(headers: Any) -> tuple[str, str]:
+    """Parse Content-Type into ``(normalized_media_type, category)``."""
+    raw_ct = ""
+    if headers:
+        try:
+            for k, v in headers.items():
+                if str(k).strip().lower() == "content-type":
+                    raw_ct = str(v or "")
+                    break
+        except AttributeError:
+            raw_ct = ""
+
+    if not raw_ct.strip():
+        return "", "missing"
+
+    essence = raw_ct.split(";", 1)[0].strip().lower()
+    if not essence or not _MIME_TYPE_RE.match(essence):
+        return essence or raw_ct.strip().lower(), "malformed"
+
+    if essence in ("text/html", "application/xhtml+xml"):
+        return essence, "html"
+    if essence in ("application/json", "text/json") or (
+        essence.startswith("application/") and essence.endswith("+json")
+    ):
+        return essence, "json"
+    return essence, "other"
+
+
+def _inspect_xss_body_shape(body_text: str) -> tuple[bool, bool]:
+    """Return ``(looks_like_json, looks_like_html)`` without trusting a single marker."""
+    stripped = (body_text or "").strip()
+    if not stripped:
+        return False, False
+
+    looks_like_json = False
+    if (stripped.startswith("{") and stripped.endswith("}")) or (
+        stripped.startswith("[") and stripped.endswith("]")
+    ):
+        try:
+            parsed = json.loads(stripped)
+            looks_like_json = isinstance(parsed, (dict, list))
+        except Exception:
+            looks_like_json = False
+
+    if looks_like_json:
+        return True, False
+
+    if _HTML_STRUCTURE_RE.search(stripped):
+        return False, True
+    distinct_tags = {m.lower() for m in _HTML_TAG_PAIR_RE.findall(stripped)}
+    return False, len(distinct_tags) >= 2
+
+
+def _find_html_escaped_spans(body_lower: str, payload_value: Any) -> list[tuple[int, int]]:
+    """Locate spans in *body_lower* where *payload_value* appears HTML/JSON-escaped."""
+    if not body_lower or not isinstance(payload_value, str):
+        return []
+    stripped = payload_value.strip()
+    if len(stripped) < _MIN_REFLECTION_PAYLOAD_LEN:
+        return []
+
+    raw_lower = payload_value.lower()
+    escaped_variants: list[str] = []
+    for candidate in (
+        html.escape(payload_value, quote=True),
+        html.escape(payload_value, quote=False),
+        html.escape(payload_value, quote=True).replace("&#x27;", "&#39;"),
+    ):
+        low = candidate.lower()
+        if low != raw_lower and low not in escaped_variants:
+            escaped_variants.append(low)
+
+    try:
+        json_utf8 = json.dumps(payload_value, ensure_ascii=False)[1:-1]
+        if any(ch in payload_value for ch in "<>&'"):
+            html_safe_json = (
+                json_utf8.replace("<", r"\u003c")
+                .replace(">", r"\u003e")
+                .replace("&", r"\u0026")
+                .replace("'", r"\u0027")
+            ).lower()
+            if html_safe_json != raw_lower and html_safe_json not in escaped_variants:
+                escaped_variants.append(html_safe_json)
+    except (TypeError, ValueError):
+        pass
+
+    spans: list[tuple[int, int]] = []
+    for variant in escaped_variants:
+        v_len = len(variant)
+        pos = 0
+        while True:
+            idx = body_lower.find(variant, pos)
+            if idx == -1:
+                break
+            spans.append((idx, idx + v_len))
+            pos = idx + v_len
+
+    if not spans:
+        return []
+    spans.sort()
+    merged: list[tuple[int, int]] = [spans[0]]
+    for start, end in spans[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            if end > prev_end:
+                merged[-1] = (prev_start, end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _classify_html_offset(body_lower: str, idx: int, matched_text: str) -> tuple[str, bool, str]:
+    """Classify an unencoded reflection at *idx* inside an HTML response."""
+    prefix = body_lower[:idx]
+
+    last_comment_open = prefix.rfind("<!--")
+    last_comment_close = prefix.rfind("-->")
+    if last_comment_open > last_comment_close:
+        if "-->" in matched_text:
+            return "html_text", True, "unencoded HTML comment breakout in HTML response"
+        return "html_comment", False, "reflection inside HTML comment without unencoded breakout"
+
+    last_script_open_end = -1
+    for m in _SCRIPT_OPEN_RE.finditer(prefix):
+        last_script_open_end = m.end()
+    last_script_close = -1
+    for m in _SCRIPT_CLOSE_RE.finditer(prefix):
+        last_script_close = m.start()
+
+    if last_script_open_end > last_script_close:
+        if any(ch in matched_text for ch in ("'", '"', ";", "(", ")", "<", ">", "`")):
+            return "html_js_context", True, "unencoded reflection with JS syntax inside <script> context"
+        return "html_js_context_inert", False, "reflection inside <script> block without JS breakout characters"
+
+    last_lt = prefix.rfind("<")
+    last_gt = prefix.rfind(">")
+    if last_lt > last_gt:
+        tag_fragment = prefix[last_lt:]
+        eq_pos = tag_fragment.rfind("=")
+        if eq_pos != -1:
+            after_eq = tag_fragment[eq_pos + 1:].lstrip()
+            quote_char = after_eq[0] if after_eq[:1] in ('"', "'") else ""
+            if quote_char and quote_char in after_eq[1:]:
+                quote_char = ""
+            is_uri_attr = bool(_URI_ATTR_NAME_RE.search(tag_fragment[:eq_pos + 1]))
+            has_uri_scheme = is_uri_attr and bool(
+                re.search(r"^\s*(?:javascript|vbscript|data\s*:\s*text/html)\s*:", matched_text, re.IGNORECASE)
+            )
+            if quote_char:
+                has_breakout = quote_char in matched_text
+            else:
+                has_breakout = any(ch.isspace() or ch in ("<", ">", "/") for ch in matched_text) or bool(
+                    _EVENT_OR_URI_ATTR_RE.search(matched_text)
+                )
+            if has_breakout or has_uri_scheme:
+                return "html_attribute", True, "unencoded reflection in HTML attribute context"
+            return (
+                "html_attribute_quoted",
+                False,
+                "reflection enclosed inside quoted HTML attribute without unencoded breakout characters",
+            )
+
+        if _EVENT_OR_URI_ATTR_RE.search(matched_text) or "<" in matched_text or ">" in matched_text:
+            return "html_attribute", True, "unencoded reflection inside HTML tag structure"
+        return "unknown", False, "reflection inside HTML tag without clear attribute context"
+
+    if _UNENCODED_HTML_MARKUP_RE.search(matched_text):
+        return "html_text", True, "unencoded HTML markup reflected in HTML text context"
+    return "html_text_plain", False, "plain text reflection in HTML body without executable HTML markup"
+
+
+def _is_xss_payload_signal(sig: str, payload_value: Any) -> bool:
+    """Return True when *sig* corresponds to reflected *payload_value* rather than independent backend data."""
+    if not isinstance(payload_value, str):
+        return False
+    low_payload = payload_value.lower()
+    if sig in low_payload:
+        return True
+    for esc in (
+        html.escape(payload_value, quote=True).lower(),
+        html.escape(payload_value, quote=False).lower(),
+    ):
+        if sig in esc:
+            return True
+    return False
+
+
+def _evaluate_xss_response_context(
+    headers: Any,
+    body_text: str,
+    body_lower: str,
+    payload_value: Any,
+    sig: str,
+) -> tuple[str, bool, str, str, Optional[str]]:
+    """Classify XSS execution context for a reflected signal *sig*.
+
+    Returns ``(xss_context, executable_candidate, detail_reason, media_type, mismatch)``.
+    """
+    media_type, header_kind = _parse_content_type(headers)
+    looks_like_json, looks_like_html = _inspect_xss_body_shape(body_text)
+
+    if header_kind == "json":
+        if not looks_like_json and looks_like_html:
+            return (
+                "mismatch",
+                False,
+                f"Content-Type '{media_type}' mismatches HTML-like body; ambiguous execution context",
+                media_type,
+                "json_header_html_body",
+            )
+        return (
+            "json_reflection",
+            False,
+            f"XSS payload reflected inside JSON response ({media_type}) — not an executable HTML context",
+            media_type,
+            None,
+        )
+
+    if header_kind == "html":
+        if looks_like_json:
+            return (
+                "mismatch",
+                False,
+                f"Content-Type '{media_type}' mismatches JSON response body; ambiguous execution context",
+                media_type,
+                "html_header_json_body",
+            )
+
+        escaped_spans = _find_html_escaped_spans(body_lower, payload_value)
+        sig_len = len(sig)
+        pos = 0
+        saw_escaped = False
+        best_non_exec: Optional[tuple[str, str]] = None
+
+        while True:
+            idx = body_lower.find(sig, pos)
+            if idx == -1:
+                break
+            occ_end = idx + sig_len
+            if any(s_start <= idx and occ_end <= s_end for s_start, s_end in escaped_spans):
+                saw_escaped = True
+                pos = idx + 1
+                continue
+            ctx, is_exec, ctx_reason = _classify_html_offset(body_lower, idx, body_lower[idx:occ_end])
+            if is_exec:
+                return ctx, True, ctx_reason, media_type, None
+            if best_non_exec is None:
+                best_non_exec = (ctx, ctx_reason)
+            pos = idx + 1
+
+        if best_non_exec is not None:
+            return best_non_exec[0], False, best_non_exec[1], media_type, None
+        if saw_escaped or escaped_spans:
+            return (
+                "html_escaped",
+                False,
+                "XSS payload reflection is HTML/JSON-escaped in HTML response",
+                media_type,
+                None,
+            )
+        return "unknown", False, "XSS HTML reflection context could not be reliably determined", media_type, None
+
+    if header_kind in ("missing", "malformed"):
+        mismatch = "missing_header_html_body" if (header_kind == "missing" and looks_like_html) else None
+        return (
+            "unknown",
+            False,
+            f"Content-Type is {header_kind}; cannot establish executable HTML context",
+            media_type or header_kind,
+            mismatch,
+        )
+
+    # Other explicit non-HTML Content-Type (text/plain, application/xml, etc.)
+    if looks_like_html:
+        return (
+            "mismatch",
+            False,
+            f"Content-Type '{media_type}' mismatches HTML-like body; ambiguous execution context",
+            media_type,
+            "non_html_header_html_body",
+        )
+    return (
+        "non_html",
+        False,
+        f"XSS payload reflected in non-HTML response ({media_type}) — not an executable HTML context",
+        media_type,
+        None,
+    )
+
+
 def detect_response(
     resp,
     payload: Payload,
@@ -923,6 +1228,11 @@ def detect_response(
 
     reflected_spans = _find_reflected_spans(body_lower, payload.payload_value)
     payload_reflected = bool(reflected_spans)
+    resp_headers = dict(getattr(resp, "headers", {}) or {})
+    parsed_media_type, parsed_header_kind = _parse_content_type(resp_headers)
+    xss_context: Optional[str] = None
+    xss_context_reason: Optional[str] = None
+    xss_mismatch: Optional[str] = None
 
     new_expected: list[str] = []
     preexisting_expected: list[str] = []
@@ -936,7 +1246,25 @@ def detect_response(
             ignored_generic.append(sig)
         elif has_baseline and sig in baseline_text_lower:
             preexisting_expected.append(sig)
-        elif not is_xss and reflected_spans:
+        elif is_xss:
+            is_payload_sig = _is_xss_payload_signal(sig, payload.payload_value)
+            if not is_payload_sig and (
+                not reflected_spans
+                or _classify_signal_against_spans(body_lower, sig, reflected_spans)[0]
+            ):
+                new_expected.append(sig)
+            else:
+                ctx, exec_cand, ctx_reason, _, mismatch = _evaluate_xss_response_context(
+                    resp_headers, body_text, body_lower, payload.payload_value, sig
+                )
+                xss_context = ctx
+                xss_context_reason = ctx_reason
+                xss_mismatch = mismatch
+                if exec_cand:
+                    new_expected.append(sig)
+                elif sig not in reflection_only:
+                    reflection_only.append(sig)
+        elif reflected_spans:
             has_indep, has_refl = _classify_signal_against_spans(body_lower, sig, reflected_spans)
             if not has_indep and has_refl:
                 if sig not in reflection_only:
@@ -945,6 +1273,14 @@ def detect_response(
                 new_expected.append(sig)
         else:
             new_expected.append(sig)
+
+    if is_xss and xss_context is None and payload_reflected and not preexisting_expected:
+        ctx, _, ctx_reason, _, mismatch = _evaluate_xss_response_context(
+            resp_headers, body_text, body_lower, payload.payload_value, str(payload.payload_value or "").lower()
+        )
+        xss_context = ctx
+        xss_context_reason = ctx_reason
+        xss_mismatch = mismatch
 
     technical_hits: list[str] = []
     new_technical_hits: list[str] = []
@@ -1016,6 +1352,10 @@ def detect_response(
             "baseline_elapsed_ms": round(baseline_elapsed_ms, 1) if baseline_elapsed_ms is not None else None,
             "latency_delta_ms": latency_delta_ms,
             "payload_preview": str(payload.payload_value)[:120],
+            "content_type": parsed_media_type or parsed_header_kind,
+            **({"xss_context": xss_context} if xss_context is not None else {}),
+            **({"xss_context_reason": xss_context_reason} if xss_context_reason is not None else {}),
+            **({"content_type_mismatch": xss_mismatch} if xss_mismatch is not None else {}),
         },
     )
     return detection, cve_ids
@@ -1125,11 +1465,14 @@ def decide_validation(detection: DetectionResult, payload: Payload) -> Validatio
             if detection.reflection_only_signals
             else ""
         )
+        xss_ctx = detection.metadata.get("xss_context")
+        xss_ctx_reason = detection.metadata.get("xss_context_reason")
+        ctx_note = f"; {xss_ctx_reason}" if (attack_type == "XSS" and xss_ctx_reason) else ""
         return _decision(
             outcome="rejected",
             confidence=0.15,
             severity="info",
-            reason=f"HTTP {status}; Schema validation barrier ({detection.barrier_framework or 'generic'}): {barrier_desc}{ignored_note}{refl_note}",
+            reason=f"HTTP {status}; Schema validation barrier ({detection.barrier_framework or 'generic'}): {barrier_desc}{ignored_note}{refl_note}{ctx_note}",
             evidence_refs=_with_refs(f"validation_barrier:{detection.barrier_framework or 'generic'}"),
         )
 
@@ -1180,12 +1523,18 @@ def decide_validation(detection: DetectionResult, payload: Payload) -> Validatio
 
     # 4. Only non-generic, high-specificity signals NOT present in baseline may raise a candidate.
     if detection.new_expected_signals:
+        xss_ctx = detection.metadata.get("xss_context") if attack_type == "XSS" else None
+        xss_ctx_reason = detection.metadata.get("xss_context_reason") if attack_type == "XSS" else None
+        ctx_suffix = f" ({xss_ctx}: {xss_ctx_reason})" if xss_ctx and xss_ctx_reason else ""
+        refs = list(detection.new_expected_signals[:3])
+        if xss_ctx:
+            refs.append(f"xss_context:{xss_ctx}")
         return _decision(
             outcome="candidate",
             confidence=0.55 if detection.has_baseline else 0.35,
             severity="low",
-            reason=f"HTTP {status}; new payload-specific signal: {detection.new_expected_signals[:3]}{limitation_suffix}",
-            evidence_refs=detection.new_expected_signals[:3],
+            reason=f"HTTP {status}; new payload-specific signal: {detection.new_expected_signals[:3]}{ctx_suffix}{limitation_suffix}",
+            evidence_refs=refs,
         )
 
     # 5. Technical SQL error signals on SQLi probes.
@@ -1239,7 +1588,28 @@ def decide_validation(detection: DetectionResult, payload: Payload) -> Validatio
             evidence_refs=detection.preexisting_expected_signals[:3],
         )
 
-    # 7b. Signals appearing solely inside reflected payload input are not independent backend evidence.
+    # 7b. Context-aware XSS disposition when reflection lacks executable HTML evidence.
+    if attack_type == "XSS" and detection.metadata.get("xss_context"):
+        xss_ctx = str(detection.metadata["xss_context"])
+        xss_ctx_reason = str(detection.metadata.get("xss_context_reason") or f"non-executable XSS context '{xss_ctx}'")
+        refs = list(detection.reflection_only_signals[:3]) + [f"xss_context:{xss_ctx}"]
+        if xss_ctx in ("mismatch", "unknown", "html_attribute_quoted", "html_comment", "html_js_context_inert"):
+            return _decision(
+                outcome="inconclusive",
+                confidence=0.25 if xss_ctx == "mismatch" else 0.20,
+                severity="info",
+                reason=f"HTTP {status}; {xss_ctx_reason}{limitation_suffix}",
+                evidence_refs=refs,
+            )
+        return _decision(
+            outcome="rejected",
+            confidence=0.10,
+            severity="info",
+            reason=f"HTTP {status}; {xss_ctx_reason}{limitation_suffix}",
+            evidence_refs=refs,
+        )
+
+    # 7c. Signals appearing solely inside reflected payload input are not independent backend evidence.
     if detection.reflection_only_signals:
         return _decision(
             outcome="rejected",
